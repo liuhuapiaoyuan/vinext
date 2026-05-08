@@ -353,6 +353,8 @@ export async function dispatchAppPage<TRoute extends AppPageDispatchRoute>(
       isrHtmlKey: options.isrHtmlKey,
       isrRscKey: options.isrRscKey,
       isrSet: options.isrSet,
+      middlewareHeaders: options.middlewareContext.headers,
+      middlewareStatus: options.middlewareContext.status,
       mountedSlotsHeader: options.mountedSlotsHeader,
       expireSeconds: options.expireSeconds,
       // cacheLife-only routes discover their actual revalidate during the
