@@ -27,7 +27,6 @@ import {
   restoreRscResponse,
   setClientParams,
   setPendingPathname,
-  snapshotRscResponse,
   setMountedSlotsHeader,
   setNavigationContext,
   type CachedRscResponse,
@@ -69,7 +68,7 @@ import {
   type AppRouterState,
   type OperationLane,
 } from "./app-browser-state.js";
-import { DevRecoveryBoundary } from "vinext/shims/error-boundary";
+import { DevRecoveryBoundary, RedirectBoundary } from "vinext/shims/error-boundary";
 import { ElementsContext, Slot } from "vinext/shims/slot";
 import { createOnUncaughtError } from "./app-browser-error.js";
 import {
@@ -518,12 +517,16 @@ function BrowserRoot({
   }, [treeState.previousNextUrl, treeState.renderId]);
 
   const innerTree = createElement(
-    NavigationCommitSignal,
-    { renderId: treeState.renderId },
+    RedirectBoundary,
+    null,
     createElement(
-      ElementsContext.Provider,
-      { value: treeState.elements },
-      createElement(Slot, { id: treeState.routeId }),
+      NavigationCommitSignal,
+      { renderId: treeState.renderId },
+      createElement(
+        ElementsContext.Provider,
+        { value: treeState.elements },
+        createElement(Slot, { id: treeState.routeId }),
+      ),
     ),
   );
 
@@ -943,6 +946,13 @@ function bootstrapHydration(rscStream: ReadableStream<Uint8Array>): void {
   );
   window.__VINEXT_HYDRATED_AT = performance.now();
 
+  // Exposed so the navigation shim's `router.refresh()` can invalidate the
+  // entire client navigation cache (visited-response + prefetch) before
+  // re-fetching, matching Next.js refresh semantics — see refresh-reducer.ts
+  // header comment: "the segment cache contains the actual RSC data which
+  // needs to be re-fetched."
+  window.__VINEXT_CLEAR_NAV_CACHES__ = clearClientNavigationCaches;
+
   window.__VINEXT_RSC_NAVIGATE__ = async function navigateRsc(
     href: string,
     redirectDepth = 0,
@@ -1016,10 +1026,10 @@ function bootstrapHydration(rscStream: ReadableStream<Uint8Array>): void {
           // avoids wasted parse work; the post-check catches supersessions that
           // occur during the await. createFromFetch on a buffered response is fast
           // but still async, so the window exists. The non-cached path (below) places
-          // its heavyweight async steps (fetch, snapshotRscResponse, createFromFetch)
-          // between navId checks consistently; the cached path omits the check between
-          // createClientNavigationRenderSnapshot (synchronous) and createFromFetch
-          // because there is no await in that gap.
+          // its heavyweight async steps (fetch, body.tee + createFromFetch on the
+          // live RSC branch) between navId checks consistently; the cached path omits
+          // the check between createClientNavigationRenderSnapshot (synchronous) and
+          // createFromFetch because there is no await in that gap.
           if (!browserNavigationController.isCurrentNavigation(navId)) return;
           const cachedParams = cachedRoute.params;
           // createClientNavigationRenderSnapshot is synchronous (URL parsing + param
@@ -1157,12 +1167,34 @@ function bootstrapHydration(rscStream: ReadableStream<Uint8Array>): void {
         // Build snapshot from local params, not latestClientParams
         const navigationSnapshot = createClientNavigationRenderSnapshot(currentHref, navParams);
 
-        const responseSnapshot = await snapshotRscResponse(navResponse);
+        // Tee the response body so React can consume it incrementally —
+        // shell parses fast, and any Suspense boundary inside (e.g. the
+        // route's loading.tsx) shows its fallback while the rest of the
+        // RSC stream resolves. Buffering with `await response.arrayBuffer()`
+        // here would block the commit until the page's slowest server
+        // promise resolved, hiding the loading state entirely.
+        //
+        // The cache branch is read in the background so the visited-
+        // response snapshot lands as soon as the full stream completes,
+        // without holding up React's commit.
+        const navBody = navResponse.body;
+        if (!navBody) {
+          // Already validated above (`!navResponse.body` triggers a hard
+          // navigation), so this branch is unreachable — kept for type
+          // narrowing only.
+          return;
+        }
+        const [reactBranch, cacheBranch] = navBody.tee();
+        const reactResponse = new Response(reactBranch, {
+          status: navResponse.status,
+          headers: navResponse.headers,
+        });
+        const cacheBufferPromise = new Response(cacheBranch).arrayBuffer();
 
         if (!browserNavigationController.isCurrentNavigation(navId)) return;
 
         const rscPayload = decodeAppElementsPromise(
-          createFromFetch<AppWireElements>(Promise.resolve(restoreRscResponse(responseSnapshot))),
+          createFromFetch<AppWireElements>(Promise.resolve(reactResponse)),
         );
 
         if (!browserNavigationController.isCurrentNavigation(navId)) return;
@@ -1189,13 +1221,20 @@ function bootstrapHydration(rscStream: ReadableStream<Uint8Array>): void {
         // never actually rendered successfully.
         const resolvedElements = await rscPayload;
         const metadata = AppElementsWire.readMetadata(resolvedElements);
+        const cacheBuffer = await cacheBufferPromise;
         storeVisitedResponseSnapshot(
           rscUrl,
           resolveVisitedResponseInterceptionContext(
             requestInterceptionContext,
             metadata.interceptionContext,
           ),
-          responseSnapshot,
+          {
+            buffer: cacheBuffer,
+            contentType: navResponse.headers.get("content-type") ?? "text/x-component",
+            mountedSlotsHeader: navResponse.headers.get(VINEXT_MOUNTED_SLOTS_HEADER),
+            paramsHeader: navResponse.headers.get(VINEXT_PARAMS_HEADER),
+            url: navResponse.url,
+          },
           navParams,
         );
         return;

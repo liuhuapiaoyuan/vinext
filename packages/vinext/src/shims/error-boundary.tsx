@@ -3,7 +3,8 @@
 import React from "react";
 // Import the local shim, not the public next/navigation alias. The built
 // package may execute this file before the plugin's resolveId hook is active.
-import { usePathname } from "./navigation.js";
+import { usePathname, useRouter } from "./navigation.js";
+import { getErrorDigest, isNavigationSignalError } from "../utils/navigation-signal.js";
 
 export type ErrorBoundaryProps = {
   fallback: React.ComponentType<{ error: unknown; reset: () => void }>;
@@ -14,6 +15,16 @@ type CapturedError = {
   thrownValue: unknown;
 };
 
+type RedirectBoundaryState = {
+  redirect: string | null;
+  redirectType: "push" | "replace" | null;
+};
+
+type RedirectError = Error & {
+  digest: string;
+  handled?: boolean;
+};
+
 type ErrorBoundaryInnerProps = {
   pathname: string;
 } & ErrorBoundaryProps;
@@ -22,6 +33,125 @@ export type ErrorBoundaryState = {
   error: CapturedError | null;
   previousPathname: string;
 };
+
+function isRedirectError(error: unknown): error is RedirectError {
+  return getErrorDigest(error)?.startsWith("NEXT_REDIRECT;") ?? false;
+}
+
+function decodeRedirectTarget(target: string): string {
+  try {
+    return decodeURIComponent(target);
+  } catch {
+    return target;
+  }
+}
+
+function getURLFromRedirectError(error: RedirectError): string | null {
+  const parts = error.digest.split(";");
+  // vinext emits 3-part (redirect: `NEXT_REDIRECT;;<encoded>`) or 4-part
+  // (permanentRedirect: `NEXT_REDIRECT;<type>;<encoded>;308`) digests;
+  // Next.js emits 5-part digests (`NEXT_REDIRECT;<type>;<url>;<status>;<isClient>`).
+  // vinext's `isRedirectError` is more permissive (just `startsWith("NEXT_REDIRECT;")`)
+  // so we branch on length rather than always using `slice(2, -2)`.
+  const encodedTarget = parts.length >= 5 ? parts.slice(2, -2).join(";") : parts[2];
+  return encodedTarget ? decodeRedirectTarget(encodedTarget) : null;
+}
+
+function getRedirectTypeFromError(error: RedirectError): "push" | "replace" {
+  const type = error.digest.split(";", 2)[1];
+  return type === "push" ? "push" : "replace";
+}
+
+function HandleRedirect({
+  redirect,
+  redirectType,
+}: {
+  redirect: string;
+  redirectType: "push" | "replace";
+}) {
+  const router = useRouter();
+
+  React.useEffect(() => {
+    React.startTransition(() => {
+      if (redirectType === "push") {
+        router.push(redirect);
+      } else {
+        router.replace(redirect);
+      }
+      // Intentionally no reset() here. The boundary stays in its "redirect
+      // caught" state (rendering this component, which returns null) until
+      // router.push()/replace() triggers a new render at the destination
+      // route. That naturally unmounts this boundary and mounts a fresh one.
+      // Calling reset() would clear the boundary state, causing React to
+      // re-render children — which re-mounts the page component that threw
+      // redirect() in the first place. For deterministic redirects (e.g.
+      // auth guards), that creates an infinite redirect loop.
+      // Matches Next.js's HandleRedirect in redirect-boundary.tsx.
+    });
+  }, [redirect, redirectType, router]);
+
+  return null;
+}
+
+export class RedirectErrorBoundary extends React.Component<
+  { children?: React.ReactNode },
+  RedirectBoundaryState
+> {
+  constructor(props: { children?: React.ReactNode }) {
+    super(props);
+    this.state = {
+      redirect: null,
+      redirectType: null,
+    };
+  }
+
+  static getDerivedStateFromError(error: unknown): RedirectBoundaryState {
+    if (isRedirectError(error)) {
+      // Next.js parity: an outer RedirectBoundary that has already started
+      // handling a redirect marks the error as `handled` so that, if React
+      // re-throws the same error during a retry render, an inner boundary
+      // doesn't re-dispatch the same `router.replace()`. Vinext doesn't
+      // currently emit `handled` itself (we never assign it on the error
+      // object), but we keep the branch so behavior matches Next.js if a
+      // host or future change ever does.
+      if (error.handled) {
+        return {
+          redirect: null,
+          redirectType: null,
+        };
+      }
+
+      const url = getURLFromRedirectError(error);
+      if (url === null) {
+        // Malformed digest (e.g. `NEXT_REDIRECT;push;` with an empty URL
+        // segment). The server-side parser at next-error-digest.ts:51 also
+        // rejects this. Re-throw so the error reaches a regular error
+        // boundary instead of being silently swallowed.
+        throw error;
+      }
+
+      return {
+        redirect: url,
+        redirectType: getRedirectTypeFromError(error),
+      };
+    }
+
+    throw error;
+  }
+
+  render() {
+    const { redirect, redirectType } = this.state;
+    if (redirect !== null && redirectType !== null) {
+      return <HandleRedirect redirect={redirect} redirectType={redirectType} />;
+    }
+
+    return this.props.children;
+  }
+}
+
+export function RedirectBoundary({ children }: { children?: React.ReactNode }) {
+  return <RedirectErrorBoundary>{children}</RedirectErrorBoundary>;
+}
 
 /**
  * Generic ErrorBoundary used to wrap route segments with error.tsx.
@@ -51,15 +181,8 @@ export class ErrorBoundaryInner extends React.Component<
     // notFound(), forbidden(), unauthorized(), and redirect() must propagate
     // past error boundaries. Re-throw them so they bubble up to the
     // framework's HTTP access fallback / redirect handler.
-    if (error && typeof error === "object" && "digest" in error) {
-      const digest = String(error.digest);
-      if (
-        digest === "NEXT_NOT_FOUND" || // legacy compat
-        digest.startsWith("NEXT_HTTP_ERROR_FALLBACK;") ||
-        digest.startsWith("NEXT_REDIRECT;")
-      ) {
-        throw error;
-      }
+    if (isNavigationSignalError(error)) {
+      throw error;
     }
     return { error: { thrownValue: error } };
   }
@@ -348,15 +471,10 @@ export class DevRecoveryBoundary extends React.Component<
   }
 
   static getDerivedStateFromError(error: unknown): Partial<DevRecoveryBoundaryState> {
-    if (error && typeof error === "object" && "digest" in error) {
-      const digest = String(error.digest);
-      if (
-        digest === "NEXT_NOT_FOUND" ||
-        digest.startsWith("NEXT_HTTP_ERROR_FALLBACK;") ||
-        digest.startsWith("NEXT_REDIRECT;")
-      ) {
-        throw error;
-      }
+    // Re-throw routing sentinels so they still reach NotFoundBoundary /
+    // RedirectBoundary / Forbidden / Unauthorized above.
+    if (isNavigationSignalError(error)) {
+      throw error;
     }
     return { error: { thrownValue: error } };
   }
