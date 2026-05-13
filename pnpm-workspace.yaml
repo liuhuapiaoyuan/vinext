@@ -1,11 +1,8 @@
+autoInstallPeers: false
+frozenLockfile: true
+preferFrozenLockfile: true
 blockExoticSubdeps: true
 minimumReleaseAge: 1440
-minimumReleaseAgeExclude:
-  - "@vitejs/plugin-rsc"
-  - react-server-dom-webpack
-  - react-dom
-  - react
-  - next
 
 packages:
   - packages/*
@@ -102,10 +99,11 @@ peerDependencyRules:
     - webpack
     - rollup
 
-onlyBuiltDependencies:
-  - better-sqlite3
-  - esbuild
-  - sharp
-  - workerd
-  - "@parcel/watcher"
-  - "@swc/core"
+allowBuilds:
+  better-sqlite3: true
+  esbuild: true
+  sharp: true
+  workerd: true
+  "@parcel/watcher": true
+  "@swc/core": true
+  unrs-resolver: false
