@@ -13,6 +13,7 @@
 import * as React from "react";
 import { notifyAppRouterTransitionStart } from "../client/instrumentation-client-state.js";
 import { AppElementsWire } from "../server/app-elements.js";
+import { createExternalHistoryStatePreservingMetadata } from "../server/app-history-state.js";
 import {
   createRscRequestHeaders,
   createRscRequestUrl,
@@ -2010,7 +2011,12 @@ if (!isServer) {
       unused: string,
       url?: string | URL | null,
     ): void {
-      state.originalPushState.call(window.history, data, unused, url);
+      state.originalPushState.call(
+        window.history,
+        createExternalHistoryStatePreservingMetadata(data, window.history.state),
+        unused,
+        url,
+      );
       if (state.suppressUrlNotifyCount === 0) {
         commitClientNavigationState();
       }
@@ -2021,7 +2027,12 @@ if (!isServer) {
       unused: string,
       url?: string | URL | null,
     ): void {
-      state.originalReplaceState.call(window.history, data, unused, url);
+      state.originalReplaceState.call(
+        window.history,
+        createExternalHistoryStatePreservingMetadata(data, window.history.state),
+        unused,
+        url,
+      );
       if (state.suppressUrlNotifyCount === 0) {
         commitClientNavigationState();
       }
