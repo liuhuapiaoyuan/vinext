@@ -2,6 +2,7 @@ import { hasBasePath, stripBasePath } from "../utils/base-path.js";
 
 export type LinkPrefetchIntent = "viewport" | "intent";
 export type LinkPrefetchPriority = "low" | "high";
+export type LinkPrefetchRouterMode = "app" | "pages";
 
 export type LinkPrefetchDecision =
   | {
@@ -20,13 +21,31 @@ export function canLinkPrefetch(input: {
   return input.nodeEnv === "production" && input.prefetch !== false && !input.isDangerous;
 }
 
+export function canLinkIntentPrefetch(input: {
+  nodeEnv: string | undefined;
+  prefetch: boolean | "auto" | null | undefined;
+  isDangerous: boolean;
+  routerMode: LinkPrefetchRouterMode;
+}): boolean {
+  if (input.nodeEnv !== "production" || input.isDangerous) return false;
+  return input.routerMode === "pages" || input.prefetch !== false;
+}
+
 export function getLinkPrefetchDecision(input: {
   nodeEnv: string | undefined;
   prefetch: boolean | "auto" | null | undefined;
   isDangerous: boolean;
   intent: LinkPrefetchIntent;
+  routerMode?: LinkPrefetchRouterMode;
 }): LinkPrefetchDecision {
-  if (!canLinkPrefetch(input)) return { shouldPrefetch: false };
+  const shouldPrefetch =
+    input.intent === "intent"
+      ? canLinkIntentPrefetch({
+          ...input,
+          routerMode: input.routerMode ?? "app",
+        })
+      : canLinkPrefetch(input);
+  if (!shouldPrefetch) return { shouldPrefetch: false };
 
   return {
     shouldPrefetch: true,

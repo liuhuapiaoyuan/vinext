@@ -137,6 +137,14 @@ declare global {
      */
     __VINEXT_RSC_PREFETCHED_URLS__: Set<string> | undefined;
 
+    /**
+     * Re-prefetches currently visible App Router links after cache invalidation
+     * or router-state changes. Installed by `next/link` when Link is loaded on
+     * the client; called opportunistically by navigation/cache owners without a
+     * direct import to avoid a circular dependency.
+     */
+    __VINEXT_PING_VISIBLE_LINKS__: (() => void) | undefined;
+
     // ── Next.js conventional globals ────────────────────────────────────────
     //
     // `__NEXT_DATA__` is already declared by `next/dist/client/index.d.ts` as

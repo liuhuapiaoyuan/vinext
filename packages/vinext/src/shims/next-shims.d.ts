@@ -117,7 +117,8 @@ declare module "next/link" {
     href: string | { pathname?: string; query?: UrlQuery };
     as?: string;
     replace?: boolean;
-    prefetch?: boolean;
+    prefetch?: boolean | "auto" | null;
+    unstable_dynamicOnHover?: boolean;
     passHref?: boolean;
     scroll?: boolean;
     locale?: string | false;

@@ -32,7 +32,12 @@ import { AppElementsWire } from "../server/app-elements.js";
 import { createRscRequestHeaders, createRscRequestUrl } from "../server/app-rsc-cache-busting.js";
 import { VINEXT_MOUNTED_SLOTS_HEADER } from "../server/headers.js";
 import { isDangerousScheme } from "./url-safety.js";
-import { canLinkPrefetch, getLinkPrefetchHref } from "./link-prefetch.js";
+import {
+  canLinkIntentPrefetch,
+  canLinkPrefetch,
+  getLinkPrefetchHref,
+  type LinkPrefetchRouterMode,
+} from "./link-prefetch.js";
 import {
   resolveRelativeHref,
   toBrowserNavigationHref,
@@ -62,6 +67,11 @@ type LinkProps = {
   replace?: boolean;
   /** Prefetch the page in the background (App Router default: auto, Pages Router default: true) */
   prefetch?: boolean | "auto" | null;
+  /**
+   * Unstable App Router option matching Next.js canary: an automatic prefetch
+   * is upgraded to a full prefetch when the user shows navigation intent.
+   */
+  unstable_dynamicOnHover?: boolean;
   /** Whether to pass the href to the child element */
   passHref?: boolean;
   /** Scroll to top on navigation (default: true) */
@@ -139,6 +149,12 @@ function toSameOriginRouteHref(href: string): string | null {
   if (url.origin !== window.location.origin) return null;
 
   return `${stripBasePath(url.pathname, __basePath)}${url.search}`;
+}
+
+function getLinkPrefetchRouterMode(): LinkPrefetchRouterMode {
+  return typeof window !== "undefined" && typeof window.__VINEXT_RSC_NAVIGATE__ === "function"
+    ? "app"
+    : "pages";
 }
 
 export function canAutoPrefetchFullAppRoute(href: string): boolean {
@@ -241,7 +257,41 @@ function prefetchUrl(href: string, mode: LinkPrefetchMode, priority: "low" | "hi
  * All Link elements use the same observer to minimize resource usage.
  */
 let sharedObserver: IntersectionObserver | null = null;
-const observerCallbacks = new WeakMap<Element, () => void>();
+type LinkPrefetchInstance = {
+  href: string;
+  isVisible: boolean;
+  mode: LinkPrefetchMode;
+  routerMode: LinkPrefetchRouterMode;
+  viewportPrefetched: boolean;
+};
+
+const observedLinkPrefetches = new WeakMap<Element, LinkPrefetchInstance>();
+const visibleLinkPrefetches = new Set<LinkPrefetchInstance>();
+
+function setVisibleLinkPrefetch(instance: LinkPrefetchInstance, isVisible: boolean): void {
+  instance.isVisible = isVisible;
+  if (isVisible) {
+    visibleLinkPrefetches.add(instance);
+    if (instance.routerMode === "pages" && instance.viewportPrefetched) return;
+    prefetchUrl(instance.href, instance.mode, "low");
+    instance.viewportPrefetched = true;
+  } else {
+    visibleLinkPrefetches.delete(instance);
+  }
+}
+
+function registerVisibleLinkPing(): void {
+  if (typeof window === "undefined") return;
+  window.__VINEXT_PING_VISIBLE_LINKS__ = pingVisibleLinkPrefetches;
+}
+
+function pingVisibleLinkPrefetches(): void {
+  for (const instance of visibleLinkPrefetches) {
+    if (instance.isVisible && instance.routerMode === "app") {
+      prefetchUrl(instance.href, instance.mode, "low");
+    }
+  }
+}
 
 function getSharedObserver(): IntersectionObserver | null {
   if (typeof window === "undefined" || typeof IntersectionObserver === "undefined") return null;
@@ -250,15 +300,9 @@ function getSharedObserver(): IntersectionObserver | null {
   sharedObserver = new IntersectionObserver(
     (entries) => {
       for (const entry of entries) {
-        if (entry.isIntersecting) {
-          const callback = observerCallbacks.get(entry.target);
-          if (callback) {
-            callback();
-            // Unobserve after prefetching — only prefetch once
-            sharedObserver?.unobserve(entry.target);
-            observerCallbacks.delete(entry.target);
-          }
-        }
+        const instance = observedLinkPrefetches.get(entry.target);
+        if (!instance) continue;
+        setVisibleLinkPrefetch(instance, entry.isIntersecting || entry.intersectionRatio > 0);
       }
     },
     {
@@ -343,6 +387,7 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
     onMouseEnter,
     onTouchStart,
     onNavigate,
+    unstable_dynamicOnHover = false,
     ...rest
   },
   forwardedRef,
@@ -377,7 +422,7 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
   // into a full RSC prefetch, matching Next.js's public prefetch contract.
   const internalRef = useRef<HTMLAnchorElement | null>(null);
   const prefetchMode = resolveLinkPrefetchMode(prefetchProp, isDangerous);
-  const shouldPrefetch = canLinkPrefetch({
+  const shouldViewportPrefetch = canLinkPrefetch({
     nodeEnv: process.env.NODE_ENV,
     prefetch: prefetchProp,
     isDangerous,
@@ -394,7 +439,7 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
   );
 
   useEffect(() => {
-    if (!shouldPrefetch || typeof window === "undefined") return;
+    if (!shouldViewportPrefetch || typeof window === "undefined") return;
     const node = internalRef.current;
     if (!node) return;
 
@@ -408,19 +453,44 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
     const observer = getSharedObserver();
     if (!observer) return;
 
-    observerCallbacks.set(node, () => prefetchUrl(hrefToPrefetch, prefetchMode, "low"));
+    registerVisibleLinkPing();
+    const instance: LinkPrefetchInstance = {
+      href: hrefToPrefetch,
+      isVisible: false,
+      mode: prefetchMode,
+      routerMode: getLinkPrefetchRouterMode(),
+      viewportPrefetched: false,
+    };
+    observedLinkPrefetches.set(node, instance);
     observer.observe(node);
 
     return () => {
       observer.unobserve(node);
-      observerCallbacks.delete(node);
+      observedLinkPrefetches.delete(node);
+      visibleLinkPrefetches.delete(instance);
     };
-  }, [shouldPrefetch, prefetchMode, localizedHref]);
+  }, [shouldViewportPrefetch, prefetchMode, localizedHref]);
 
   const prefetchOnIntent = useCallback(() => {
-    if (!shouldPrefetch) return;
-    prefetchUrl(localizedHref, prefetchMode, "high");
-  }, [shouldPrefetch, prefetchMode, localizedHref]);
+    if (
+      !canLinkIntentPrefetch({
+        nodeEnv: process.env.NODE_ENV,
+        prefetch: prefetchProp,
+        isDangerous,
+        routerMode: getLinkPrefetchRouterMode(),
+      })
+    ) {
+      return;
+    }
+    const intentMode = unstable_dynamicOnHover ? "full" : prefetchMode;
+    if (unstable_dynamicOnHover && internalRef.current) {
+      const instance = observedLinkPrefetches.get(internalRef.current);
+      if (instance) {
+        instance.mode = "full";
+      }
+    }
+    prefetchUrl(localizedHref, intentMode, "high");
+  }, [prefetchProp, isDangerous, prefetchMode, localizedHref, unstable_dynamicOnHover]);
 
   const handleMouseEnter = useCallback(
     (e: MouseEvent<HTMLAnchorElement>) => {

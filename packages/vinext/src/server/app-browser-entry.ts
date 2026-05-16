@@ -545,6 +545,7 @@ function BrowserRoot({
 
   useLayoutEffect(() => {
     setMountedSlotsHeader(getMountedSlotIdsHeader(stateRef.current.elements));
+    window.__VINEXT_PING_VISIBLE_LINKS__?.();
   }, [treeState.elements]);
 
   useLayoutEffect(() => {
