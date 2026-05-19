@@ -38,6 +38,10 @@ type MetadataRouteFunctions = {
 };
 
 const routeFunctionCache = new WeakMap<MetadataRuntimeRoute, MetadataRouteFunctions>();
+const CACHE_HEADERS = {
+  noCache: "no-cache, no-store",
+  revalidate: "public, max-age=0, must-revalidate",
+} as const;
 
 function isObject(value: unknown): value is object {
   return typeof value === "object" && value !== null;
@@ -76,6 +80,25 @@ function isImageMetadataRoute(route: MetadataRuntimeRoute): boolean {
     route.type === "opengraph-image" ||
     route.type === "twitter-image"
   );
+}
+
+function metadataRouteCacheHeader(route: MetadataRuntimeRoute): string {
+  if (route.isDynamic && isImageMetadataRoute(route) && process.env.NODE_ENV === "development") {
+    return CACHE_HEADERS.noCache;
+  }
+  return CACHE_HEADERS.revalidate;
+}
+
+function withMetadataRouteCacheHeader(response: Response, route: MetadataRuntimeRoute): Response {
+  const headers = new Headers(response.headers);
+  if (!headers.has("Cache-Control")) {
+    headers.set("Cache-Control", metadataRouteCacheHeader(route));
+  }
+  return new Response(response.body, {
+    headers,
+    status: response.status,
+    statusText: response.statusText,
+  });
 }
 
 function getMetadataRouteFunctions(route: MetadataRuntimeRoute): MetadataRouteFunctions {
@@ -194,7 +217,7 @@ async function handleGeneratedSitemap(
     id: makeThenableMetadataRouteId(matchedId),
   });
   if (result instanceof Response) {
-    return result;
+    return withMetadataRouteCacheHeader(result, route);
   }
   if (!isSitemapEntries(result)) {
     throw new TypeError("Metadata sitemap routes must return an array.");
@@ -202,7 +225,7 @@ async function handleGeneratedSitemap(
   return new Response(sitemapToXml(result), {
     headers: {
       "Content-Type": route.contentType,
-      "Cache-Control": "public, max-age=0, must-revalidate",
+      "Cache-Control": metadataRouteCacheHeader(route),
     },
   });
 }
@@ -276,7 +299,7 @@ async function callDynamicMetadataRoute(
   }
 
   if (result instanceof Response) {
-    return result;
+    return withMetadataRouteCacheHeader(result, route);
   }
 
   let body: string;
@@ -306,7 +329,7 @@ async function callDynamicMetadataRoute(
   return new Response(body, {
     headers: {
       "Content-Type": route.contentType,
-      "Cache-Control": "public, max-age=0, must-revalidate",
+      "Cache-Control": metadataRouteCacheHeader(route),
     },
   });
 }
@@ -327,7 +350,7 @@ function serveStaticMetadataRoute(route: MetadataRuntimeRoute): Response {
     return new Response(bytes, {
       headers: {
         "Content-Type": route.contentType,
-        "Cache-Control": "public, max-age=0, must-revalidate",
+        "Cache-Control": metadataRouteCacheHeader(route),
       },
     });
   } catch (error) {

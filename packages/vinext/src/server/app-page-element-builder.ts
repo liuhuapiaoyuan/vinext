@@ -203,6 +203,7 @@ export async function buildPageElements<
     makeThenableParams,
     matchedParams: params,
     resolvedMetadata,
+    resolvedMetadataPathname: routePath,
     resolvedViewport,
     interceptionContext: opts?.interceptionContext ?? null,
     interception,

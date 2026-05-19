@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 import { handleMetadataRouteRequest } from "../packages/vinext/src/server/metadata-route-response.js";
 import type { MetadataFileRoute } from "../packages/vinext/src/server/metadata-routes.js";
+import { withEnvVar } from "./env-test-helpers.js";
 
 type MetadataRuntimeRoute = MetadataFileRoute & {
   fileDataBase64?: string;
@@ -64,6 +65,30 @@ describe("handleMetadataRouteRequest", () => {
     expect(
       Array.from(new Uint8Array((await response?.arrayBuffer()) ?? new ArrayBuffer(0))),
     ).toEqual([105, 99, 111, 110, 45, 98, 121, 116, 101, 115]);
+  });
+
+  it("keeps static image metadata route cache control stable in development", async () => {
+    await withEnvVar("NODE_ENV", "development", async () => {
+      const route = {
+        type: "apple-icon",
+        isDynamic: false,
+        filePath: "/tmp/app/apple-icon.png",
+        routePrefix: "",
+        routeSegments: [],
+        servedUrl: "/apple-icon.png",
+        contentType: "image/png",
+        fileDataBase64: btoa("icon-bytes"),
+      } satisfies MetadataRuntimeRoute;
+
+      const response = await handleMetadataRouteRequest({
+        metadataRoutes: [route],
+        cleanPathname: "/apple-icon.png",
+        makeThenableParams,
+      });
+
+      expect(response?.status).toBe(200);
+      expect(response?.headers.get("cache-control")).toBe("public, max-age=0, must-revalidate");
+    });
   });
 
   it("caches metadata route module function lookups", async () => {
@@ -355,6 +380,33 @@ describe("handleMetadataRouteRequest", () => {
     expect(receivedSyncId).toBe("post-small");
     expect(receivedSlug).toBe("post");
     expect(await response?.text()).toBe("image:post-small");
+  });
+
+  it("sets metadata cache control on dynamic image route Response results", async () => {
+    // Ported from Next.js: test/e2e/app-dir/metadata-dynamic-routes/index.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/metadata-dynamic-routes/index.test.ts
+    const route = {
+      type: "opengraph-image",
+      isDynamic: true,
+      filePath: "/tmp/app/opengraph-image.tsx",
+      routePrefix: "",
+      routeSegments: [],
+      servedUrl: "/opengraph-image",
+      contentType: "image/png",
+      module: {
+        default: () => new Response("image", { headers: { "Content-Type": "image/png" } }),
+      },
+    } satisfies MetadataFileRoute;
+
+    const response = await handleMetadataRouteRequest({
+      metadataRoutes: [route],
+      cleanPathname: "/opengraph-image",
+      makeThenableParams,
+    });
+
+    expect(response?.status).toBe(200);
+    expect(response?.headers.get("content-type")).toBe("image/png");
+    expect(response?.headers.get("cache-control")).toBe("public, max-age=0, must-revalidate");
   });
 
   it("returns 404 for unknown or invalid generated image ids", async () => {

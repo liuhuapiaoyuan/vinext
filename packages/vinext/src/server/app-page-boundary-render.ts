@@ -305,6 +305,7 @@ export async function renderAppPageHttpAccessFallback<TModule extends AppPageMod
   }
 
   const layoutModules = options.layoutModules ?? options.route?.layouts ?? options.rootLayouts;
+  const pathname = new URL(options.requestUrl).pathname;
   const routeSegments = resolveHttpAccessFallbackHeadRouteSegments(options.route, layoutModules);
   const { metadata, viewport } = await resolveAppPageHead({
     basePath: options.basePath ?? "",
@@ -315,7 +316,7 @@ export async function renderAppPageHttpAccessFallback<TModule extends AppPageMod
     ),
     metadataRoutes: options.metadataRoutes,
     params: options.matchedParams,
-    routePath: options.route?.pattern ?? new URL(options.requestUrl).pathname,
+    routePath: options.route?.pattern ?? pathname,
     routeSegments,
   });
 
@@ -324,7 +325,7 @@ export async function renderAppPageHttpAccessFallback<TModule extends AppPageMod
     createElement("meta", { content: "noindex", key: "robots", name: "robots" }),
   ];
   if (metadata) {
-    headElements.push(createElement(MetadataHead, { key: "metadata", metadata }));
+    headElements.push(createElement(MetadataHead, { key: "metadata", metadata, pathname }));
   }
   headElements.push(createElement(ViewportHead, { key: "viewport", viewport }));
 
@@ -392,7 +393,7 @@ export async function renderAppPageErrorBoundary<TModule extends AppPageModule>(
         routeSegments: options.route?.routeSegments,
       });
       if (metadata) {
-        headElements.push(createElement(MetadataHead, { key: "metadata", metadata }));
+        headElements.push(createElement(MetadataHead, { key: "metadata", metadata, pathname }));
       }
       headElements.push(createElement(ViewportHead, { key: "viewport", viewport }));
     } catch (error) {

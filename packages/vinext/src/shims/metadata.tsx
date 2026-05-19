@@ -6,6 +6,7 @@
  */
 import React from "react";
 import { makeThenableParams } from "./thenable-params.js";
+import { isAbsoluteOrProtocolRelativeUrl } from "./url-utils.js";
 
 // ---------------------------------------------------------------------------
 // Viewport types and resolution
@@ -139,15 +140,7 @@ export type Metadata = {
     description?: string;
     url?: string | URL;
     siteName?: string;
-    images?:
-      | string
-      | URL
-      | { url: string | URL; width?: number; height?: number; alt?: string; type?: string }
-      | Array<
-          | string
-          | URL
-          | { url: string | URL; width?: number; height?: number; alt?: string; type?: string }
-        >;
+    images?: string | URL | SocialImageDescriptor | Array<string | URL | SocialImageDescriptor>;
     videos?: Array<{ url: string | URL; width?: number; height?: number }>;
     audio?: Array<{ url: string | URL }>;
     locale?: string;
@@ -162,15 +155,7 @@ export type Metadata = {
     siteId?: string;
     title?: string;
     description?: string;
-    images?:
-      | string
-      | URL
-      | { url: string | URL; alt?: string; width?: number; height?: number; type?: string }
-      | Array<
-          | string
-          | URL
-          | { url: string | URL; alt?: string; width?: number; height?: number; type?: string }
-        >;
+    images?: string | URL | SocialImageDescriptor | Array<string | URL | SocialImageDescriptor>;
     creator?: string;
     creatorId?: string;
     players?: TwitterPlayerDescriptor | TwitterPlayerDescriptor[];
@@ -264,6 +249,14 @@ type TwitterAppDescriptor = {
     googleplay?: string | URL;
   };
   name?: string;
+};
+
+type SocialImageDescriptor = {
+  url: string | URL;
+  alt?: string;
+  width?: number;
+  height?: number;
+  type?: string;
 };
 
 type IconDescriptor = {
@@ -601,7 +594,136 @@ function normalizeUrlDescriptorEntries<T extends { url: string | URL }>(
   return [normalizeUrlDescriptor(value, createDescriptor)];
 }
 
-export function MetadataHead({ metadata }: { metadata: Metadata }) {
+function stringifyUrl(url: string | URL): string {
+  return typeof url === "string" ? url : url.toString();
+}
+
+function createLocalMetadataBase(): URL {
+  const protocol = process.env.__NEXT_EXPERIMENTAL_HTTPS ? "https" : "http";
+  return new URL(`${protocol}://localhost:${process.env.PORT || 3000}`);
+}
+
+function getPreviewDeploymentUrl(): URL | null {
+  const origin = process.env.VERCEL_BRANCH_URL || process.env.VERCEL_URL;
+  return origin ? new URL(`https://${origin}`) : null;
+}
+
+function getProductionDeploymentUrl(): URL | null {
+  const origin = process.env.VERCEL_PROJECT_PRODUCTION_URL;
+  return origin ? new URL(`https://${origin}`) : null;
+}
+
+function getSocialImageMetadataBaseFallback(metadataBase: URL | null | undefined): URL {
+  const defaultMetadataBase = createLocalMetadataBase();
+  const previewDeploymentUrl = getPreviewDeploymentUrl();
+  const productionDeploymentUrl = getProductionDeploymentUrl();
+
+  if (process.env.NODE_ENV === "development") {
+    return defaultMetadataBase;
+  }
+
+  if (
+    process.env.NODE_ENV === "production" &&
+    process.env.VERCEL_ENV === "preview" &&
+    previewDeploymentUrl
+  ) {
+    return previewDeploymentUrl;
+  }
+
+  return metadataBase || productionDeploymentUrl || defaultMetadataBase;
+}
+
+function trimSlashes(value: string): string {
+  return value.replace(/^\/+|\/+$/g, "");
+}
+
+function joinMetadataPath(basePathname: string, pathname: string): string {
+  if (!basePathname || basePathname === "/") {
+    return pathname;
+  }
+
+  const base = trimSlashes(basePathname);
+  const path = trimSlashes(pathname);
+  return path ? `/${base}/${path}` : `/${base}`;
+}
+
+function resolveRelativeMetadataUrl(url: string, pathname: string): string {
+  if (url === "." || url === "./") {
+    return pathname || "/";
+  }
+  if (!url.startsWith("./")) {
+    return url;
+  }
+
+  const base = pathname === "/" ? "" : pathname.replace(/\/+$/g, "");
+  return `${base}/${url.slice(2)}`;
+}
+
+function formatResolvedMetadataUrl(url: URL): string {
+  if (url.pathname === "/" && url.search === "" && url.hash === "") {
+    return url.origin;
+  }
+  return url.href;
+}
+
+function resolveMetadataUrl(url: string | URL, metadataBase: URL | null | undefined): string {
+  const value = stringifyUrl(url);
+  if (isAbsoluteOrProtocolRelativeUrl(value) || !metadataBase) {
+    return value;
+  }
+
+  try {
+    return formatResolvedMetadataUrl(
+      new URL(joinMetadataPath(metadataBase.pathname, value), metadataBase),
+    );
+  } catch {
+    return value;
+  }
+}
+
+function resolveCanonicalUrl(
+  url: string | URL,
+  metadataBase: URL | null | undefined,
+  pathname: string,
+): string {
+  if (url instanceof URL) {
+    return resolveMetadataUrl(url, metadataBase);
+  }
+  return resolveMetadataUrl(resolveRelativeMetadataUrl(url, pathname), metadataBase);
+}
+
+function isSocialImageDescriptor(
+  value: string | URL | SocialImageDescriptor,
+): value is SocialImageDescriptor {
+  return typeof value === "object" && !(value instanceof URL);
+}
+
+function isMetadataRouteSocialImage(value: SocialImageDescriptor): boolean {
+  return Reflect.get(value, "metadataRoute") === true;
+}
+
+function resolveSocialImageUrl(
+  image: string | URL | SocialImageDescriptor,
+  metadataBase: URL | null | undefined,
+): string {
+  const imageUrl = isSocialImageDescriptor(image) ? image.url : image;
+  const metadataRoute = isSocialImageDescriptor(image) && isMetadataRouteSocialImage(image);
+  if (
+    typeof imageUrl === "string" &&
+    !isAbsoluteOrProtocolRelativeUrl(imageUrl) &&
+    (!metadataBase || metadataRoute)
+  ) {
+    return resolveMetadataUrl(imageUrl, getSocialImageMetadataBaseFallback(metadataBase));
+  }
+  return resolveMetadataUrl(imageUrl, metadataBase);
+}
+
+type MetadataHeadProps = {
+  metadata: Metadata;
+  pathname?: string;
+};
+
+export function MetadataHead({ metadata, pathname = "/" }: MetadataHeadProps) {
   const elements: React.ReactElement[] = [];
   let key = 0;
 
@@ -611,15 +733,7 @@ export function MetadataHead({ metadata }: { metadata: Metadata }) {
   function resolveUrl(url: string | URL | undefined): string | undefined;
   function resolveUrl(url: string | URL | undefined): string | undefined {
     if (!url) return undefined;
-    // Coerce URL objects to strings (Next.js metadata allows string | URL)
-    const s = typeof url === "string" ? url : url instanceof URL ? url.toString() : String(url);
-    if (!base) return s;
-    if (s.startsWith("http://") || s.startsWith("https://") || s.startsWith("//")) return s;
-    try {
-      return new URL(s, base).toString();
-    } catch {
-      return s;
-    }
+    return resolveMetadataUrl(url, base);
   }
 
   // Title
@@ -764,8 +878,9 @@ export function MetadataHead({ metadata }: { metadata: Metadata }) {
             ? og.images
             : [og.images];
       for (const img of imgList) {
-        const imgUrl = typeof img === "string" || img instanceof URL ? img : img.url;
-        elements.push(<meta key={key++} property="og:image" content={resolveUrl(imgUrl)} />);
+        elements.push(
+          <meta key={key++} property="og:image" content={resolveSocialImageUrl(img, base)} />,
+        );
         if (typeof img !== "string" && !(img instanceof URL)) {
           if (img.width)
             elements.push(
@@ -822,8 +937,9 @@ export function MetadataHead({ metadata }: { metadata: Metadata }) {
             ? tw.images
             : [tw.images];
       for (const img of imgList) {
-        const imgUrl = typeof img === "string" || img instanceof URL ? img : img.url;
-        elements.push(<meta key={key++} name="twitter:image" content={resolveUrl(imgUrl)} />);
+        elements.push(
+          <meta key={key++} name="twitter:image" content={resolveSocialImageUrl(img, base)} />,
+        );
         if (typeof img !== "string" && !(img instanceof URL)) {
           if (img.type) {
             elements.push(<meta key={key++} name="twitter:image:type" content={img.type} />);
@@ -954,14 +1070,20 @@ export function MetadataHead({ metadata }: { metadata: Metadata }) {
 
   // Manifest
   if (metadata.manifest) {
-    elements.push(<link key={key++} rel="manifest" href={resolveUrl(metadata.manifest)} />);
+    elements.push(<link key={key++} rel="manifest" href={stringifyUrl(metadata.manifest)} />);
   }
 
   // Alternates
   if (metadata.alternates) {
     const alt = metadata.alternates;
     if (alt.canonical) {
-      elements.push(<link key={key++} rel="canonical" href={resolveUrl(alt.canonical)} />);
+      elements.push(
+        <link
+          key={key++}
+          rel="canonical"
+          href={resolveCanonicalUrl(alt.canonical, base, pathname)}
+        />,
+      );
     }
     if (alt.languages) {
       for (const [lang, href] of Object.entries(alt.languages)) {

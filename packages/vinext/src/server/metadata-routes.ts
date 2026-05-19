@@ -114,7 +114,7 @@ export const METADATA_FILE_MAP: Record<
     contentType: "application/xml",
     canBeDynamic: true,
     staticExtensions: [".xml"],
-    dynamicExtensions: [".ts", ".js"],
+    dynamicExtensions: [".tsx", ".ts", ".jsx", ".js"],
     nestable: true,
   },
   robots: {
@@ -122,7 +122,7 @@ export const METADATA_FILE_MAP: Record<
     contentType: "text/plain",
     canBeDynamic: true,
     staticExtensions: [".txt"],
-    dynamicExtensions: [".ts", ".js"],
+    dynamicExtensions: [".tsx", ".ts", ".jsx", ".js"],
     nestable: false,
   },
   manifest: {
@@ -130,7 +130,7 @@ export const METADATA_FILE_MAP: Record<
     contentType: "application/manifest+json",
     canBeDynamic: true,
     staticExtensions: [".json", ".webmanifest"],
-    dynamicExtensions: [".ts", ".js"],
+    dynamicExtensions: [".tsx", ".ts", ".jsx", ".js"],
     nestable: false,
   },
   favicon: {
@@ -146,7 +146,7 @@ export const METADATA_FILE_MAP: Record<
     contentType: "image/png",
     canBeDynamic: true,
     staticExtensions: [".ico", ".jpg", ".jpeg", ".png", ".svg"],
-    dynamicExtensions: [".ts", ".tsx", ".js"],
+    dynamicExtensions: [".tsx", ".ts", ".jsx", ".js"],
     nestable: true,
   },
   "opengraph-image": {
@@ -154,7 +154,7 @@ export const METADATA_FILE_MAP: Record<
     contentType: "image/png",
     canBeDynamic: true,
     staticExtensions: [".jpg", ".jpeg", ".png", ".gif"],
-    dynamicExtensions: [".ts", ".tsx", ".js"],
+    dynamicExtensions: [".tsx", ".ts", ".jsx", ".js"],
     nestable: true,
   },
   "twitter-image": {
@@ -162,7 +162,7 @@ export const METADATA_FILE_MAP: Record<
     contentType: "image/png",
     canBeDynamic: true,
     staticExtensions: [".jpg", ".jpeg", ".png", ".gif"],
-    dynamicExtensions: [".ts", ".tsx", ".js"],
+    dynamicExtensions: [".tsx", ".ts", ".jsx", ".js"],
     nestable: true,
   },
   "apple-icon": {
@@ -170,7 +170,7 @@ export const METADATA_FILE_MAP: Record<
     contentType: "image/png",
     canBeDynamic: true,
     staticExtensions: [".jpg", ".jpeg", ".png"],
-    dynamicExtensions: [".ts", ".tsx", ".js"],
+    dynamicExtensions: [".tsx", ".ts", ".jsx", ".js"],
     nestable: true,
   },
 };
@@ -327,15 +327,15 @@ export function robotsToText(config: RobotsConfig): string {
     lines.push("");
   }
 
+  if (config.host) {
+    lines.push(`Host: ${config.host}`);
+  }
+
   if (config.sitemap) {
     const sitemaps = Array.isArray(config.sitemap) ? config.sitemap : [config.sitemap];
     for (const sitemap of sitemaps) {
       lines.push(`Sitemap: ${sitemap}`);
     }
-  }
-
-  if (config.host) {
-    lines.push(`Host: ${config.host}`);
   }
 
   return lines.join("\n").trim() + "\n";

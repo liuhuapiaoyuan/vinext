@@ -10,7 +10,10 @@ import { describe, it, expect, beforeEach, afterEach } from "vite-plus/test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { resolveSitemap as nextResolveSitemap } from "next/dist/build/webpack/loaders/metadata/resolve-route-data.js";
+import {
+  resolveRobots as nextResolveRobots,
+  resolveSitemap as nextResolveSitemap,
+} from "next/dist/build/webpack/loaders/metadata/resolve-route-data.js";
 import {
   sitemapToXml,
   robotsToText,
@@ -29,6 +32,12 @@ import {
 // several edge cases are surprising but observable in Next itself.
 function expectSitemapToMatchNext(entries: SitemapEntry[]): void {
   expect(sitemapToXml(entries)).toBe(nextResolveSitemap(entries));
+}
+
+type NextRobotsConfig = Parameters<typeof nextResolveRobots>[0];
+
+function expectRobotsToMatchNext(config: RobotsConfig & NextRobotsConfig): void {
+  expect(robotsToText(config)).toBe(nextResolveRobots(config));
 }
 
 describe("matchMetadataRoutePattern", () => {
@@ -635,6 +644,33 @@ describe("robotsToText", () => {
     expect(txt).toContain("Host: example.com");
   });
 
+  it("emits Host before Sitemap like Next.js dynamic robots routes", () => {
+    // Ported from Next.js: test/e2e/app-dir/metadata-dynamic-routes/index.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/metadata-dynamic-routes/index.test.ts
+    const config = {
+      rules: [
+        { userAgent: "Googlebot", allow: "/" },
+        { userAgent: ["Applebot", "Bingbot"], disallow: "/", crawlDelay: 2 },
+      ],
+      host: "https://example.com",
+      sitemap: "https://example.com/sitemap.xml",
+    } satisfies RobotsConfig;
+
+    expectRobotsToMatchNext(config);
+    expect(robotsToText(config)).toBe(
+      "User-Agent: Googlebot\n" +
+        "Allow: /\n" +
+        "\n" +
+        "User-Agent: Applebot\n" +
+        "User-Agent: Bingbot\n" +
+        "Disallow: /\n" +
+        "Crawl-delay: 2\n" +
+        "\n" +
+        "Host: https://example.com\n" +
+        "Sitemap: https://example.com/sitemap.xml\n",
+    );
+  });
+
   it("defaults user agent to *", () => {
     const config: RobotsConfig = {
       rules: { allow: "/" },
@@ -853,6 +889,15 @@ describe("scanMetadataFiles", () => {
     expect(icon).toBeDefined();
     expect(icon!.isDynamic).toBe(true);
     expect(icon!.servedUrl).toBe("/icon");
+  });
+
+  it("discovers dynamic sitemap.tsx routes", () => {
+    createFile("blog/sitemap.tsx");
+    const routes = scanMetadataFiles(tmpDir);
+    const sitemap = routes.find((r) => r.type === "sitemap");
+    expect(sitemap).toBeDefined();
+    expect(sitemap!.isDynamic).toBe(true);
+    expect(sitemap!.servedUrl).toBe("/blog/sitemap.xml");
   });
 
   it("discovers static icon.png at root", () => {

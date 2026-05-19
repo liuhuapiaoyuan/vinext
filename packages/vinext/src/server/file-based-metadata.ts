@@ -31,6 +31,7 @@ type SocialImageEntry = {
   height?: number;
   alt?: string;
   type?: string;
+  metadataRoute?: true;
 };
 
 type DynamicImageSize = {
@@ -335,6 +336,15 @@ function normalizeAppleEntry(value: string | URL | AppleIconEntry): AppleIconEnt
   return { ...value };
 }
 
+function markMetadataRouteSocialImage(entry: SocialImageEntry): SocialImageEntry {
+  Object.defineProperty(entry, "metadataRoute", {
+    configurable: true,
+    enumerable: false,
+    value: true,
+  });
+  return entry;
+}
+
 function buildSocialEntry(headData: MetadataRouteHeadData): SocialImageEntry | null {
   if (headData.kind !== "openGraph" && headData.kind !== "twitter") {
     return null;
@@ -355,7 +365,7 @@ function buildSocialEntry(headData: MetadataRouteHeadData): SocialImageEntry | n
   if (headData.type) {
     socialEntry.type = headData.type;
   }
-  return socialEntry;
+  return markMetadataRouteSocialImage(socialEntry);
 }
 
 function normalizeMetadataImageId(route: MetadataFileRoute, id: string | number): string | null {

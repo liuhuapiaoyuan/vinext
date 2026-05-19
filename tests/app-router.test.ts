@@ -3298,6 +3298,14 @@ describe("metadata routes integration (App Router)", () => {
     expect(data.display).toBe("standalone");
   });
 
+  it("serves sitemap routes that import but do not render client references", async () => {
+    // Ported from Next.js: test/e2e/app-dir/metadata-dynamic-routes/index.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/metadata-dynamic-routes/index.test.ts
+    const res = await fetch(`${baseUrl}/client-ref-dependency/sitemap.xml`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/xml");
+  });
+
   // Note: serving /icon from dynamic icon.tsx requires the RSC environment
   // to have access to Satori + Resvg Node APIs. This works when the RSC env
   // has proper Node externals configured. The discovery/routing is tested below.
