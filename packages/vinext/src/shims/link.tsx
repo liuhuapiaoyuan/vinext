@@ -55,6 +55,7 @@ import { appendSearchParamsToUrl, type UrlQuery, urlQueryToSearchParams } from "
 import { addLocalePrefix, getDomainLocaleUrl, type DomainLocale } from "../utils/domain-locale.js";
 import { getI18nContext } from "./i18n-context.js";
 import type { VinextLinkPrefetchRoute, VinextNextData } from "../client/vinext-next-data.js";
+import { navigatePagesRouterLink } from "../client/pages-router-link-navigation.js";
 import { createRouteTrieCache, matchRouteWithTrie } from "../routing/route-matching.js";
 import { stripBasePath } from "../utils/base-path.js";
 
@@ -329,6 +330,13 @@ function getDefaultLocale(): string | undefined {
   return getI18nContext()?.defaultLocale;
 }
 
+function getCurrentLocale(): string | undefined {
+  if (typeof window !== "undefined") {
+    return window.__VINEXT_LOCALE__;
+  }
+  return getI18nContext()?.locale;
+}
+
 function getDomainLocales(): readonly DomainLocale[] | undefined {
   if (typeof window !== "undefined") {
     return (window.__NEXT_DATA__ as VinextNextData | undefined)?.domainLocales;
@@ -363,8 +371,8 @@ function applyLocaleToHref(href: string, locale: string | false | undefined): st
     return href;
   }
 
-  if (locale === undefined) {
-    // No locale prop: keep current behavior (href as-is)
+  const resolvedLocale = locale ?? getCurrentLocale();
+  if (resolvedLocale === undefined) {
     return href;
   }
 
@@ -374,12 +382,12 @@ function applyLocaleToHref(href: string, locale: string | false | undefined): st
     return href;
   }
 
-  const domainLocaleHref = getDomainLocaleHref(href, locale);
+  const domainLocaleHref = getDomainLocaleHref(href, resolvedLocale);
   if (domainLocaleHref) {
     return domainLocaleHref;
   }
 
-  return addLocalePrefix(href, locale, getDefaultLocale() ?? "");
+  return addLocalePrefix(href, resolvedLocale, getDefaultLocale() ?? "");
 }
 
 const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
@@ -611,13 +619,8 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
       // Pages Router: use the Router singleton
       try {
         const routerModule = await import("next/router");
-        // oxlint-disable-next-line @typescript-eslint/no-explicit-any -- vinext's Router shim accepts (url, as, options)
-        const Router = routerModule.default as any;
-        if (replace) {
-          await Router.replace(absoluteHref, undefined, { scroll });
-        } else {
-          await Router.push(absoluteHref, undefined, { scroll });
-        }
+        const Router = routerModule.default;
+        await navigatePagesRouterLink(Router, { href: absoluteHref, replace, scroll, locale });
       } catch {
         // Fallback to hard navigation if router fails
         if (replace) {

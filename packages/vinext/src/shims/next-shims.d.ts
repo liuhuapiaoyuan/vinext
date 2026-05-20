@@ -27,12 +27,17 @@ declare module "next/router" {
   export function setSSRContext(ctx: any): void;
   export type WithRouterProps = { router: any };
   export type ExcludeRouterProps<P> = Pick<P, Exclude<keyof P, keyof WithRouterProps>>;
+  export type TransitionOptions = {
+    shallow?: boolean;
+    scroll?: boolean;
+    locale?: string | false;
+  };
   export function withRouter<P extends WithRouterProps>(
     ComposedComponent: ComponentType<P>,
   ): ComponentType<ExcludeRouterProps<P>>;
   const Router: {
-    push(url: string | object): Promise<boolean>;
-    replace(url: string | object): Promise<boolean>;
+    push(url: string | object, as?: string, options?: TransitionOptions): Promise<boolean>;
+    replace(url: string | object, as?: string, options?: TransitionOptions): Promise<boolean>;
     back(): void;
     reload(): void;
     prefetch(url: string): Promise<void>;

@@ -1,4 +1,5 @@
 import React, { type ComponentType, type ReactNode } from "react";
+import type { VinextNextData } from "../client/vinext-next-data.js";
 import type { CachedPagesValue } from "vinext/shims/cache";
 import { withScriptNonce } from "vinext/shims/script-nonce-context";
 import { getRequestExecutionContext } from "vinext/shims/request-context";
@@ -98,7 +99,9 @@ export function buildPagesNextDataScript(
     | "routePattern"
     | "safeJsonStringify"
     | "scriptNonce"
-  >,
+  > & {
+    vinext?: VinextNextData["__vinext"];
+  },
 ): string {
   const nextDataPayload: Record<string, unknown> = {
     props: { pageProps: options.pageProps },
@@ -113,6 +116,10 @@ export function buildPagesNextDataScript(
     nextDataPayload.locales = options.i18n.locales;
     nextDataPayload.defaultLocale = options.i18n.defaultLocale;
     nextDataPayload.domainLocales = options.i18n.domainLocales;
+  }
+
+  if (options.vinext) {
+    nextDataPayload.__vinext = options.vinext;
   }
 
   const localeGlobals = options.i18n.locales

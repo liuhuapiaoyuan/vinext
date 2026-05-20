@@ -3,8 +3,11 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { PAGES_FIXTURE_DIR } from "./helpers.js";
 import { isExternalUrl, isHashOnlyChange } from "../packages/vinext/src/shims/router.js";
+import { extractVinextNextDataJson } from "../packages/vinext/src/client/vinext-next-data.js";
 import { isValidModulePath } from "../packages/vinext/src/client/validate-module-path.js";
 import vinext from "../packages/vinext/src/index.js";
+import { safeJsonStringify } from "../packages/vinext/src/server/html.js";
+import { buildPagesNextDataScript } from "../packages/vinext/src/server/pages-page-response.js";
 import type { Plugin } from "vite-plus";
 import type { NextRouter } from "../packages/vinext/src/shims/router.js";
 import type {
@@ -14,6 +17,16 @@ import type {
 } from "../packages/vinext/src/shims/cache.js";
 
 const FIXTURE_DIR = PAGES_FIXTURE_DIR;
+
+describe("vinext next data client helpers", () => {
+  it("extracts __NEXT_DATA__ after carriage-return whitespace", () => {
+    const json = '{"props":{},"page":"/","query":{}}';
+
+    expect(extractVinextNextDataJson(`<script>window.__NEXT_DATA__ = \r\n\t${json}</script>`)).toBe(
+      json,
+    );
+  });
+});
 
 describe("next/navigation shim", () => {
   it("exports usePathname, useSearchParams, useParams, useRouter", async () => {
@@ -11210,15 +11223,18 @@ describe("Pages Router concurrent navigation", () => {
     page: string,
     pageModuleUrl: string,
     query: Record<string, unknown> = {},
+    i18n?: { locale: string; locales: string[]; defaultLocale: string },
   ): string {
-    const nextData = JSON.stringify({
-      page,
-      query,
-      isFallback: false,
-      props: { pageProps: { page } },
-      __vinext: { pageModuleUrl },
+    const nextDataScript = buildPagesNextDataScript({
+      buildId: null,
+      i18n: i18n ?? {},
+      pageProps: { page },
+      params: query,
+      routePattern: page,
+      safeJsonStringify,
+      vinext: { pageModuleUrl },
     });
-    return `<html><head></head><body><script>window.__NEXT_DATA__ = ${nextData}</script></body></html>`;
+    return `<html><head></head><body>${nextDataScript}</body></html>`;
   }
 
   /**
@@ -11556,6 +11572,186 @@ describe("Pages Router concurrent navigation", () => {
       // Catch-all: exactly one history write plus exactly one hard-nav fallback.
       expect(hrefAssignments).toHaveLength(2);
     } finally {
+      if (previousWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = previousWindow;
+      }
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("fetches default-locale root through a locale-qualified URL without changing the browser URL", async () => {
+    const previousWindow = (globalThis as any).window;
+    const originalFetch = globalThis.fetch;
+    const { win } = createNavWindow();
+    const pageModuleUrl = path.resolve(import.meta.dirname, "fixtures/client-navigation-page.tsx");
+    win.location.pathname = "/new";
+    win.location.href = "http://localhost/new";
+    Object.assign(win, {
+      __VINEXT_LOCALE__: "en",
+      __VINEXT_LOCALES__: ["en", "id"],
+      __VINEXT_DEFAULT_LOCALE__: "en",
+    });
+    (globalThis as any).window = win;
+
+    const fetch = vi.fn(
+      async () =>
+        new Response(
+          buildNavHtml(
+            "/",
+            pageModuleUrl,
+            {},
+            {
+              locale: "en",
+              locales: ["en", "id"],
+              defaultLocale: "en",
+            },
+          ),
+          { status: 200 },
+        ),
+    );
+    globalThis.fetch = fetch;
+
+    try {
+      vi.resetModules();
+      const routerModule = await import("../packages/vinext/src/shims/router.js");
+      const Router = routerModule.default;
+
+      const result = await Router.push("/");
+
+      expect(result).toBe(true);
+      expect(fetch).toHaveBeenCalledWith("/en", expect.any(Object));
+      expect(win.history.pushState).toHaveBeenCalledWith({}, "", "/");
+      expect(win.location.href).toBe("http://localhost/");
+      expect(win.__VINEXT_LOCALE__).toBe("en");
+    } finally {
+      vi.resetModules();
+      if (previousWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = previousWindow;
+      }
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("popstate fetches default-locale root through a locale-qualified URL", async () => {
+    const previousWindow = (globalThis as any).window;
+    const originalFetch = globalThis.fetch;
+    const originalCustomEvent = globalThis.CustomEvent;
+    const listeners = new Map<string, (event: any) => void>();
+    const { win } = createNavWindow();
+    const pageModuleUrl = path.resolve(import.meta.dirname, "fixtures/client-navigation-page.tsx");
+
+    win.location.pathname = "/about";
+    win.location.href = "http://localhost/about";
+    Object.assign(win, {
+      __VINEXT_LOCALE__: "en",
+      __VINEXT_LOCALES__: ["en", "id"],
+      __VINEXT_DEFAULT_LOCALE__: "en",
+    });
+    win.addEventListener = vi.fn((type: string, handler: (event: any) => void) => {
+      listeners.set(type, handler);
+    });
+
+    (globalThis as any).window = win;
+    (globalThis as any).CustomEvent = class CustomEventMock {
+      constructor(public type: string) {}
+    } as any;
+
+    const fetch = vi.fn(
+      async () =>
+        new Response(
+          buildNavHtml(
+            "/",
+            pageModuleUrl,
+            {},
+            {
+              locale: "en",
+              locales: ["en", "id"],
+              defaultLocale: "en",
+            },
+          ),
+          { status: 200 },
+        ),
+    );
+    globalThis.fetch = fetch;
+
+    try {
+      vi.resetModules();
+      await import("../packages/vinext/src/shims/router.js");
+      const { installPagesRouterRuntime } =
+        await import("../packages/vinext/src/shims/pages-router-runtime.js");
+      installPagesRouterRuntime();
+
+      const popstateHandler = listeners.get("popstate");
+      expect(popstateHandler).toBeDefined();
+
+      win.location.pathname = "/";
+      win.location.href = "http://localhost/";
+      popstateHandler!({ state: null });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(fetch).toHaveBeenCalledWith("/en", expect.any(Object));
+      expect(win.location.href).toBe("http://localhost/");
+      expect(win.__VINEXT_LOCALE__).toBe("en");
+    } finally {
+      vi.resetModules();
+      if (previousWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = previousWindow;
+      }
+      globalThis.fetch = originalFetch;
+      (globalThis as any).CustomEvent = originalCustomEvent;
+    }
+  });
+
+  it("does not prefix a locale-qualified target with the current locale", async () => {
+    const previousWindow = (globalThis as any).window;
+    const originalFetch = globalThis.fetch;
+    const { win } = createNavWindow();
+    const pageModuleUrl = path.resolve(import.meta.dirname, "fixtures/client-navigation-page.tsx");
+    Object.assign(win, {
+      __VINEXT_LOCALE__: "id",
+      __VINEXT_LOCALES__: ["en", "id", "fr"],
+      __VINEXT_DEFAULT_LOCALE__: "en",
+    });
+    (globalThis as any).window = win;
+
+    const fetch = vi.fn(
+      async () =>
+        new Response(
+          buildNavHtml(
+            "/about",
+            pageModuleUrl,
+            {},
+            {
+              locale: "fr",
+              locales: ["en", "id", "fr"],
+              defaultLocale: "en",
+            },
+          ),
+          { status: 200 },
+        ),
+    );
+    globalThis.fetch = fetch;
+
+    try {
+      vi.resetModules();
+      const routerModule = await import("../packages/vinext/src/shims/router.js");
+      const Router = routerModule.default;
+
+      const result = await Router.push("/fr/about");
+
+      expect(result).toBe(true);
+      expect(fetch).toHaveBeenCalledWith("/fr/about", expect.any(Object));
+      expect(win.history.pushState).toHaveBeenCalledWith({}, "", "/fr/about");
+      expect(win.location.href).toBe("http://localhost/fr/about");
+      expect(win.__VINEXT_LOCALE__).toBe("fr");
+    } finally {
+      vi.resetModules();
       if (previousWindow === undefined) {
         delete (globalThis as any).window;
       } else {

@@ -20,6 +20,7 @@ import Link, {
   resolveLinkPrefetchMode,
   useLinkStatus,
 } from "../packages/vinext/src/shims/link.js";
+import { navigatePagesRouterLink } from "../packages/vinext/src/client/pages-router-link-navigation.js";
 
 // Internal helpers re-exported or accessible via the router shim
 import { isExternalUrl, isHashOnlyChange } from "../packages/vinext/src/shims/router.js";
@@ -341,6 +342,21 @@ describe("Link locale handling", () => {
     expect(html).toContain('href="/about"');
   });
 
+  it("locale=undefined uses the current non-default locale", async () => {
+    delete (globalThis as any).window;
+
+    const html = await runWithI18nState(async () => {
+      setI18nContext({
+        locale: "id",
+        locales: ["en", "id"],
+        defaultLocale: "en",
+      });
+      return ReactDOMServer.renderToString(React.createElement(Link, { href: "/" }, "x"));
+    });
+
+    expect(html).toContain('href="/id"');
+  });
+
   it("locale string prepends locale prefix", () => {
     // When locale is a non-default locale string, it prepends /{locale}
     // Note: default locale check uses __VINEXT_DEFAULT_LOCALE__ which is undefined in tests
@@ -473,6 +489,32 @@ describe("Link locale handling", () => {
       }
       vi.resetModules();
     }
+  });
+
+  it("passes locale=false through the Pages Router Link handoff", async () => {
+    const push = vi.fn(async () => true);
+    const replace = vi.fn(async () => true);
+
+    await navigatePagesRouterLink(
+      { push, replace },
+      { href: "/", replace: false, scroll: true, locale: false },
+    );
+
+    expect(push).toHaveBeenCalledWith("/", undefined, { scroll: true, locale: false });
+    expect(replace).not.toHaveBeenCalled();
+  });
+
+  it("passes explicit locale through the Pages Router Link handoff", async () => {
+    const push = vi.fn(async () => true);
+    const replace = vi.fn(async () => true);
+
+    await navigatePagesRouterLink(
+      { push, replace },
+      { href: "/fr/about", replace: false, scroll: true, locale: "fr" },
+    );
+
+    expect(push).toHaveBeenCalledWith("/fr/about", undefined, { scroll: true, locale: "fr" });
+    expect(replace).not.toHaveBeenCalled();
   });
 });
 

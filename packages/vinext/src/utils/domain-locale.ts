@@ -54,6 +54,21 @@ export function addLocalePrefix(path: string, locale: string, localeDefault: str
   return `/${locale}${pathWithLeadingSlash}`;
 }
 
+export function getLocalePathPrefix(
+  path: string,
+  locales: readonly string[] | undefined,
+): string | undefined {
+  if (!locales?.length) return undefined;
+
+  const pathWithLeadingSlash = path.startsWith("/") ? path : `/${path}`;
+  const pathname = pathWithLeadingSlash.split(/[?#]/, 1)[0] ?? pathWithLeadingSlash;
+  const firstSegment = pathname.split("/").find(Boolean);
+  if (!firstSegment) return undefined;
+
+  const normalizedSegment = firstSegment.toLowerCase();
+  return locales.find((locale) => locale.toLowerCase() === normalizedSegment);
+}
+
 function withBasePath(path: string, basePath = ""): string {
   if (!basePath) return path;
   return basePath + path;
