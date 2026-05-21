@@ -169,6 +169,7 @@ export async function runMiddleware(request, ctx, options) {
     isProxy: ${JSON.stringify(isProxyFile(middlewarePath))},
     module: middlewareModule,
     request,
+    trailingSlash: vinextConfig.trailingSlash,
   });
 }
 `

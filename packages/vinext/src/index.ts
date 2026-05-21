@@ -3027,6 +3027,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                   middlewareRequest,
                   nextConfig?.i18n,
                   nextConfig?.basePath,
+                  nextConfig?.trailingSlash,
                   isDataRequest,
                 );
 
