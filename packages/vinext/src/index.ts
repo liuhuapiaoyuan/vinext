@@ -1142,6 +1142,9 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         // because vinext is the runtime — there is no underlying Next.js
         // version to surface.
         defines["process.env.__NEXT_VERSION"] = JSON.stringify(getVinextVersion());
+        // App Shells — always false; plumbing-only flag, not yet implemented.
+        // See: https://github.com/vercel/next.js/pull/93997
+        defines["process.env.__NEXT_APP_SHELLS"] = JSON.stringify(false);
 
         // Build the shim alias map. Exact `.js` variants are included for the
         // public Next entrypoints that are file-backed in `next/package.json`.

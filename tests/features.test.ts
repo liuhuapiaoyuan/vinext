@@ -1699,6 +1699,39 @@ describe("i18n localeDetection: false", () => {
 });
 
 describe("basePath support (Pages Router)", () => {
+  it("resolveNextConfig correctly resolves basePath", async () => {
+    const { resolveNextConfig } = await import("../packages/vinext/src/config/next-config.js");
+
+    // Default: empty basePath
+    const defaultConfig = await resolveNextConfig({});
+    expect(defaultConfig.basePath).toBe("");
+
+    // With basePath configured
+    const withBasePath = await resolveNextConfig({ basePath: "/app" });
+    expect(withBasePath.basePath).toBe("/app");
+
+    // basePath must start with / (Next.js requirement)
+    const withSlash = await resolveNextConfig({ basePath: "/docs" });
+    expect(withSlash.basePath).toBe("/docs");
+  });
+
+  it("resolveNextConfig correctly resolves trailingSlash", async () => {
+    const { resolveNextConfig } = await import("../packages/vinext/src/config/next-config.js");
+
+    // Default: trailingSlash is false
+    const defaultConfig = await resolveNextConfig({});
+    expect(defaultConfig.trailingSlash).toBe(false);
+
+    // With trailingSlash: true
+    const withTrailing = await resolveNextConfig({ trailingSlash: true });
+    expect(withTrailing.trailingSlash).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// build-time defines exposed to client code
+
+describe("build-time defines (Pages Router)", () => {
   let server: ViteDevServer;
 
   beforeAll(async () => {
@@ -1718,41 +1751,17 @@ describe("basePath support (Pages Router)", () => {
     await server?.close();
   });
 
-  it("resolveNextConfig correctly resolves basePath", async () => {
-    const { resolveNextConfig } = await import("../packages/vinext/src/config/next-config.js");
-
-    // Default: empty basePath
-    const defaultConfig = await resolveNextConfig({});
-    expect(defaultConfig.basePath).toBe("");
-
-    // With basePath configured
-    const withBasePath = await resolveNextConfig({ basePath: "/app" });
-    expect(withBasePath.basePath).toBe("/app");
-
-    // basePath must start with / (Next.js requirement)
-    const withSlash = await resolveNextConfig({ basePath: "/docs" });
-    expect(withSlash.basePath).toBe("/docs");
-  });
-
   it("basePath define is injected into client code", async () => {
-    // The plugin should set process.env.__NEXT_ROUTER_BASEPATH as a define.
-    // We test this by checking the resolved config of the current server.
-    const config = server.config;
     // Default fixture has no basePath, so it should be ""
     const defineKey = "process.env.__NEXT_ROUTER_BASEPATH";
-    expect(config.define?.[defineKey]).toBe(JSON.stringify(""));
+    expect(server.config.define?.[defineKey]).toBe(JSON.stringify(""));
   });
 
-  it("resolveNextConfig correctly resolves trailingSlash", async () => {
-    const { resolveNextConfig } = await import("../packages/vinext/src/config/next-config.js");
-
-    // Default: trailingSlash is false
-    const defaultConfig = await resolveNextConfig({});
-    expect(defaultConfig.trailingSlash).toBe(false);
-
-    // With trailingSlash: true
-    const withTrailing = await resolveNextConfig({ trailingSlash: true });
-    expect(withTrailing.trailingSlash).toBe(true);
+  it("App Shells define is always false", async () => {
+    // Plumbing-only upstream; vinext always reports false so client gating
+    // code never trips. See issue #1405.
+    const defineKey = "process.env.__NEXT_APP_SHELLS";
+    expect(server.config.define?.[defineKey]).toBe(JSON.stringify(false));
   });
 });
 
