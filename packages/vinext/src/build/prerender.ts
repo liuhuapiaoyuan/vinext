@@ -44,6 +44,7 @@ import { VINEXT_PRERENDER_SECRET_HEADER } from "../server/headers.js";
 import { startProdServer } from "../server/prod-server.js";
 import { readPrerenderSecret } from "./server-manifest.js";
 import { getOutputPath, getRscOutputPath } from "../utils/prerender-output-paths.js";
+import type { MetadataFileRoute } from "../server/metadata-routes.js";
 export { readPrerenderSecret } from "./server-manifest.js";
 
 function getErrorMessageWithStack(err: Error): string {
@@ -59,6 +60,8 @@ function getErrorMessageWithStack(err: Error): string {
 export type PrerenderResult = {
   /** One entry per route (including skipped/error routes). */
   routes: PrerenderRouteResult[];
+  /** Additional generated files that are not represented as route entries. */
+  outputFiles?: string[];
 };
 
 export type PrerenderRouteResult =
@@ -156,6 +159,8 @@ type PrerenderPagesOptions = {
 type PrerenderAppOptions = {
   /** Discovered app routes. */
   routes: AppRoute[];
+  /** Discovered file-based metadata routes. Used by static export. */
+  metadataRoutes?: readonly MetadataFileRoute[];
   /**
    * Absolute path to the pre-built RSC handler bundle (e.g. `dist/server/index.js`).
    */
@@ -366,6 +371,38 @@ function buildUrlFromParams(
   }
 
   return "/" + result.join("/");
+}
+
+function metadataOutputPath(servedUrl: string): string | null {
+  const pathname = servedUrl.split("?", 1)[0];
+  if (!pathname || !pathname.startsWith("/")) return null;
+
+  const segments = pathname.split("/").filter(Boolean);
+  if (segments.length === 0 || segments.some((segment) => segment === "." || segment === "..")) {
+    return null;
+  }
+
+  return segments.join("/");
+}
+
+function emitStaticMetadataFiles(
+  metadataRoutes: readonly MetadataFileRoute[],
+  outDir: string,
+): string[] {
+  const outputFiles: string[] = [];
+  for (const route of metadataRoutes) {
+    if (route.isDynamic) continue;
+
+    const outputPath = metadataOutputPath(route.servedUrl);
+    // scanMetadataFiles controls servedUrl; this remains defensive against malformed route data.
+    if (!outputPath) continue;
+
+    const fullPath = path.join(outDir, ...outputPath.split("/"));
+    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+    fs.copyFileSync(route.filePath, fullPath);
+    outputFiles.push(outputPath);
+  }
+  return outputFiles;
 }
 
 /** Map of route patterns to generateStaticParams functions (or null/undefined). */
@@ -826,6 +863,7 @@ export async function prerenderPages({
  */
 export async function prerenderApp({
   routes,
+  metadataRoutes = [],
   outDir,
   config,
   mode,
@@ -1326,6 +1364,11 @@ export async function prerenderApp({
     });
     results.push(...appResults);
 
+    const outputFiles =
+      mode === "export" && metadataRoutes.length > 0
+        ? emitStaticMetadataFiles(metadataRoutes, outDir)
+        : [];
+
     // ── Render 404 page ───────────────────────────────────────────────────────
     // Fetch a known-nonexistent URL to get the App Router's not-found response.
     // The RSC handler returns 404 with full HTML for the not-found.tsx page (or
@@ -1360,7 +1403,10 @@ export async function prerenderApp({
         trailingSlash: config.trailingSlash,
       });
 
-    return { routes: results };
+    return {
+      routes: results,
+      ...(outputFiles.length > 0 ? { outputFiles } : {}),
+    };
   } finally {
     setCacheHandler(previousHandler);
     if (previousPrerenderFlag === undefined) delete process.env.VINEXT_PRERENDER;
