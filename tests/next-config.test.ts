@@ -1193,6 +1193,7 @@ describe("detectNextIntlConfig", () => {
       compilerDefineServer: {},
       instrumentationClientInject: [],
       clientTraceMetadata: undefined,
+      staleTimes: { dynamic: 0, static: 300 },
       ...overrides,
     };
   }
@@ -1726,5 +1727,58 @@ describe("resolveNextConfig enablePrerenderSourceMaps", () => {
       enablePrerenderSourceMaps: false,
     });
     expect(resolved.enablePrerenderSourceMaps).toBe(false);
+  });
+});
+
+// Regression for issue #1490:
+// experimental.staleTimes should be surfaced through ResolvedNextConfig so the
+// plugin can inject the values into the client-side router cache.
+describe("resolveNextConfig staleTimes (#1490)", () => {
+  it("defaults to Next.js' { dynamic: 0, static: 300 } when no config is provided", async () => {
+    const resolved = await resolveNextConfig(null);
+    expect(resolved.staleTimes).toEqual({ dynamic: 0, static: 300 });
+  });
+
+  it("defaults to Next.js' { dynamic: 0, static: 300 } when experimental is not set", async () => {
+    const resolved = await resolveNextConfig({});
+    expect(resolved.staleTimes).toEqual({ dynamic: 0, static: 300 });
+  });
+
+  it("reads experimental.staleTimes.{dynamic,static} verbatim (in seconds)", async () => {
+    const resolved = await resolveNextConfig({
+      experimental: { staleTimes: { dynamic: 30, static: 180 } },
+    });
+    expect(resolved.staleTimes).toEqual({ dynamic: 30, static: 180 });
+  });
+
+  it("falls back to defaults for individually-omitted keys", async () => {
+    const resolvedDynOnly = await resolveNextConfig({
+      experimental: { staleTimes: { dynamic: 45 } },
+    });
+    expect(resolvedDynOnly.staleTimes).toEqual({ dynamic: 45, static: 300 });
+
+    const resolvedStaticOnly = await resolveNextConfig({
+      experimental: { staleTimes: { static: 600 } },
+    });
+    expect(resolvedStaticOnly.staleTimes).toEqual({ dynamic: 0, static: 600 });
+  });
+
+  it("falls back to defaults when staleTimes contains non-numeric values", async () => {
+    const resolved = await resolveNextConfig({
+      experimental: {
+        staleTimes: { dynamic: "oops" as unknown as number, static: undefined },
+      },
+    });
+    expect(resolved.staleTimes).toEqual({ dynamic: 0, static: 300 });
+  });
+
+  it("falls back to defaults when staleTimes contains negative values", async () => {
+    // Negative values are rejected at resolution time so we don't pass them
+    // downstream to `resolvePrefetchCacheTtl`, where they'd be re-validated.
+    // Matches the `seconds < 0` guard in `shims/navigation.ts`.
+    const resolved = await resolveNextConfig({
+      experimental: { staleTimes: { dynamic: -5, static: -1 } },
+    });
+    expect(resolved.staleTimes).toEqual({ dynamic: 0, static: 300 });
   });
 });

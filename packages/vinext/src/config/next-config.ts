@@ -434,6 +434,16 @@ export type ResolvedNextConfig = {
    * Mirrors Next.js: packages/next/src/server/lib/trace/utils.ts (getTracedMetadata).
    */
   clientTraceMetadata: string[] | undefined;
+  /**
+   * App Router client cache freshness windows in seconds, sourced from
+   * `experimental.staleTimes`. Controls how long prefetched route segments
+   * are considered fresh in the client-side router cache.
+   *
+   * `dynamic` applies to partial/dynamic prefetches (default 0 — no reuse).
+   * `static` applies to full-route prefetches (default 300 — 5 minutes).
+   * Mirrors Next.js' `process.env.__NEXT_CLIENT_ROUTER_{DYNAMIC,STATIC}_STALETIME`.
+   */
+  staleTimes: { dynamic: number; static: number };
 };
 
 // Mirrors Next.js's accepted set in packages/next/src/shared/lib/constants.ts
@@ -1048,6 +1058,38 @@ function serializeCompilerDefine(value: unknown): Record<string, string> {
 }
 
 /**
+ * Defaults for `experimental.staleTimes` (in seconds), matching Next.js'
+ * `config-shared.ts` defaults.
+ */
+const DEFAULT_STALE_TIMES = { dynamic: 0, static: 300 };
+
+/**
+ * Parse `experimental.staleTimes` from a raw next.config object.
+ *
+ * Mirrors Next.js' `build/define-env.ts` parsing logic:
+ *   - missing / NaN / negative values fall back to the documented defaults
+ *     (`dynamic: 0`, `static: 300`) — matching Next.js parity and the
+ *     non-negative guard in `resolvePrefetchCacheTtl`
+ *   - all values are in seconds
+ *
+ * @see https://nextjs.org/docs/app/api-reference/config/next-config-js/staleTimes
+ */
+function resolveStaleTimes(experimental: Record<string, unknown> | undefined): {
+  dynamic: number;
+  static: number;
+} {
+  const staleTimes = readOptionalRecord(experimental?.staleTimes);
+  const dynamicRaw = Number(staleTimes?.dynamic);
+  const staticRaw = Number(staleTimes?.static);
+
+  return {
+    dynamic:
+      Number.isFinite(dynamicRaw) && dynamicRaw >= 0 ? dynamicRaw : DEFAULT_STALE_TIMES.dynamic,
+    static: Number.isFinite(staticRaw) && staticRaw >= 0 ? staticRaw : DEFAULT_STALE_TIMES.static,
+  };
+}
+
+/**
  * Resolve a NextConfig into a fully-resolved ResolvedNextConfig.
  * Awaits async functions for redirects/rewrites/headers.
  */
@@ -1094,6 +1136,7 @@ export async function resolveNextConfig(
       compilerDefineServer: {},
       instrumentationClientInject: [],
       clientTraceMetadata: undefined,
+      staleTimes: { ...DEFAULT_STALE_TIMES },
     };
     detectNextIntlConfig(root, resolved);
     return resolved;
@@ -1328,6 +1371,7 @@ export async function resolveNextConfig(
           (value): value is string => typeof value === "string",
         )
       : undefined,
+    staleTimes: resolveStaleTimes(experimental),
   };
 
   // Auto-detect next-intl (lowest priority — explicit aliases from
