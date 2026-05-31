@@ -321,6 +321,12 @@ export type ResolvedNextConfig = {
   pageExtensions: string[];
   instrumentationClientInject: string[];
   cacheComponents: boolean;
+  /**
+   * Whether `experimental.prefetchInlining` is configured. Next.js uses this
+   * with the Segment Cache to fetch the route tree before the bundled inlined
+   * segment payload.
+   */
+  prefetchInlining: boolean;
   redirects: NextRedirect[];
   rewrites: {
     beforeFiles: NextRewrite[];
@@ -1115,6 +1121,7 @@ export async function resolveNextConfig(
       output: "",
       pageExtensions: normalizePageExtensions(),
       cacheComponents: false,
+      prefetchInlining: false,
       redirects: [],
       rewrites: { beforeFiles: [], afterFiles: [], fallback: [] },
       headers: [],
@@ -1237,6 +1244,8 @@ export async function resolveNextConfig(
     ? rawOptimize.filter((x): x is string => typeof x === "string")
     : [];
   const inlineCss = experimental?.inlineCss === true;
+  const prefetchInlining =
+    experimental?.prefetchInlining === true || isUnknownRecord(experimental?.prefetchInlining);
 
   // Validate experimental.appShells co-flags. Next.js requires all of the
   // following to be enabled when appShells is true:
@@ -1383,6 +1392,7 @@ export async function resolveNextConfig(
         )
       : [],
     cacheComponents: config.cacheComponents ?? false,
+    prefetchInlining,
     redirects,
     rewrites,
     headers,

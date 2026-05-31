@@ -822,7 +822,9 @@ describe("resolveNextConfig serverActionsBodySizeLimit", () => {
     });
     expect(resolved.serverActionsBodySizeLimit).toBe(5242880);
   });
+});
 
+describe("resolveNextConfig disableOptimizedLoading", () => {
   // Regression for #1519: `experimental.disableOptimizedLoading` defaults to
   // `false` and is read into the resolved config. The default drives the
   // `defer`-in-head behaviour for Pages Router scripts in production.
@@ -836,6 +838,23 @@ describe("resolveNextConfig serverActionsBodySizeLimit", () => {
       experimental: { disableOptimizedLoading: true },
     });
     expect(resolved.disableOptimizedLoading).toBe(true);
+  });
+});
+
+describe("resolveNextConfig prefetchInlining", () => {
+  it("reads experimental.prefetchInlining from next.config", async () => {
+    const disabled = await resolveNextConfig({});
+    expect(disabled.prefetchInlining).toBe(false);
+
+    const enabledByBoolean = await resolveNextConfig({
+      experimental: { prefetchInlining: true },
+    });
+    expect(enabledByBoolean.prefetchInlining).toBe(true);
+
+    const enabledByThresholds = await resolveNextConfig({
+      experimental: { prefetchInlining: { maxSize: Infinity, maxBundleSize: Infinity } },
+    });
+    expect(enabledByThresholds.prefetchInlining).toBe(true);
   });
 });
 
@@ -1165,6 +1184,7 @@ describe("detectNextIntlConfig", () => {
       output: "",
       pageExtensions: ["tsx", "ts", "jsx", "js"],
       cacheComponents: false,
+      prefetchInlining: false,
       redirects: [],
       rewrites: { beforeFiles: [], afterFiles: [], fallback: [] },
       headers: [],
