@@ -85,6 +85,7 @@ const CACHE_PROOF_REJECTION_CODES = createCacheProofRejectionCodeSet([
 export type AppElementsSlotBindingState = "active" | "default" | "unmatched";
 
 export type AppElementsSlotBinding = Readonly<{
+  activeRouteId?: string | null;
   ownerLayoutId: string | null;
   slotId: string;
   state: AppElementsSlotBindingState;
@@ -519,7 +520,22 @@ function parseSlotBindings(
       throw new Error("[vinext] Invalid __slotBindings in App Router payload: expected state");
     }
 
-    slotBindings.push({ ownerLayoutId, slotId, state });
+    const activeRouteId = entry.activeRouteId;
+    if (
+      activeRouteId !== undefined &&
+      activeRouteId !== null &&
+      (typeof activeRouteId !== "string" ||
+        parseAppElementsWireElementKey(activeRouteId)?.kind !== "route")
+    ) {
+      throw new Error("[vinext] Invalid __slotBindings in App Router payload: expected route ids");
+    }
+
+    slotBindings.push({
+      ...(activeRouteId !== undefined ? { activeRouteId } : {}),
+      ownerLayoutId,
+      slotId,
+      state,
+    });
   }
   return normalizeAppElementsSlotBindings(slotBindings, options);
 }

@@ -27,6 +27,7 @@ import {
   createCachedRscResponseSnapshot,
   createClientNavigationRenderSnapshot,
   getClientNavigationRenderContext,
+  getBfcacheIdMapContext,
   getPrefetchCache,
   invalidatePrefetchCache,
   decodeRedirectError,
@@ -103,7 +104,10 @@ import {
   FRESH_APP_NAVIGATION_PAYLOAD_ORIGIN,
   VISITED_CACHE_APP_NAVIGATION_PAYLOAD_ORIGIN,
   createHistoryStateWithNavigationMetadata,
-  createHistoryStateWithPreviousNextUrl,
+  createInitialBfcacheIdMap,
+  isHistoryStateBfcacheVersionCurrent,
+  readHistoryStateBfcacheIds,
+  readHistoryStateBfcacheVersion,
   readHistoryStatePreviousNextUrl,
   readHistoryStateTraversalIndex,
   isCacheRestorableAppPayloadMetadata,
@@ -245,6 +249,7 @@ function syncServerActionHttpFallbackHead(status: number | null): void {
   robots.setAttribute(ACTION_HTTP_FALLBACK_ROBOTS_META_ATTR, "robots");
   document.head.appendChild(robots);
 }
+const BfcacheIdMapContext = getBfcacheIdMapContext();
 
 // Parses a URI-encoded JSON value carried in a response header (e.g.
 // `X-Vinext-Params`). Returns `null` on missing or malformed input so callers
@@ -279,9 +284,31 @@ let browserRouterStateHasEverCommitted = false;
 let pendingNavigationRecoveryHref: string | null = null;
 const mpaNavigationScheduler = new AppBrowserMpaNavigationScheduler();
 const unresolvedMpaNavigation = new Promise<never>(() => {});
+const initialHistoryBfcacheVersion = readHistoryStateBfcacheVersion(window.history.state);
+// A new browser document does not retain Next's in-memory BFCache entries.
+// Treat bfcache ids persisted by an older document as stale so a hard reload
+// cannot restore/collide with pre-reload route identities.
+let currentBfcacheVersion =
+  initialHistoryBfcacheVersion === null ? 0 : initialHistoryBfcacheVersion + 1;
 let currentHistoryTraversalIndex: number | null =
   readHistoryStateTraversalIndex(window.history.state) ?? 0;
 let nextHistoryTraversalIndex: number = currentHistoryTraversalIndex;
+
+function isCurrentBfcacheVersion(state: unknown): boolean {
+  return isHistoryStateBfcacheVersionCurrent(state, currentBfcacheVersion);
+}
+
+function readCurrentBfcacheVersionHistoryIds(
+  state: unknown,
+): Readonly<Record<string, string>> | null {
+  const ids = readHistoryStateBfcacheIds(state);
+  if (ids === null) return null;
+  return isCurrentBfcacheVersion(state) ? ids : null;
+}
+
+function invalidateRestorableBfcacheIds(): void {
+  currentBfcacheVersion += 1;
+}
 
 function allocateNavigationHistoryTraversalIndex(
   historyUpdateMode: HistoryUpdateMode | undefined,
@@ -319,9 +346,14 @@ function commitHashOnlyNavigation(
   const previousNextUrl = hasBrowserRouterState()
     ? getBrowserRouterState().previousNextUrl
     : readHistoryStatePreviousNextUrl(window.history.state);
+  const bfcacheIds = hasBrowserRouterState()
+    ? getBrowserRouterState().bfcacheIds
+    : readCurrentBfcacheVersionHistoryIds(window.history.state);
   const historyState = createHistoryStateWithNavigationMetadata(
     createHashOnlyNavigationBaseHistoryState(historyUpdateMode, scroll),
     {
+      bfcacheIds,
+      bfcacheVersion: bfcacheIds === null ? undefined : currentBfcacheVersion,
       previousNextUrl,
       traversalIndex: navigationHistoryIndex,
     },
@@ -409,6 +441,7 @@ function clearPrefetchState(): void {
 function clearClientNavigationCaches(): void {
   clearVisitedResponseCache();
   clearPrefetchState();
+  invalidateRestorableBfcacheIds();
 }
 
 function isSettledPrefetchCacheEntry(
@@ -510,15 +543,46 @@ async function learnOptimisticRouteTemplatesFromPrefetchCache(options: {
   await Promise.allSettled(learning);
 }
 
-function syncCurrentHistoryStatePreviousNextUrl(previousNextUrl: string | null): void {
-  if (readHistoryStatePreviousNextUrl(window.history.state) === previousNextUrl) {
+function areBfcacheIdMapsEqual(
+  a: Readonly<Record<string, string>> | null,
+  b: Readonly<Record<string, string>> | null,
+): boolean {
+  if (a === b) return true;
+  if (a === null || b === null) return false;
+  const aEntries = Object.entries(a);
+  const bEntries = Object.entries(b);
+  if (aEntries.length !== bEntries.length) return false;
+  // Equal lengths make this bidirectional: if every a entry exists in b with
+  // the same value, b cannot contain an extra distinct key.
+  return aEntries.every(([key, value]) => b[key] === value);
+}
+
+function isHistoryStateNavigationMetadataInSync(
+  state: unknown,
+  previousNextUrl: string | null,
+  bfcacheIds?: Readonly<Record<string, string>> | null,
+): boolean {
+  return (
+    readHistoryStatePreviousNextUrl(state) === previousNextUrl &&
+    (bfcacheIds === undefined ||
+      (areBfcacheIdMapsEqual(readHistoryStateBfcacheIds(state), bfcacheIds) &&
+        isCurrentBfcacheVersion(state)))
+  );
+}
+
+function syncCurrentHistoryStatePreviousNextUrl(
+  previousNextUrl: string | null,
+  bfcacheIds?: Readonly<Record<string, string>> | null,
+): void {
+  if (isHistoryStateNavigationMetadataInSync(window.history.state, previousNextUrl, bfcacheIds)) {
     return;
   }
 
-  const nextHistoryState = createHistoryStateWithPreviousNextUrl(
-    window.history.state,
+  const nextHistoryState = createHistoryStateWithNavigationMetadata(window.history.state, {
+    bfcacheIds,
+    bfcacheVersion: bfcacheIds === undefined ? undefined : currentBfcacheVersion,
     previousNextUrl,
-  );
+  });
   // First attempt: use replaceHistoryStateWithoutNotify which fires no popstate
   // or hashchange events. If the browser accepted the state update (checked via
   // readHistoryStatePreviousNextUrl), we're done. The double-read is needed
@@ -526,7 +590,7 @@ function syncCurrentHistoryStatePreviousNextUrl(previousNextUrl: string | null):
   // replaceState calls when called in rapid succession (e.g. back-to-back
   // navigation commits). The fallback fires only when the state didn't stick.
   replaceHistoryStateWithoutNotify(nextHistoryState, "", window.location.href);
-  if (readHistoryStatePreviousNextUrl(window.history.state) === previousNextUrl) {
+  if (isHistoryStateNavigationMetadataInSync(window.history.state, previousNextUrl, bfcacheIds)) {
     return;
   }
   window.history.replaceState(nextHistoryState, "", window.location.href);
@@ -544,6 +608,7 @@ function createActionInitiationSnapshot() {
 type ActionInitiationSnapshot = ReturnType<typeof createActionInitiationSnapshot>;
 
 function createNavigationCommitEffect(options: {
+  bfcacheIds: Readonly<Record<string, string>>;
   href: string;
   historyUpdateMode: HistoryUpdateMode | undefined;
   navId: number;
@@ -551,7 +616,15 @@ function createNavigationCommitEffect(options: {
   previousNextUrl: string | null;
   targetHistoryIndex?: number | null;
 }): () => void {
-  const { href, historyUpdateMode, navId, params, previousNextUrl, targetHistoryIndex } = options;
+  const {
+    bfcacheIds,
+    href,
+    historyUpdateMode,
+    navId,
+    params,
+    previousNextUrl,
+    targetHistoryIndex,
+  } = options;
 
   return () => {
     // Only update URL if this is still the active navigation.
@@ -572,6 +645,8 @@ function createNavigationCommitEffect(options: {
     const historyState = createHistoryStateWithNavigationMetadata(
       preserveExistingState ? window.history.state : null,
       {
+        bfcacheIds,
+        bfcacheVersion: currentBfcacheVersion,
         previousNextUrl,
         traversalIndex: navigationHistoryIndex,
       },
@@ -591,7 +666,9 @@ function createNavigationCommitEffect(options: {
     }
 
     if (!wroteHistoryState) {
-      syncCurrentHistoryStatePreviousNextUrl(previousNextUrl);
+      // Traversal and refresh commits may keep the URL unchanged, but still
+      // persist the latest bfcache id map for future history restoration.
+      syncCurrentHistoryStatePreviousNextUrl(previousNextUrl, bfcacheIds);
       stageClientParams(params);
       if (targetHistoryIndex !== undefined) {
         commitHistoryTraversalIndex(targetHistoryIndex);
@@ -618,6 +695,7 @@ async function renderNavigationPayload(
   operationLane: OperationLane = "navigation",
   traversalIntent: HistoryTraversalIntent | null = null,
   scrollIntent: AppRouterScrollIntent | null | undefined = null,
+  restoredBfcacheIds: Readonly<Record<string, string>> | null = null,
 ): Promise<NavigationPayloadOutcome> {
   syncServerActionHttpFallbackHead(null);
   try {
@@ -636,6 +714,7 @@ async function renderNavigationPayload(
       pendingRouterState,
       previousNextUrl,
       scrollIntent,
+      restoredBfcacheIds,
       targetHistoryIndex: traversalIntent === null ? undefined : traversalIntent.targetHistoryIndex,
       targetHref,
       navId,
@@ -972,8 +1051,14 @@ function BrowserRoot({
   const initialMetadata = AppElementsWire.readMetadata(resolvedElements);
   const [treeStateValue, setTreeStateValue] = useState<
     AppRouterState | Promise<AppRouterState> | MpaNavigationState
-  >({
+  >(() => ({
     activeOperation: null,
+    // Intentional Next.js parity: a hard reload starts a new browser
+    // document without the prior in-memory CacheNode/Activity tree. Hydrate
+    // the new document on the zero sentinel and rely on the document-scoped
+    // bfcache version gate to reject stale ids persisted by previous
+    // documents.
+    bfcacheIds: createInitialBfcacheIdMap(resolvedElements),
     elements: resolvedElements,
     interception: initialMetadata.interception,
     interceptionContext: initialMetadata.interceptionContext,
@@ -986,7 +1071,7 @@ function BrowserRoot({
     routeId: initialMetadata.routeId,
     slotBindings: initialMetadata.slotBindings,
     visibleCommitVersion: 0,
-  });
+  }));
   if (isMpaNavigationState(treeStateValue)) {
     performMpaNavigation(treeStateValue.href, treeStateValue.historyUpdateMode);
     throw unresolvedMpaNavigation;
@@ -1055,13 +1140,15 @@ function BrowserRoot({
 
     replaceHistoryStateWithoutNotify(
       createHistoryStateWithNavigationMetadata(window.history.state, {
+        bfcacheIds: treeState.bfcacheIds,
+        bfcacheVersion: currentBfcacheVersion,
         previousNextUrl: treeState.previousNextUrl,
         traversalIndex: currentHistoryTraversalIndex,
       }),
       "",
       window.location.href,
     );
-  }, [treeState.previousNextUrl, treeState.renderId]);
+  }, [treeState.bfcacheIds, treeState.previousNextUrl, treeState.renderId]);
 
   const routeTree = createElement(
     RedirectBoundary,
@@ -1076,13 +1163,13 @@ function BrowserRoot({
       ),
     ),
   );
-  const innerTree = AppRouterContext
-    ? createElement(
-        AppRouterContext.Provider,
-        { value: appRouterInstance },
-        createElement(AppRouterRedirectBridge, null, routeTree),
-      )
+  const bfcacheTree = BfcacheIdMapContext
+    ? createElement(BfcacheIdMapContext.Provider, { value: treeState.bfcacheIds }, routeTree)
     : routeTree;
+  const redirectedTree = createElement(AppRouterRedirectBridge, null, bfcacheTree);
+  const innerTree = AppRouterContext
+    ? createElement(AppRouterContext.Provider, { value: appRouterInstance }, redirectedTree)
+    : bfcacheTree;
 
   // In dev, wrap the route tree in a top-level recovery boundary. A render
   // error (e.g. a slot's RSC reference rejects) is caught here instead of
@@ -1354,7 +1441,10 @@ function registerServerActionCallback(): void {
     const actionInitiation = createActionInitiationSnapshot();
     // Keep history aligned with the captured snapshot. Action POST headers
     // read from actionInitiation, not from history, after this point.
-    syncCurrentHistoryStatePreviousNextUrl(actionInitiation.routerState.previousNextUrl);
+    syncCurrentHistoryStatePreviousNextUrl(
+      actionInitiation.routerState.previousNextUrl,
+      actionInitiation.routerState.bfcacheIds,
+    );
     const body = await encodeReply(args, { temporaryReferences });
     const { headers } = resolveServerActionRequestState({
       actionId: id,
@@ -1625,6 +1715,15 @@ function bootstrapHydration(rscStream: ReadableStream<Uint8Array>): void {
       consumeAppRouterScrollIntent(scrollIntent ?? null);
       return browserNavigationController.performHardNavigation(targetHref);
     };
+    // Traversal restores history-state ids before identity matching. Any
+    // redirect hop that changes currentHref must null this before commit so
+    // stale ids from the pre-redirect history entry cannot win.
+    let restoredBfcacheIds =
+      navigationKind === "traverse"
+        ? readCurrentBfcacheVersionHistoryIds(
+            activeTraversalIntent?.historyState ?? window.history.state,
+          )
+        : null;
 
     try {
       const shouldUsePendingRouterState = programmaticTransition;
@@ -1650,7 +1749,10 @@ function bootstrapHydration(rscStream: ReadableStream<Uint8Array>): void {
         const requestInterceptionContext = requestState.interceptionContext;
         const requestPreviousNextUrl = requestState.previousNextUrl;
         if (navigationKind === "refresh") {
-          syncCurrentHistoryStatePreviousNextUrl(requestPreviousNextUrl);
+          syncCurrentHistoryStatePreviousNextUrl(
+            requestPreviousNextUrl,
+            getBrowserRouterState().bfcacheIds,
+          );
         }
 
         // Set this navigation as the pending pathname, overwriting any previous.
@@ -1685,6 +1787,33 @@ function bootstrapHydration(rscStream: ReadableStream<Uint8Array>): void {
           if (compatibilityDecision.kind === "hard-navigate") {
             performHardNavigationForScrollIntent(compatibilityDecision.hardNavigationTarget);
             return;
+          }
+          const cachedRedirectDecision = resolveRscRedirectLifecycleHop({
+            currentHref,
+            historyUpdateMode: currentHistoryMode ?? "replace",
+            origin: window.location.origin,
+            redirectDepth: redirectCount,
+            requestPreviousNextUrl,
+            responseUrl: cachedRoute.response.url,
+          });
+          if (cachedRedirectDecision.kind === "terminal-hard-navigation") {
+            if (cachedRedirectDecision.reason === "maxRedirectsExceeded") {
+              console.error(
+                "[vinext] Too many RSC redirects — aborting navigation to prevent infinite loop.",
+              );
+            }
+            performHardNavigationForScrollIntent(cachedRedirectDecision.href);
+            return;
+          }
+          if (cachedRedirectDecision.kind === "follow") {
+            if (navigationKind === "traverse") {
+              restoredBfcacheIds = null;
+            }
+            currentHref = cachedRedirectDecision.href;
+            currentHistoryMode = cachedRedirectDecision.historyUpdateMode;
+            currentPrevNextUrl = cachedRedirectDecision.previousNextUrl;
+            redirectCount = cachedRedirectDecision.redirectDepth;
+            continue;
           }
           // Check stale-navigation before and after createFromFetch. The pre-check
           // avoids wasted parse work; the post-check catches supersessions that
@@ -1723,6 +1852,7 @@ function bootstrapHydration(rscStream: ReadableStream<Uint8Array>): void {
             toOperationLane(navigationKind),
             activeTraversalIntent,
             scrollIntent,
+            restoredBfcacheIds,
           );
           return;
         }
@@ -1793,6 +1923,7 @@ function bootstrapHydration(rscStream: ReadableStream<Uint8Array>): void {
                 toOperationLane(navigationKind),
                 activeTraversalIntent,
                 scrollIntent,
+                restoredBfcacheIds,
               ).catch((error) => {
                 if (browserNavigationController.isCurrentNavigation(navId)) {
                   console.error("[vinext] Optimistic RSC navigation error:", error);
@@ -1880,6 +2011,13 @@ function bootstrapHydration(rscStream: ReadableStream<Uint8Array>): void {
           // and defer URL/history mutation to the eventual approved commit.
           // This keeps isPending true across all hops and avoids publishing a
           // destination URL before its RSC payload is lifecycle-approved.
+          // Traverse restored ids belong to the history entry being traversed
+          // to. Once a server redirect changes the target href, those ids no
+          // longer describe the redirected payload and must not win over fresh
+          // segment identities.
+          if (navigationKind === "traverse") {
+            restoredBfcacheIds = null;
+          }
           currentHref = redirectDecision.href;
           currentHistoryMode = redirectDecision.historyUpdateMode;
           currentPrevNextUrl = redirectDecision.previousNextUrl;
@@ -1916,7 +2054,12 @@ function bootstrapHydration(rscStream: ReadableStream<Uint8Array>): void {
             performHardNavigationForScrollIntent(resolvedTarget.href);
             return;
           }
+          if (navigationKind === "traverse") {
+            restoredBfcacheIds = null;
+          }
           currentHref = `${resolvedTarget.pathname}${resolvedTarget.search}${resolvedTarget.hash}`;
+          currentHistoryMode = currentHistoryMode ?? "replace";
+          currentPrevNextUrl = requestPreviousNextUrl;
           redirectCount += 1;
           continue;
         }
@@ -1975,6 +2118,7 @@ function bootstrapHydration(rscStream: ReadableStream<Uint8Array>): void {
           toOperationLane(navigationKind),
           activeTraversalIntent,
           scrollIntent,
+          restoredBfcacheIds,
         );
         if (renderOutcome !== "committed") return;
         // Don't cache the response if this navigation was superseded during

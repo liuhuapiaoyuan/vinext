@@ -12,7 +12,7 @@ import {
 } from "../server/app-elements.js";
 import type { ArtifactCompatibilityEnvelope } from "../server/artifact-compatibility.js";
 import type { CacheEntryReuseProof } from "../server/cache-proof.js";
-import { notFound } from "./navigation.js";
+import { getBfcacheIdMapContext, getBfcacheSegmentIdContext, notFound } from "./navigation.js";
 
 const EMPTY_ELEMENTS: AppElements = Object.freeze({});
 const warnedMissingEntryIds = new Set<string>();
@@ -32,6 +32,8 @@ export const ChildrenContext = React.createContext<React.ReactNode>(null);
 export const ParallelSlotsContext = React.createContext<Readonly<
   Record<string, React.ReactNode>
 > | null>(null);
+const BfcacheIdMapContext = getBfcacheIdMapContext();
+const BfcacheSegmentIdContext = getBfcacheSegmentIdContext();
 
 type MergeElementsOptions = {
   clearAbsentSlots?: boolean;
@@ -117,6 +119,12 @@ function warnTransportMetadataEntry(id: string): void {
 
   warnedTransportMetadataEntryIds.add(id);
   console.warn("[vinext] Transport metadata value found under App Router render entry: " + id);
+}
+
+function BfcacheSlotBoundary({ content, id }: { content: React.ReactNode; id: string }) {
+  const SegmentContext = BfcacheSegmentIdContext;
+  if (!SegmentContext) return <>{content}</>;
+  return <SegmentContext.Provider value={id}>{content}</SegmentContext.Provider>;
 }
 
 export function mergeElements(
@@ -210,11 +218,20 @@ export function Slot({
   if (element === UNMATCHED_SLOT) {
     notFound();
   }
+  if (element === null) {
+    return null;
+  }
 
-  return (
+  const content = (
     <ParallelSlotsContext.Provider value={parallelSlots ?? null}>
       <ChildrenContext.Provider value={children ?? null}>{element}</ChildrenContext.Provider>
     </ParallelSlotsContext.Provider>
+  );
+
+  return BfcacheIdMapContext && BfcacheSegmentIdContext ? (
+    <BfcacheSlotBoundary id={id} content={content} />
+  ) : (
+    content
   );
 }
 

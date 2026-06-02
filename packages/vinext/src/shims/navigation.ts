@@ -13,9 +13,13 @@
 import * as React from "react";
 import { getNavigationRuntime, hasAppNavigationRuntime } from "../client/navigation-runtime.js";
 import { notifyAppRouterTransitionStart } from "../client/instrumentation-client-state.js";
+import { INITIAL_BFCACHE_ID, PUBLIC_INITIAL_BFCACHE_ID } from "../server/app-bfcache-id.js";
 import { AppElementsWire } from "../server/app-elements.js";
 import { resolveManifestNavigationInterceptionContext } from "../server/app-browser-interception-context.js";
-import { createExternalHistoryStatePreservingMetadata } from "../server/app-history-state.js";
+import {
+  createExternalHistoryStatePreservingMetadata,
+  createHashOnlyHistoryStatePreservingNavigationMetadata,
+} from "../server/app-history-state.js";
 import {
   createRscRequestHeaders,
   createRscRequestUrl,
@@ -52,6 +56,8 @@ import {
 // still line up if Vite loads this shim through multiple resolved module IDs.
 const _LAYOUT_SEGMENT_CTX_KEY = Symbol.for("vinext.layoutSegmentContext");
 const _SERVER_INSERTED_HTML_CTX_KEY = Symbol.for("vinext.serverInsertedHTMLContext");
+const _BFCACHE_ID_MAP_CTX_KEY = Symbol.for("vinext.bfcacheIdMapContext");
+const _BFCACHE_SEGMENT_ID_CTX_KEY = Symbol.for("vinext.bfcacheSegmentIdContext");
 
 /**
  * Map of parallel route key → child segments below the current layout.
@@ -68,6 +74,8 @@ type _LayoutSegmentGlobal = typeof globalThis & {
   [_SERVER_INSERTED_HTML_CTX_KEY]?: React.Context<
     ((callback: () => unknown) => void) | null
   > | null;
+  [_BFCACHE_ID_MAP_CTX_KEY]?: React.Context<Readonly<Record<string, string>> | null> | null;
+  [_BFCACHE_SEGMENT_ID_CTX_KEY]?: React.Context<string | null> | null;
 };
 
 // ─── ServerInsertedHTML context ────────────────────────────────────────────────
@@ -116,6 +124,32 @@ export function getLayoutSegmentContext(): React.Context<SegmentMap> | null {
   }
 
   return globalState[_LAYOUT_SEGMENT_CTX_KEY] ?? null;
+}
+
+export function getBfcacheIdMapContext(): React.Context<Readonly<
+  Record<string, string>
+> | null> | null {
+  if (typeof React.createContext !== "function") return null;
+
+  const globalState = globalThis as _LayoutSegmentGlobal;
+  if (!globalState[_BFCACHE_ID_MAP_CTX_KEY]) {
+    globalState[_BFCACHE_ID_MAP_CTX_KEY] = React.createContext<Readonly<
+      Record<string, string>
+    > | null>(null);
+  }
+
+  return globalState[_BFCACHE_ID_MAP_CTX_KEY] ?? null;
+}
+
+export function getBfcacheSegmentIdContext(): React.Context<string | null> | null {
+  if (typeof React.createContext !== "function") return null;
+
+  const globalState = globalThis as _LayoutSegmentGlobal;
+  if (!globalState[_BFCACHE_SEGMENT_ID_CTX_KEY]) {
+    globalState[_BFCACHE_SEGMENT_ID_CTX_KEY] = React.createContext<string | null>(null);
+  }
+
+  return globalState[_BFCACHE_SEGMENT_ID_CTX_KEY] ?? null;
 }
 
 /**
@@ -1375,10 +1409,11 @@ function commitHashOnlyHistoryState(href: string, mode: "push" | "replace", scro
     return;
   }
 
+  const historyState = createHashOnlyHistoryStatePreservingNavigationMetadata(window.history.state);
   if (mode === "replace") {
-    replaceHistoryStateWithoutNotify(null, "", href);
+    replaceHistoryStateWithoutNotify(historyState, "", href);
   } else {
-    pushHistoryStateWithoutNotify(null, "", href);
+    pushHistoryStateWithoutNotify(historyState, "", href);
   }
 }
 
@@ -1581,7 +1616,7 @@ function releaseScheduledAppRouterNavigationAfterCurrentTask(release: () => void
  * Internal callers in this file continue to use `_appRouter` for brevity.
  */
 const _appRouter = {
-  bfcacheId: "0",
+  bfcacheId: INITIAL_BFCACHE_ID,
   push(href: string, options?: { scroll?: boolean }): void {
     assertSafeNavigationUrl(href);
     if (isServer) return;
@@ -1700,6 +1735,33 @@ const _appRouter = {
   },
 };
 
+function formatPublicBfcacheId(value: string | null | undefined): string {
+  if (!value || value === INITIAL_BFCACHE_ID) return PUBLIC_INITIAL_BFCACHE_ID;
+  return value;
+}
+
+/* oxlint-disable eslint-plugin-react-hooks/rules-of-hooks */
+function readBfcacheIdFromContext(): string {
+  const segmentContext = getBfcacheSegmentIdContext();
+  const idMapContext = getBfcacheIdMapContext();
+  if (!segmentContext || !idMapContext || typeof React.useContext !== "function") {
+    return formatPublicBfcacheId(null);
+  }
+
+  try {
+    const segmentId = React.useContext(segmentContext);
+    const idMap = React.useContext(idMapContext);
+    return formatPublicBfcacheId(segmentId !== null ? idMap?.[segmentId] : null);
+  } catch (error) {
+    // Low-level tests and direct module calls can hit this outside render.
+    if (process.env.NODE_ENV !== "production") {
+      console.warn("[vinext] readBfcacheIdFromContext failed:", error);
+    }
+    return formatPublicBfcacheId(null);
+  }
+}
+/* oxlint-enable eslint-plugin-react-hooks/rules-of-hooks */
+
 /**
  * Public App Router instance, exposed for the browser entry so it can wire
  * `window.next.router` to the same singleton returned from `useRouter()`.
@@ -1713,19 +1775,29 @@ export const appRouterInstance = _appRouter;
  * App Router's useRouter — returns push/replace/back/forward/refresh.
  * Different from Pages Router's useRouter (next/router).
  *
- * Returns a stable singleton: the same object reference on every call,
- * matching Next.js behavior so components using referential equality
- * (e.g. useMemo / useEffect deps, React.memo) don't re-render unnecessarily.
+ * Preserves the mounted AppRouterContext router as the authority for methods
+ * and layers the nearest segment's contextual `bfcacheId` on top.
  */
 export function useRouter() {
-  if (!AppRouterContext || typeof React.useContext !== "function") {
+  if (
+    !AppRouterContext ||
+    typeof React.useContext !== "function" ||
+    typeof React.useMemo !== "function"
+  ) {
     throw new Error("invariant expected app router to be mounted");
   }
   const router = React.useContext(AppRouterContext);
   if (router === null) {
     throw new Error("invariant expected app router to be mounted");
   }
-  return router;
+  const bfcacheId = readBfcacheIdFromContext();
+  return React.useMemo(
+    () => ({
+      ...router,
+      bfcacheId,
+    }),
+    [router, bfcacheId],
+  );
 }
 
 /**

@@ -356,6 +356,11 @@ function createAppPageSlotBindings<
     slotKey: string,
     slotName: string,
   ) => AppPageSlotOverride<TModule> | undefined,
+  options: {
+    interception: AppElementsInterception | null;
+    interceptionContext: string | null;
+    routePath: string;
+  },
 ): readonly AppElementsSlotBinding[] {
   const bindings: AppElementsSlotBinding[] = [];
   for (const [slotKey, slot] of Object.entries(route.slots ?? {})) {
@@ -363,10 +368,19 @@ function createAppPageSlotBindings<
     const layoutEntry = layoutEntries[targetIndex] ?? null;
     const ownerLayoutId = layoutEntry?.id ?? null;
     const override = resolveSlotOverride(slotKey, slot.name);
+    const slotId = resolveAppPageSlotId(slot, layoutEntry?.treePath ?? "/");
+    const state = resolveAppPageSlotBindingState(slot, override);
+    const activeRouteId =
+      state === "active"
+        ? options.interception?.slotId === slotId
+          ? options.interception.targetRouteId
+          : AppElementsWire.encodeRouteId(options.routePath, null)
+        : null;
     bindings.push({
+      ...(activeRouteId !== null ? { activeRouteId } : {}),
       ownerLayoutId,
-      slotId: resolveAppPageSlotId(slot, layoutEntry?.treePath ?? "/"),
-      state: resolveAppPageSlotBindingState(slot, override),
+      slotId,
+      state,
     });
   }
   return normalizeAppElementsSlotBindings(bindings, {
@@ -485,7 +499,11 @@ export function buildAppPageElements<
       layoutIds: options.route.ids?.layouts ?? layoutEntries.map((entry) => entry.id),
       rootLayoutTreePath,
       routeId,
-      slotBindings: createAppPageSlotBindings(options.route, layoutEntries, resolveSlotOverride),
+      slotBindings: createAppPageSlotBindings(options.route, layoutEntries, resolveSlotOverride, {
+        interception: renderIdentity?.interception ?? options.interception ?? null,
+        interceptionContext,
+        routePath: options.routePath,
+      }),
     }),
   };
   // Surface static-sibling info on the wire so the client router can decide
