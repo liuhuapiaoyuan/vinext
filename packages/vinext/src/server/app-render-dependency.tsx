@@ -5,6 +5,23 @@ export type AppRenderDependency = {
   release: () => void;
 };
 
+const appElementRenderDependencies = new WeakMap<
+  Readonly<Record<string, unknown>>,
+  ReadonlyMap<string, AppRenderDependency>
+>();
+
+// Write-only until the enable slice: this map is populated here so the
+// per-element render dependencies are registered ahead of the consumer
+// (`releaseAppElementRenderDependency`) that lands with enable-transport. It is
+// keyed by the elements object and GCs with it, so it is harmless while unread.
+export function registerAppElementRenderDependencies(
+  elements: Readonly<Record<string, unknown>>,
+  dependenciesByElementId: ReadonlyMap<string, AppRenderDependency>,
+): void {
+  if (dependenciesByElementId.size === 0) return;
+  appElementRenderDependencies.set(elements, dependenciesByElementId);
+}
+
 export function createAppRenderDependency(): AppRenderDependency {
   let released = false;
   let resolve!: () => void;

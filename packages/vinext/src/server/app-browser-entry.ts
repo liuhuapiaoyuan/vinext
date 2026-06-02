@@ -126,6 +126,7 @@ import { ElementsContext, Slot } from "vinext/shims/slot";
 import type { RouteManifest } from "../routing/app-route-graph.js";
 import { stripBasePath } from "../utils/base-path.js";
 import { createOnUncaughtError } from "./app-browser-error.js";
+import { createClientReuseManifestHeaderFromVisibleAppState } from "./app-browser-client-reuse-manifest.js";
 import {
   devOnCaughtError,
   devOnUncaughtError,
@@ -160,7 +161,7 @@ import {
   ACTION_REDIRECT_HEADER,
   ACTION_REDIRECT_STATUS_HEADER,
   ACTION_REDIRECT_TYPE_HEADER,
-  VINEXT_MOUNTED_SLOTS_HEADER,
+  VINEXT_CLIENT_REUSE_MANIFEST_HEADER,
   VINEXT_PARAMS_HEADER,
   VINEXT_RSC_REDIRECT_HEADER,
 } from "./headers.js";
@@ -1759,16 +1760,20 @@ function bootstrapHydration(rscStream: ReadableStream<Uint8Array>): void {
         // Pass navId so only this navigation (or a newer one) can clear it later.
         setPendingPathname(url.pathname, navId);
 
-        const elementsAtNavStart = getBrowserRouterState().elements;
+        const routerStateAtNavStart = getBrowserRouterState();
+        const elementsAtNavStart = routerStateAtNavStart.elements;
         const mountedSlotsHeader = getMountedSlotIdsHeader(elementsAtNavStart);
+        // The client reuse manifest is excluded from VINEXT_RSC_VARY_HEADER, so
+        // it never affects the cache-busting URL. Defer producing it until the
+        // visited-response cache miss is confirmed below — its producer iterates
+        // the visible layout ids and binary-searches a byte budget, which is
+        // pure waste on the cache-hit soft-nav path.
         const requestHeaders = createRscRequestHeaders({
           interceptionContext: requestInterceptionContext,
+          mountedSlotsHeader,
           renderMode:
             navigationKind === "refresh" ? APP_RSC_RENDER_MODE_REFRESH_PRESERVE_UI : undefined,
         });
-        if (mountedSlotsHeader) {
-          requestHeaders.set(VINEXT_MOUNTED_SLOTS_HEADER, mountedSlotsHeader);
-        }
         const rscUrl = await createRscRequestUrl(url.pathname + url.search, requestHeaders);
         const cachedRoute = getVisitedResponse(
           rscUrl,
@@ -1934,6 +1939,17 @@ function bootstrapHydration(rscStream: ReadableStream<Uint8Array>): void {
         }
 
         if (!navResponse) {
+          // Produce the client reuse manifest only now that prefetch/optimistic
+          // paths did not satisfy the navigation and a real request is required.
+          // Computed from the nav-start router state so it matches the snapshot
+          // the request would have carried if produced earlier.
+          if (navigationKind === "navigate") {
+            const clientReuseManifestHeader =
+              createClientReuseManifestHeaderFromVisibleAppState(routerStateAtNavStart);
+            if (clientReuseManifestHeader !== null) {
+              requestHeaders.set(VINEXT_CLIENT_REUSE_MANIFEST_HEADER, clientReuseManifestHeader);
+            }
+          }
           navResponse = await fetch(rscUrl, {
             headers: requestHeaders,
             credentials: "include",
