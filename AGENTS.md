@@ -319,6 +319,10 @@ Always use Node.js built-in modules and APIs before reaching for third-party pac
 
 If a Node built-in does the job, use it. Only reach for a dependency when the built-in is genuinely insufficient.
 
+### Never Install With `--no-frozen-lockfile`
+
+**NEVER run installs with `--no-frozen-lockfile`** (e.g. `pnpm install --no-frozen-lockfile`) on your own. Installs are frozen by default, so updating the lockfile requires this flag — which is exactly why an agent must never run it unattended. Bypassing the frozen lockfile opens the door to supply chain attacks: a frozen lockfile pins exact, vetted dependency versions and integrity hashes, and unfreezing it can pull in unreviewed or tampered packages. If you genuinely believe the lockfile needs to change, stop and ask the user to run the install with `--no-frozen-lockfile` themselves; never run it yourself.
+
 ---
 
 ## Git Workflow
