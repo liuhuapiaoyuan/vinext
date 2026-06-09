@@ -3911,13 +3911,34 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
     {
       name: "vinext:compiler-define-server",
       configEnvironment(name) {
-        if (Object.keys(nextConfig.compilerDefineServer).length === 0) return null;
-        // The client environment is never given the server-only defines.
-        // All other environments (rsc, ssr, custom worker envs, etc.) are
-        // server-side per Vite's `consumer: "server"` default and receive
-        // the substitutions.
+        // The client environment is NEVER given server-only defines. Returning
+        // early here is what makes every define in `serverDefines` below
+        // structurally guaranteed to stay out of the browser bundle. All other
+        // environments (rsc, ssr, custom worker envs, etc.) are server-side per
+        // Vite's `consumer: "server"` default and receive the substitutions.
         if (name === "client") return null;
-        return { define: { ...nextConfig.compilerDefineServer } };
+
+        const serverDefines: Record<string, string> = { ...nextConfig.compilerDefineServer };
+
+        // On-demand ISR revalidation secret — baked SERVER-ONLY (the `client`
+        // early-return above guarantees it never reaches the browser bundle) so
+        // every server bundle, and therefore every Workers isolate, shares the
+        // exact same value. This makes `res.revalidate()`'s cross-isolate
+        // loopback authenticate correctly where a per-process random secret would
+        // mismatch. Generated once per build by the `vinext build` CLI (see
+        // __VINEXT_SHARED_REVALIDATE_SECRET) and read at runtime by
+        // `getRevalidateSecret()` in `server/isr-cache.ts`. The env var is only
+        // set during `vinext build`, so dev (and any non-CLI build) omits the
+        // define and the runtime falls back to a process-shared dev secret —
+        // correct since dev is single-process.
+        const sharedRevalidateSecret = process.env.__VINEXT_SHARED_REVALIDATE_SECRET;
+        if (sharedRevalidateSecret) {
+          serverDefines["process.env.__VINEXT_REVALIDATE_SECRET"] =
+            JSON.stringify(sharedRevalidateSecret);
+        }
+
+        if (Object.keys(serverDefines).length === 0) return null;
+        return { define: serverDefines };
       },
     },
     // Local image import transform:

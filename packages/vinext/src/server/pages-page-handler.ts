@@ -29,7 +29,14 @@ import {
   normalizePagesDataRequest,
 } from "./pages-data-route.js";
 import { buildDefaultPagesNotFoundResponse } from "./pages-default-404.js";
-import { isrGet, isrSet, isrCacheKey, triggerBackgroundRegeneration } from "./isr-cache.js";
+import {
+  isrGet,
+  isrSet,
+  isrCacheKey,
+  triggerBackgroundRegeneration,
+  PRERENDER_REVALIDATE_HEADER,
+  isOnDemandRevalidateRequest,
+} from "./isr-cache.js";
 import { getScriptNonceFromHeaderSources } from "./csp.js";
 import { reportRequestError } from "./instrumentation.js";
 import { createRequestContext, runWithRequestContext } from "vinext/shims/unified-request-context";
@@ -451,6 +458,18 @@ export function createPagesPageHandler(
           expireSeconds: vinextConfig.expireTime,
           isBuildTimePrerendering:
             typeof process !== "undefined" && process.env && process.env.VINEXT_PRERENDER === "1",
+          // `res.revalidate()` issues an internal request carrying the
+          // `x-prerender-revalidate` header set to the process revalidate
+          // secret; treat it as an on-demand revalidation so getStaticProps
+          // sees `revalidateReason: "on-demand"` and the cache entry is
+          // regenerated synchronously. SECURITY: authorized by *equality*
+          // against the secret (never presence) — `isOnDemandRevalidateRequest`
+          // mirrors Next.js's `checkIsOnDemandRevalidate`, preventing an
+          // external client from forcing synchronous regeneration via an
+          // arbitrary header value (cache-stampede/DoS vector).
+          isOnDemandRevalidate: isOnDemandRevalidateRequest(
+            request.headers.get(PRERENDER_REVALIDATE_HEADER),
+          ),
           pageModule,
           params,
           query,

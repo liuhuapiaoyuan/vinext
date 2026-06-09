@@ -156,15 +156,16 @@ export type ResolvePagesPageDataOptions = {
    * When true, this dispatch was triggered by an on-demand revalidation
    * request (e.g. `res.revalidate()` in a Pages Router API route, or an
    * equivalent webhook). Maps to `revalidateReason: "on-demand"` when
-   * `getStaticProps` is invoked. Mirrors Next.js's
+   * `getStaticProps` is invoked, and bypasses the fresh/stale cache-hit
+   * short-circuits so the entry is regenerated synchronously. Mirrors Next.js's
    * `renderOpts.isOnDemandRevalidate` flag — see
    * `.nextjs-ref/packages/next/src/server/render.tsx`.
    *
-   * Forward-looking plumbing: no caller currently sets this — `res.revalidate()`
-   * is not yet implemented in vinext. The `"on-demand"` branch in the
-   * `revalidateReason` resolver is intentionally unreachable today; keeping the
-   * typed contract here means wiring it up will be a one-line change once the
-   * trigger lands.
+   * The page handler sets this only when the incoming request's
+   * `x-prerender-revalidate` header (`PRERENDER_REVALIDATE_HEADER`) *equals* the
+   * process revalidate secret that `res.revalidate()` attaches to its internal
+   * request (`isOnDemandRevalidateRequest`). It is never set on mere header
+   * presence — see the security note in `isr-cache.ts`.
    */
   isOnDemandRevalidate?: boolean;
   pageModule: PagesPageModule;
@@ -537,7 +538,13 @@ export async function resolvePagesPageData(
     const cached = await options.isrGet(cacheKey);
     const cachedValue = cached?.value.value;
 
+    // On-demand revalidation (`res.revalidate()`) must regenerate the entry
+    // synchronously with `revalidateReason: "on-demand"`, so the fresh/stale
+    // cache-hit short-circuits below are bypassed and execution falls through
+    // to the regeneration path. Mirrors Next.js's `isOnDemandRevalidate`
+    // handling in render.tsx / base-server.ts.
     if (
+      !options.isOnDemandRevalidate &&
       cachedValue?.kind === "PAGES" &&
       cached &&
       !cached.isStale &&
@@ -559,6 +566,7 @@ export async function resolvePagesPageData(
     }
 
     if (
+      !options.isOnDemandRevalidate &&
       cachedValue?.kind === "PAGES" &&
       cached &&
       cached.isStale &&
