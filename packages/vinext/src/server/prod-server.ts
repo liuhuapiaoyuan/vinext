@@ -26,17 +26,6 @@ import path from "node:path";
 import zlib from "node:zlib";
 import { StaticFileCache, CONTENT_TYPES, etagFromFilenameHash } from "./static-file-cache.js";
 import {
-  matchRedirect,
-  matchRewrite,
-  preserveRedirectDestinationQuery,
-  requestContextFromRequest,
-  applyMiddlewareRequestHeaders,
-  isExternalUrl,
-  proxyExternalRequest,
-  sanitizeDestination,
-} from "../config/config-matchers.js";
-import type { RequestContext } from "../config/config-matchers.js";
-import {
   isImageOptimizationPath,
   IMAGE_CONTENT_SECURITY_POLICY,
   parseImageParams,
@@ -46,21 +35,20 @@ import {
   type ImageConfig,
 } from "./image-optimization.js";
 import { normalizePath } from "./normalize-path.js";
-import {
-  applyConfigHeadersToHeaderRecord,
-  filterInternalHeaders,
-  isOpenRedirectShaped,
-  normalizeTrailingSlash,
-} from "./request-pipeline.js";
+import { filterInternalHeaders, isOpenRedirectShaped } from "./request-pipeline.js";
 import { notFoundResponse } from "./http-error-responses.js";
-import { normalizeDefaultLocalePathname, stripI18nLocaleForApiRoute } from "./pages-i18n.js";
+import {
+  runPagesRequest,
+  type PagesPipelineDeps,
+  type PagesRenderOptions,
+} from "./pages-request-pipeline.js";
+import { mergeHeaders } from "./worker-utils.js";
 import {
   isNextDataPathname,
   parseNextDataPathname,
   buildNextDataNotFoundResponse,
 } from "./pages-data-route.js";
 import { hasBasePath, stripBasePath } from "../utils/base-path.js";
-import { mergeRewriteQuery } from "../utils/query.js";
 import {
   ASSET_PREFIX_URL_DIR,
   assetPrefixPathname,
@@ -268,11 +256,6 @@ function nodeHeadersToWebHeaders(headersRecord: IncomingMessage["headers"]): Hea
 
 const NO_BODY_RESPONSE_STATUSES = new Set([204, 205, 304]);
 
-function hasHeader(headersRecord: Record<string, string | string[]>, name: string): boolean {
-  const target = name.toLowerCase();
-  return Object.keys(headersRecord).some((key) => key.toLowerCase() === target);
-}
-
 function omitHeadersCaseInsensitive(
   headersRecord: Record<string, string | string[]>,
   names: readonly string[],
@@ -293,16 +276,6 @@ function matchesIfNoneMatchHeader(ifNoneMatch: string | undefined, etag: string)
     .split(",")
     .map((value) => value.trim())
     .some((value) => value === etag);
-}
-
-function stripHeaders(
-  headersRecord: Record<string, string | string[]>,
-  names: readonly string[],
-): void {
-  const targets = new Set(names.map((name) => name.toLowerCase()));
-  for (const key of Object.keys(headersRecord)) {
-    if (targets.has(key.toLowerCase())) delete headersRecord[key];
-  }
 }
 
 function isNoBodyResponseStatus(status: number): boolean {
@@ -338,56 +311,19 @@ function logProdServerStarted(host: string, port: number, purpose: ProdServerOpt
 /**
  * Merge middleware/config headers and an optional status override into a new
  * Web Response while preserving the original body stream when allowed.
- * Keep this in sync with server/worker-utils.ts and the generated copy in
- * deploy.ts.
+ *
+ * This is the canonical {@link mergeHeaders} (server/worker-utils.ts) with the
+ * arguments in (headers, response) order. The request path now calls
+ * `runPagesRequest`, which uses `mergeHeaders` directly; this wrapper is retained
+ * only for its existing tests and any external callers, so there is a single
+ * implementation to keep in sync. (deploy.ts still emits its own generated copy.)
  */
 function mergeWebResponse(
   middlewareHeaders: Record<string, string | string[]>,
   response: Response,
   statusOverride?: number,
 ): Response {
-  const filteredMiddlewareHeaders = omitHeadersCaseInsensitive(middlewareHeaders, [
-    "content-length",
-  ]);
-  const status = statusOverride ?? response.status;
-  const mergedHeaders = mergeResponseHeaders(filteredMiddlewareHeaders, response);
-  const shouldDropBody = isNoBodyResponseStatus(status);
-  const shouldStripStreamLength =
-    isVinextStreamedHtmlResponse(response) && hasHeader(mergedHeaders, "content-length");
-
-  if (
-    !Object.keys(filteredMiddlewareHeaders).length &&
-    statusOverride === undefined &&
-    !shouldDropBody &&
-    !shouldStripStreamLength
-  ) {
-    return response;
-  }
-
-  if (shouldDropBody) {
-    cancelResponseBody(response);
-    stripHeaders(mergedHeaders, [
-      "content-encoding",
-      "content-length",
-      "content-type",
-      "transfer-encoding",
-    ]);
-    return new Response(null, {
-      status,
-      statusText: status === response.status ? response.statusText : undefined,
-      headers: toWebHeaders(mergedHeaders),
-    });
-  }
-
-  if (shouldStripStreamLength) {
-    stripHeaders(mergedHeaders, ["content-length"]);
-  }
-
-  return new Response(response.body, {
-    status,
-    statusText: status === response.status ? response.statusText : undefined,
-    headers: toWebHeaders(mergedHeaders),
-  });
+  return mergeHeaders(response, middlewareHeaders, statusOverride);
 }
 
 /**
@@ -1671,23 +1607,6 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
           pathname = stripped;
         }
       }
-      const basePathState = { basePath, hadBasePath };
-
-      // ── 3. Trailing slash normalization ───────────────────────────
-      {
-        const qs = url.includes("?") ? url.slice(url.indexOf("?")) : "";
-        const trailingSlashRedirect = normalizeTrailingSlash(pathname, basePath, trailingSlash, qs);
-        if (trailingSlashRedirect) {
-          const location = trailingSlashRedirect.headers.get("Location");
-          res.writeHead(
-            trailingSlashRedirect.status,
-            location ? { Location: location } : undefined,
-          );
-          res.end();
-          return;
-        }
-      }
-
       // ── 3b. `_next/data` normalization ────────────────────────────
       // Pages Router client-side navigations fetch
       // `/_next/data/<buildId>/<page>.json`. The page path must be normalized
@@ -1725,7 +1644,7 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
       const reqHeaders = filterInternalHeaders(rawReqHeaders);
       const method = req.method ?? "GET";
       const hasBody = method !== "GET" && method !== "HEAD";
-      let webRequest = new Request(`${protocol}://${hostHeader}${url}`, {
+      const webRequest = new Request(`${protocol}://${hostHeader}${url}`, {
         method,
         headers: reqHeaders,
         body: hasBody ? readNodeStream(req) : undefined,
@@ -1733,298 +1652,100 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
         duplex: hasBody ? "half" : undefined,
       });
 
-      // Build request context for pre-middleware config matching. Redirects
-      // run before middleware in Next.js. Header match conditions also use the
-      // original request snapshot even though header merging happens later so
-      // middleware response headers can still take precedence.
-      // beforeFiles, afterFiles, and fallback all run after middleware per the
-      // Next.js execution order, so they use postMwReqCtx below.
-      const reqCtx: RequestContext = requestContextFromRequest(webRequest);
-
-      // ── 4. Default-locale path normalisation (issue #1336, item 4) ──
-      // Next.js normalises every request that arrives without a locale
-      // prefix by splicing in the (domain-aware) default locale before any
-      // config rule or filesystem match runs. Without this, a rule like
-      // `source: '/:locale/to-sv'` with `locale: false` does not match a
-      // request for `/to-sv` because there is no segment for `:locale`.
-      // Mirrors packages/next/src/server/lib/router-utils/resolve-routes.ts
-      // (lines ~250-263).
-      //
-      // Extract the request hostname once and reuse it for both the
-      // pre-middleware match below and the post-middleware
-      // `matchResolvedPathname` helper further down. `webRequest.url` is
-      // preserved across `applyMiddlewareRequestHeaders` (it constructs the
-      // post-middleware request with the same URL), so the hostname does
-      // not change.
-      const requestHostname = i18nConfig ? new URL(webRequest.url).hostname : "";
-      const matchPathname = i18nConfig
-        ? normalizeDefaultLocalePathname(pathname, i18nConfig, { hostname: requestHostname })
-        : pathname;
-
-      // ── 5. Apply redirects from next.config.js ────────────────────
-      if (configRedirects.length) {
-        // The matcher sees the stripped pathname when the request was under
-        // basePath, and the original (un-stripped) pathname otherwise. The
-        // basePath gating inside `matchRedirect` then filters rules based on
-        // their `basePath: false` opt-out so the wrong rule set can't match.
-        const redirect = matchRedirect(matchPathname, configRedirects, reqCtx, basePathState);
-        if (redirect) {
-          // Guard against double-prefixing: only add basePath if the
-          // request was under basePath AND the destination doesn't already
-          // start with it. basePath: false rules with `hadBasePath === false`
-          // must NOT receive a basePath prefix.
-          const dest = sanitizeDestination(
-            basePath &&
-              hadBasePath &&
-              !isExternalUrl(redirect.destination) &&
-              !hasBasePath(redirect.destination, basePath)
-              ? basePath + redirect.destination
-              : redirect.destination,
+      // ── Delegate steps 3–11 to the shared Pages Router pipeline ──
+      const deps: PagesPipelineDeps = {
+        basePath,
+        trailingSlash,
+        i18nConfig,
+        configRedirects,
+        configRewrites,
+        configHeaders,
+        hadBasePath,
+        isDataReq,
+        isDataRequest,
+        ctx: undefined, // Node has no ExecutionContext
+        // Raw query from req.url so redirect Locations aren't re-encoded by URL parsing.
+        rawSearch: rawQs,
+        matchPageRoute: matchPageRoute ?? null,
+        runMiddleware: typeof runMiddleware === "function" ? runMiddleware : null,
+        renderPage:
+          typeof renderPage === "function"
+            ? (
+                request: Request,
+                resolvedUrl: string,
+                options?: PagesRenderOptions,
+                stagedHeaders?: Headers,
+              ) => renderPage(request, resolvedUrl, ssrManifest, undefined, stagedHeaders, options)
+            : null,
+        handleApi:
+          typeof handleApi === "function"
+            ? (request: Request, apiUrl: string) =>
+                handleApi(request, apiUrl, createNodeExecutionContext())
+            : null,
+        // ── 5b. Serve public-directory static files (post-middleware) ──
+        // Public files (favicon.ico, robots.txt, anything under public/) are served
+        // after middleware so middleware can intercept or redirect them, and before
+        // rewrites so a real public file wins over a fallback rewrite. Build assets
+        // (/_next/static/*) were already served above. Middleware response headers
+        // (including next.config headers staged by the pipeline) are passed through so
+        // Set-Cookie / security headers from middleware are included in the response.
+        serveStaticFile: async (requestPathname, stagedHeaders) => {
+          if (
+            requestPathname === "/" ||
+            requestPathname.startsWith("/api/") ||
+            requestPathname.startsWith(`/${ASSET_PREFIX_URL_DIR}/`)
+          ) {
+            return false;
+          }
+          return tryServeStatic(
+            req,
+            res,
+            clientDir,
+            requestPathname,
+            compress,
+            staticCache,
+            stagedHeaders,
           );
-          // Carry the original request query (e.g. the App Router RSC
-          // cache-busting `_rsc` param) onto the redirect Location so the
-          // browser's auto-followed request is still treated as an RSC
-          // fetch. Mirrors Next.js resolve-routes.ts (issue #1529).
-          // `rawQs` already holds the original (un-re-encoded) query string
-          // that `url` was rebuilt from above.
-          const location = preserveRedirectDestinationQuery(dest, rawQs);
-          res.writeHead(redirect.permanent ? 308 : 307, { Location: location });
-          res.end();
+        },
+      };
+
+      const result = await runPagesRequest(webRequest, deps);
+
+      if (result.type === "handled") {
+        // serveStaticFile already wrote the response to `res`.
+        return;
+      }
+
+      if (result.type === "response") {
+        const { response } = result;
+        const shouldStream = isVinextStreamedHtmlResponse(response);
+        // Passthrough responses (middleware short-circuits, external proxies, redirects)
+        // carry no defaultContentType — send them verbatim without injecting a
+        // Content-Type, matching the pre-refactor behavior. Only buffered render/api
+        // responses below apply a Content-Type fallback.
+        if (shouldStream || !response.body || result.defaultContentType === undefined) {
+          await sendWebResponse(response, req, res, compress);
           return;
         }
-      }
 
-      // ── 5. Run middleware ─────────────────────────────────────────
-      let resolvedUrl = url;
-      const middlewareHeaders: Record<string, string | string[]> = {};
-      let middlewareStatus: number | undefined;
-      if (typeof runMiddleware === "function") {
-        const result = await runMiddleware(webRequest, undefined, { isDataRequest });
-
-        // Settle waitUntil promises immediately — in Node.js there's no ctx.waitUntil().
-        // Must run BEFORE the !result.continue check so promises survive redirect/response paths
-        // (e.g. Clerk auth redirecting unauthenticated users).
-        if (result.waitUntilPromises && result.waitUntilPromises.length > 0) {
-          void Promise.allSettled(result.waitUntilPromises);
-        }
-
-        if (!result.continue) {
-          if (result.redirectUrl) {
-            const redirectHeaders: Record<string, string | string[]> = {
-              Location: result.redirectUrl,
-            };
-            if (result.responseHeaders) {
-              for (const [key, value] of result.responseHeaders) {
-                const existing = redirectHeaders[key];
-                if (existing === undefined) {
-                  redirectHeaders[key] = value;
-                } else if (Array.isArray(existing)) {
-                  existing.push(value);
-                } else {
-                  redirectHeaders[key] = [existing, value];
-                }
-              }
-            }
-            res.writeHead(result.redirectStatus ?? 307, redirectHeaders);
-            res.end();
-            return;
-          }
-          if (result.response) {
-            // Use arrayBuffer() to handle binary response bodies correctly
-            const body = Buffer.from(await result.response.arrayBuffer());
-            // Preserve multi-value headers (especially Set-Cookie) by
-            // using getSetCookie() for cookies and forEach for the rest.
-            const respHeaders: Record<string, string | string[]> = {};
-            result.response.headers.forEach((value: string, key: string) => {
-              if (key === "set-cookie") return; // handled below
-              respHeaders[key] = value;
-            });
-            const setCookies = result.response.headers.getSetCookie?.() ?? [];
-            if (setCookies.length > 0) respHeaders["set-cookie"] = setCookies;
-            if (result.response.statusText) {
-              res.writeHead(result.response.status, result.response.statusText, respHeaders);
-            } else {
-              res.writeHead(result.response.status, respHeaders);
-            }
-            res.end(body);
-            return;
-          }
-        }
-
-        // Collect middleware response headers to merge into final response.
-        // Use an array for Set-Cookie to preserve multiple values.
-        if (result.responseHeaders) {
-          for (const [key, value] of result.responseHeaders) {
-            if (key === "set-cookie") {
-              const existing = middlewareHeaders[key];
-              if (Array.isArray(existing)) {
-                existing.push(value);
-              } else if (existing) {
-                middlewareHeaders[key] = [existing as string, value];
-              } else {
-                middlewareHeaders[key] = [value];
-              }
-            } else {
-              middlewareHeaders[key] = value;
-            }
-          }
-        }
-
-        // Apply middleware rewrite
-        if (result.rewriteUrl) {
-          resolvedUrl = result.rewriteUrl;
-        }
-
-        // Apply custom status code from middleware continue/rewrite responses.
-        // Examples: NextResponse.next({ status: 404 }) and
-        // NextResponse.rewrite(url, { status: 403 }).
-        middlewareStatus = result.status ?? result.rewriteStatus;
-      }
-
-      // Unpack x-middleware-request-* headers into the actual request and strip
-      // all x-middleware-* internal signals. Rebuilds postMwReqCtx for use by
-      // beforeFiles, afterFiles, and fallback config rules (which run after
-      // middleware per the Next.js execution order).
-      const { postMwReqCtx, request: postMwReq } = applyMiddlewareRequestHeaders(
-        middlewareHeaders,
-        webRequest,
-        { preserveCredentialHeaders: isExternalUrl(resolvedUrl) },
-      );
-      webRequest = postMwReq;
-
-      // Config header matching must keep using the original normalized pathname
-      // even if middleware rewrites the downstream route/render target.
-      let resolvedPathname = resolvedUrl.split("?")[0];
-      // Default-locale-normalised form of resolvedPathname for matching against
-      // next.config.js rewrites (beforeFiles, afterFiles, fallback). Mirrors
-      // Next.js's resolve-routes.ts behaviour where the post-middleware
-      // pathname is also locale-prefixed before rewrite matching.
-      const matchResolvedPathname = (p: string): string =>
-        i18nConfig
-          ? normalizeDefaultLocalePathname(p, i18nConfig, { hostname: requestHostname })
-          : p;
-
-      // ── 6. Apply custom headers from next.config.js ───────────────
-      // Config headers are additive for multi-value headers (Vary,
-      // Set-Cookie) and override for everything else. Set-Cookie values
-      // are stored as arrays (RFC 6265 forbids comma-joining cookies).
-      // Middleware headers take precedence: skip config keys already set
-      // by middleware so middleware always wins for the same key.
-      // This runs before step 5b so config headers are included in static
-      // public directory file responses (matching Next.js behavior).
-      if (configHeaders.length) {
-        applyConfigHeadersToHeaderRecord(middlewareHeaders, {
-          configHeaders,
-          pathname: matchPathname,
-          requestContext: reqCtx,
-          basePathState,
+        const responseBody = Buffer.from(await response.arrayBuffer());
+        // render → text/html, api → application/octet-stream (set by the pipeline).
+        const ct = response.headers.get("content-type") ?? result.defaultContentType;
+        const responseHeaders: Record<string, string | string[]> = {};
+        response.headers.forEach((v, k) => {
+          if (k === "set-cookie") return;
+          responseHeaders[k] = v;
         });
-      }
-
-      if (isExternalUrl(resolvedUrl)) {
-        const proxyResponse = await proxyExternalRequest(webRequest, resolvedUrl);
-        const mergedResponse = mergeWebResponse(middlewareHeaders, proxyResponse, undefined);
-        await sendWebResponse(mergedResponse, req, res, compress);
-        return;
-      }
-
-      // ── 5b. Serve public directory static files ────────────────────
-      // Public directory files (non-build-asset static files) are served
-      // after middleware so middleware can intercept or redirect them.
-      // Build assets (/_next/static/*) are already served in step 1.
-      // Middleware response headers (including config headers applied above)
-      // are passed through so Set-Cookie, security headers, etc. from
-      // middleware and next.config.js are included in the response.
-      if (
-        staticLookupPath !== "/" &&
-        !staticLookupPath.startsWith("/api/") &&
-        !staticLookupPath.startsWith(`/${ASSET_PREFIX_URL_DIR}/`) &&
-        (await tryServeStatic(
-          req,
-          res,
-          clientDir,
-          staticLookupPath,
-          compress,
-          staticCache,
-          middlewareHeaders,
-        ))
-      ) {
-        return;
-      }
-
-      // ── 7. Apply beforeFiles rewrites from next.config.js ─────────
-      let configRewriteFired = false;
-      if (configRewrites.beforeFiles?.length) {
-        const rewritten = matchRewrite(
-          matchResolvedPathname(resolvedPathname),
-          configRewrites.beforeFiles,
-          postMwReqCtx,
-          basePathState,
-        );
-        if (rewritten) {
-          if (isExternalUrl(rewritten)) {
-            const proxyResponse = await proxyExternalRequest(webRequest, rewritten);
-            await sendWebResponse(proxyResponse, req, res, compress);
-            return;
-          }
-          // Preserve the original request's query params across the config
-          // rewrite. Matches Next.js `Object.assign(parsedUrl.query, ...)`.
-          resolvedUrl = mergeRewriteQuery(resolvedUrl, rewritten);
-          resolvedPathname = resolvedUrl.split("?")[0];
-          configRewriteFired = true;
-        }
-      }
-
-      // ── 7b. Reject out-of-basePath requests that no rule rewrote ──
-      // When `basePath` is configured and the request was outside it,
-      // only `basePath: false` rules can keep it alive. If none matched,
-      // the request must 404 — Next.js does not serve internal routes
-      // from outside the configured basePath.
-      // @see .nextjs-ref/packages/next/src/server/lib/router-utils/resolve-routes.ts:304-309
-      if (basePath && !hadBasePath && !configRewriteFired) {
-        res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
-        res.end("This page could not be found");
-        return;
-      }
-
-      // ── 8. API routes ─────────────────────────────────────────────
-      // Strip the i18n locale prefix before the `/api/` check so
-      // `/fr/api/ok` resolves to the `pages/api/ok` handler (Next.js
-      // parity — see base-server.ts's normalizeLocalePath call).
-      const apiLookupUrl = stripI18nLocaleForApiRoute(resolvedUrl, vinextConfig?.i18n ?? null);
-      const apiLookupPathname = apiLookupUrl.split("?")[0];
-      if (apiLookupPathname.startsWith("/api/") || apiLookupPathname === "/api") {
-        let response: Response;
-        if (typeof handleApi === "function") {
-          // Pass a Node-shaped ExecutionContext so any after() calls in the
-          // API handler still get a working waitUntil (which fires
-          // background work without blocking the response).
-          response = await handleApi(webRequest, apiLookupUrl, createNodeExecutionContext());
-        } else {
-          response = new Response("404 - API route not found", { status: 404 });
-        }
-
-        const mergedResponse = mergeWebResponse(middlewareHeaders, response, middlewareStatus);
-
-        if (!mergedResponse.body) {
-          await sendWebResponse(mergedResponse, req, res, compress);
-          return;
-        }
-
-        const responseBody = Buffer.from(await mergedResponse.arrayBuffer());
-        // API routes may return arbitrary data (JSON, binary, etc.), so
-        // default to application/octet-stream rather than text/html when
-        // the handler doesn't set an explicit Content-Type.
-        const ct = mergedResponse.headers.get("content-type") ?? "application/octet-stream";
-        const responseHeaders = mergeResponseHeaders({}, mergedResponse);
-        const finalStatusText = mergedResponse.statusText || undefined;
+        const setCookies = response.headers.getSetCookie?.() ?? [];
+        if (setCookies.length > 0) responseHeaders["set-cookie"] = setCookies;
+        const finalStatusText = response.statusText || undefined;
 
         sendCompressed(
           req,
           res,
           responseBody,
           ct,
-          mergedResponse.status,
+          response.status,
           responseHeaders,
           compress,
           finalStatusText,
@@ -2032,126 +1753,10 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
         return;
       }
 
-      const pageMatch = matchPageRoute ? matchPageRoute(resolvedPathname, webRequest) : null;
-
-      // ── 9. Apply afterFiles rewrites from next.config.js ──────────
-      // These run after non-dynamic page routes but before dynamic routes.
-      if ((!pageMatch || pageMatch.route.isDynamic) && configRewrites.afterFiles?.length) {
-        const rewritten = matchRewrite(
-          matchResolvedPathname(resolvedPathname),
-          configRewrites.afterFiles,
-          postMwReqCtx,
-          basePathState,
-        );
-        if (rewritten) {
-          if (isExternalUrl(rewritten)) {
-            const proxyResponse = await proxyExternalRequest(webRequest, rewritten);
-            await sendWebResponse(proxyResponse, req, res, compress);
-            return;
-          }
-          resolvedUrl = mergeRewriteQuery(resolvedUrl, rewritten);
-          resolvedPathname = resolvedUrl.split("?")[0];
-        }
-      }
-
-      // ── 10. SSR page rendering ────────────────────────────────────
-      let response: Response | undefined;
-      if (typeof renderPage === "function") {
-        const middlewareResponseHeaders = toWebHeaders(middlewareHeaders);
-        const renderPageMatch = matchPageRoute
-          ? matchPageRoute(resolvedPathname, webRequest)
-          : null;
-        const shouldDeferErrorPageOnMiss = !isDataReq && !!matchPageRoute && !renderPageMatch;
-        const dataRenderOptions = isDataReq ? { isDataReq: true } : undefined;
-        const initialRenderOptions = shouldDeferErrorPageOnMiss
-          ? { renderErrorPageOnMiss: false }
-          : dataRenderOptions;
-        response = await renderPage(
-          webRequest,
-          resolvedUrl,
-          ssrManifest,
-          undefined,
-          middlewareResponseHeaders,
-          initialRenderOptions,
-        );
-
-        // ── 11. Fallback rewrites (if SSR returned 404) ─────────────
-        let matchedFallbackRewrite = false;
-        if (
-          response &&
-          response.status === 404 &&
-          shouldDeferErrorPageOnMiss &&
-          configRewrites.fallback?.length
-        ) {
-          const fallbackRewrite = matchRewrite(
-            matchResolvedPathname(resolvedPathname),
-            configRewrites.fallback,
-            postMwReqCtx,
-            basePathState,
-          );
-          if (fallbackRewrite) {
-            if (isExternalUrl(fallbackRewrite)) {
-              const proxyResponse = await proxyExternalRequest(webRequest, fallbackRewrite);
-              await sendWebResponse(proxyResponse, req, res, compress);
-              return;
-            }
-            matchedFallbackRewrite = true;
-            response = await renderPage(
-              webRequest,
-              mergeRewriteQuery(resolvedUrl, fallbackRewrite),
-              ssrManifest,
-              undefined,
-              middlewareResponseHeaders,
-              dataRenderOptions,
-            );
-          }
-        }
-        if (
-          response &&
-          response.status === 404 &&
-          shouldDeferErrorPageOnMiss &&
-          !matchedFallbackRewrite
-        ) {
-          response = await renderPage(
-            webRequest,
-            resolvedUrl,
-            ssrManifest,
-            undefined,
-            middlewareResponseHeaders,
-          );
-        }
-      }
-
-      if (!response) {
-        res.writeHead(404);
-        res.end("This page could not be found");
-        return;
-      }
-
-      // Capture the streaming marker before mergeWebResponse rebuilds the Response.
-      const shouldStreamPagesResponse = isVinextStreamedHtmlResponse(response);
-      const mergedResponse = mergeWebResponse(middlewareHeaders, response, middlewareStatus);
-
-      if (shouldStreamPagesResponse || !mergedResponse.body) {
-        await sendWebResponse(mergedResponse, req, res, compress);
-        return;
-      }
-
-      const responseBody = Buffer.from(await mergedResponse.arrayBuffer());
-      const ct = mergedResponse.headers.get("content-type") ?? "text/html";
-      const responseHeaders = mergeResponseHeaders({}, mergedResponse);
-      const finalStatusText = mergedResponse.statusText || undefined;
-
-      sendCompressed(
-        req,
-        res,
-        responseBody,
-        ct,
-        mergedResponse.status,
-        responseHeaders,
-        compress,
-        finalStatusText,
-      );
+      // type "render", "api", "next" should not happen when we supply all callbacks,
+      // but guard anyway to keep the adapter correct if callbacks are absent.
+      res.writeHead(404);
+      res.end("This page could not be found");
     } catch (e) {
       console.error("[vinext] Server error:", e);
       if (!res.headersSent) {
