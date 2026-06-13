@@ -214,6 +214,19 @@ const CLIENT_RSC_COMPATIBILITY_ID = getVinextRscCompatibilityId();
 const optimisticRouteTemplates = new Map<string, OptimisticRouteTemplate>();
 const optimisticRouteTemplateSources = new Set<string>();
 const optimisticRouteTemplateLearning = new Map<string, Promise<void>>();
+
+function claimInitialAppRouterBootstrap(): boolean {
+  if (window.__VINEXT_RSC_ROOT__ || window.__VINEXT_RSC_BOOTSTRAP_STATE__) {
+    return false;
+  }
+  window.__VINEXT_RSC_BOOTSTRAP_STATE__ = "starting";
+  return true;
+}
+
+function markInitialAppRouterBootstrapHydrated(): void {
+  window.__VINEXT_RSC_BOOTSTRAP_STATE__ = "hydrated";
+}
+
 function getBrowserRouteManifest(): RouteManifest | null {
   return getNavigationRuntime()?.bootstrap.routeManifest ?? null;
 }
@@ -1550,6 +1563,8 @@ function registerServerActionCallback(): void {
 }
 
 async function main(): Promise<void> {
+  if (!claimInitialAppRouterBootstrap()) return;
+
   registerServerActionCallback();
 
   if (import.meta.env.DEV) {
@@ -1564,6 +1579,8 @@ async function main(): Promise<void> {
   // persistently broken (post-reload). Bootstrap is a separate synchronous
   // helper so the null-branch structurally cannot reach any RSC bootstrap
   // global assignment, even if a future refactor interposes async work here.
+  // The recovery path reloads the document, which resets the "starting" claim;
+  // this module instance is intentionally not eligible to retry bootstrap.
   if (rscStream === null) return;
   bootstrapHydration(rscStream);
 }
@@ -1605,6 +1622,7 @@ function bootstrapHydration(rscStream: ReadableStream<Uint8Array>): void {
     options: hydrateRootOptions,
     startTransition,
   });
+  markInitialAppRouterBootstrapHydrated();
 
   const navigateRsc: NavigationRuntimeNavigate = async function navigateRsc(
     href: string,

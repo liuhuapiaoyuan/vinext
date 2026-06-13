@@ -287,6 +287,11 @@ function hasProperty<TKey extends PropertyKey>(
   return key in value;
 }
 
+function isEdgeRouteHandler(handler: unknown): boolean {
+  if (!handler || typeof handler !== "object" || !hasProperty(handler, "runtime")) return false;
+  return handler.runtime === "edge" || handler.runtime === "experimental-edge";
+}
+
 function isExecutionContextLike(value: unknown): value is ExecutionContextLike {
   if (!value || typeof value !== "object") return false;
   return hasProperty(value, "waitUntil") && typeof value.waitUntil === "function";
@@ -382,6 +387,16 @@ function requestWithoutRscCacheBustingSearchParam(request: Request): Request {
   // reconstruct via `cloneRequestWithUrl` rather than a bare `new Request` so
   // the Workers `cf` metadata is preserved (user middleware reads it directly)
   // and `duplex: "half"` is set for streaming bodies.
+  const source = request.body ? request.clone() : request;
+  return cloneRequestWithUrl(source, url.toString());
+}
+
+function requestWithoutRscSuffix(request: Request): Request {
+  const url = new URL(request.url);
+  const pathname = stripRscSuffix(url.pathname);
+  if (pathname === url.pathname) return request;
+
+  url.pathname = pathname;
   const source = request.body ? request.clone() : request;
   return cloneRequestWithUrl(source, url.toString());
 }
@@ -492,9 +507,8 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   // Keep cache-busting validation on the real request above, then hide the
   // internal `_rsc` transport query from userland middleware and post-middleware
   // has/missing matching. This mirrors Next.js' navigation middleware fixture.
-  const userlandRequest = isRscRequest
-    ? requestWithoutRscCacheBustingSearchParam(request)
-    : request;
+  const normalizedUserlandRequest = requestWithoutRscSuffix(request);
+  const userlandRequest = requestWithoutRscCacheBustingSearchParam(normalizedUserlandRequest);
   const middlewareContext: AppRscMiddlewareContext = {
     headers: null,
     requestHeaders: null,
@@ -540,9 +554,9 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     {
       basePathState,
       clearRequestContext: options.clearRequestContext,
-      // Forward the `_rsc`-stripped request so external rewrite proxies never
-      // receive the internal RSC transport query (same invariant as middleware).
-      request: userlandRequest,
+      // External RSC rewrites must forward the validated `_rsc` token so the
+      // destination server can validate the request without the original URL.
+      request: normalizedUserlandRequest,
       requestContext: postMiddlewareRequestContext,
       rewrites: options.configRewrites.beforeFiles,
     },
@@ -594,9 +608,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     return publicFileResponse;
   }
 
-  if (isRscRequest) {
-    stripRscCacheBustingSearchParam(url);
-  }
+  stripRscCacheBustingSearchParam(url);
 
   options.setNavigationContext({
     pathname: canonicalPathname,
@@ -663,9 +675,8 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       {
         basePathState,
         clearRequestContext: options.clearRequestContext,
-        // Forward the `_rsc`-stripped request so external rewrite proxies never
-        // receive the internal RSC transport query (same invariant as middleware).
-        request: userlandRequest,
+        // External RSC rewrites must forward the validated `_rsc` token.
+        request: normalizedUserlandRequest,
         requestContext: postMiddlewareRequestContext,
         rewrites: options.configRewrites.afterFiles,
       },
@@ -683,9 +694,8 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       {
         basePathState,
         clearRequestContext: options.clearRequestContext,
-        // Forward the `_rsc`-stripped request so external rewrite proxies never
-        // receive the internal RSC transport query (same invariant as middleware).
-        request: userlandRequest,
+        // External RSC rewrites must forward the validated `_rsc` token.
+        request: normalizedUserlandRequest,
         requestContext: postMiddlewareRequestContext,
         rewrites: options.configRewrites.fallback,
       },
@@ -762,6 +772,13 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     setCurrentFetchSoftTags(
       buildPageCacheTags(cleanPathname, [], [...route.routeSegments], "route"),
     );
+    // Next.js edge route handlers run through web/adapter.ts, which strips
+    // internal search params from the request URL. Node route handlers only
+    // strip `_rsc` from the parsed query object and rebuild request.url from
+    // initURL, preserving it there even for RSC requests.
+    const routeHandlerRequest = isEdgeRouteHandler(route.routeHandler)
+      ? userlandRequest
+      : normalizedUserlandRequest;
     return options.dispatchMatchedRouteHandler({
       cleanPathname,
       middlewareContext,
@@ -770,7 +787,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       // object (always `{}` for non-dynamic) so `useParams()` etc. still see
       // an object shape; only the user-facing handler context surfaces null.
       params: route.isDynamic ? renderParams : null,
-      request,
+      request: routeHandlerRequest,
       route,
       searchParams: url.searchParams,
     });

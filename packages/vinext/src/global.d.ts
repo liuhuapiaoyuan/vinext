@@ -132,6 +132,15 @@ declare global {
     __VINEXT_RSC_ROOT__: Root | undefined;
 
     /**
+     * App Router browser bootstrap ownership marker.
+     * Shared on `window` because the same browser entry can be evaluated under
+     * distinct ESM URLs when deployment-id cache busting meets split chunks.
+     * Only the first module instance may consume the inlined RSC payload and
+     * hydrate the document.
+     */
+    __VINEXT_RSC_BOOTSTRAP_STATE__: "starting" | "hydrated" | undefined;
+
+    /**
      * A Promise that resolves when the current in-flight popstate RSC navigation
      * finishes rendering.
      * Set by the popstate handler in the browser RSC entry; read by

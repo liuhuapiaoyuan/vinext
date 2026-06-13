@@ -334,6 +334,10 @@ jobs:
             label: root-layout-redirect
             shardIndex: 1
             shardTotal: 1
+          - project: app-front-redirect-issue
+            label: app-front-redirect-issue
+            shardIndex: 1
+            shardTotal: 1
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:

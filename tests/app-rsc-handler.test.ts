@@ -22,11 +22,12 @@ type TestRoute = {
   page?: { default?: unknown } | null;
   pattern: string;
   rootParamNames?: readonly string[];
-  routeHandler?: { GET?: () => Response } | null;
+  routeHandler?: { GET?: () => Response; runtime?: string } | null;
   routeSegments: readonly string[];
 };
 
 type HandlerOptions = Parameters<typeof createAppRscHandler<TestRoute>>[0];
+type DispatchMatchedRouteHandler = HandlerOptions["dispatchMatchedRouteHandler"];
 
 function createPageRoute(overrides: Partial<TestRoute> = {}): TestRoute {
   return {
@@ -731,7 +732,9 @@ describe("createAppRscHandler", () => {
     expect(dispatchMatchedPage).toHaveBeenCalledTimes(1);
   });
 
-  it("hides internal RSC cache-busting params from external rewrite proxies", async () => {
+  it("forwards validated RSC cache-busting params to external rewrite proxies", async () => {
+    // Matches Next.js middleware-rsc-external-rewrite: the destination server
+    // needs `_rsc` because it cannot validate against the original request URL.
     // The fetch-cache instrumentation captures the real `fetch` at module load
     // and reinstalls a patched copy during request handling, so a global
     // `fetch` mock can't intercept the proxied request. Use a real loopback
@@ -769,11 +772,155 @@ describe("createAppRscHandler", () => {
       expect(response.status).toBe(200);
       expect(receivedUrls).toHaveLength(1);
       const forwardedUrl = new URL(`${upstreamBase}${receivedUrls[0]}`);
-      expect(forwardedUrl.searchParams.has(VINEXT_RSC_CACHE_BUSTING_SEARCH_PARAM)).toBe(false);
+      expect(forwardedUrl.searchParams.has(VINEXT_RSC_CACHE_BUSTING_SEARCH_PARAM)).toBe(true);
       expect(forwardedUrl.searchParams.get("tab")).toBe("latest");
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+  });
+
+  it("preserves Node route handler RSC URLs while hiding internal parsed params", async () => {
+    // Ported from Next.js:
+    // test/e2e/app-dir/front-redirect-issue/front-redirect-issue.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/front-redirect-issue/front-redirect-issue.test.ts
+    //
+    // The upstream fixture fallback-rewrites a front URL to an App route
+    // handler. Next strips `_rsc` from the parsed query in base-server.ts, but
+    // its Node request adapter rebuilds request.url from initURL and preserves
+    // the original search string.
+    const route = createPageRoute({
+      isDynamic: true,
+      page: null,
+      pattern: "/api/app-redirect/:path",
+      routeHandler: { GET: () => new Response("route") },
+      routeSegments: ["api", "app-redirect", "[path]"],
+    });
+    const dispatchMatchedRouteHandler = vi.fn<DispatchMatchedRouteHandler>(
+      async () => new Response("route", { status: 200 }),
+    );
+    const headers = createRscRequestHeaders({ mountedSlotsHeader: "slot:modal:/" });
+    const rscUrl = await createRscRequestUrl("/docs/vercel-user?tab=latest", headers);
+    const handler = createHandler({
+      configHeaders: [],
+      configRewrites: {
+        beforeFiles: [],
+        afterFiles: [],
+        fallback: [{ source: "/:path*", destination: "/api/app-redirect/:path*" }],
+      },
+      dispatchMatchedRouteHandler,
+      matchRoute: (pathname: string) =>
+        pathname === "/api/app-redirect/vercel-user"
+          ? {
+              params: { path: "vercel-user" },
+              route,
+            }
+          : null,
+    });
+
+    const response = await handler(new Request(`https://example.test${rscUrl}`, { headers }), null);
+
+    expect(response.status).toBe(200);
+    expect(dispatchMatchedRouteHandler).toHaveBeenCalledTimes(1);
+    const dispatched = dispatchMatchedRouteHandler.mock.calls[0]?.[0];
+    expect(dispatched).toEqual(
+      expect.objectContaining({
+        cleanPathname: "/api/app-redirect/vercel-user",
+        params: { path: "vercel-user" },
+        route,
+      }),
+    );
+    const dispatchedUrl = new URL(dispatched?.request.url ?? "");
+    expect(dispatchedUrl.pathname).toBe("/docs/vercel-user");
+    expect(dispatchedUrl.searchParams.has("_rsc")).toBe(true);
+    expect(dispatchedUrl.searchParams.get("tab")).toBe("latest");
+    expect(dispatched?.searchParams.has("_rsc")).toBe(false);
+  });
+
+  it("normalizes edge route handler RSC URLs and hides internal params", async () => {
+    // Next.js normalizes `.rsc` in web/adapter.ts before stripping internal
+    // search params from the Edge NextRequest.
+    const route = createPageRoute({
+      page: null,
+      pattern: "/api/inspect",
+      routeHandler: { GET: () => new Response("route"), runtime: "edge" },
+      routeSegments: ["api", "inspect"],
+    });
+    const dispatchMatchedRouteHandler = vi.fn<DispatchMatchedRouteHandler>(
+      async () => new Response("route", { status: 200 }),
+    );
+    const headers = createRscRequestHeaders({ mountedSlotsHeader: "slot:modal:/" });
+    const rscUrl = await createRscRequestUrl("/docs/api/inspect?tab=latest", headers);
+    const handler = createHandler({
+      configHeaders: [],
+      dispatchMatchedRouteHandler,
+      matchRoute: (pathname: string) =>
+        pathname === "/api/inspect" ? { params: {}, route } : null,
+    });
+
+    const response = await handler(new Request(`https://example.test${rscUrl}`, { headers }), null);
+
+    expect(response.status).toBe(200);
+    const dispatched = dispatchMatchedRouteHandler.mock.calls[0]?.[0];
+    const dispatchedUrl = new URL(dispatched?.request.url ?? "");
+    expect(dispatchedUrl.pathname).toBe("/docs/api/inspect");
+    expect(dispatchedUrl.search).toBe("?tab=latest");
+    expect(dispatched?.searchParams.toString()).toBe("tab=latest");
+  });
+
+  it("preserves non-RSC route handler request URLs while hiding internal parsed params", async () => {
+    const route = createPageRoute({
+      page: null,
+      pattern: "/api/inspect",
+      routeHandler: { GET: () => new Response("route") },
+      routeSegments: ["api", "inspect"],
+    });
+    const dispatchMatchedRouteHandler = vi.fn<DispatchMatchedRouteHandler>(
+      async () => new Response("route", { status: 200 }),
+    );
+    const handler = createHandler({
+      configHeaders: [],
+      dispatchMatchedRouteHandler,
+      matchRoute: (pathname: string) =>
+        pathname === "/api/inspect" ? { params: {}, route } : null,
+    });
+
+    const response = await handler(
+      new Request("https://example.test/docs/api/inspect?tab=latest&_rsc=user-value"),
+      null,
+    );
+
+    expect(response.status).toBe(200);
+    const dispatched = dispatchMatchedRouteHandler.mock.calls[0]?.[0];
+    expect(new URL(dispatched?.request.url ?? "").search).toBe("?tab=latest&_rsc=user-value");
+    expect(dispatched?.searchParams.toString()).toBe("tab=latest");
+  });
+
+  it("hides internal RSC params from non-RSC edge route handler request URLs", async () => {
+    const route = createPageRoute({
+      page: null,
+      pattern: "/api/inspect",
+      routeHandler: { GET: () => new Response("route"), runtime: "edge" },
+      routeSegments: ["api", "inspect"],
+    });
+    const dispatchMatchedRouteHandler = vi.fn<DispatchMatchedRouteHandler>(
+      async () => new Response("route", { status: 200 }),
+    );
+    const handler = createHandler({
+      configHeaders: [],
+      dispatchMatchedRouteHandler,
+      matchRoute: (pathname: string) =>
+        pathname === "/api/inspect" ? { params: {}, route } : null,
+    });
+
+    const response = await handler(
+      new Request("https://example.test/docs/api/inspect?tab=latest&_rsc=user-value"),
+      null,
+    );
+
+    expect(response.status).toBe(200);
+    const dispatched = dispatchMatchedRouteHandler.mock.calls[0]?.[0];
+    expect(new URL(dispatched?.request.url ?? "").search).toBe("?tab=latest");
+    expect(dispatched?.searchParams.toString()).toBe("tab=latest");
   });
 
   it("does not render RSC payloads at HTML URLs marked only by RSC headers", async () => {

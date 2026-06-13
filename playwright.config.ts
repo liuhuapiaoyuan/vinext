@@ -227,6 +227,18 @@ const projectServers = {
       timeout: 60_000,
     },
   },
+  "app-front-redirect-issue": {
+    testDir: "./tests/e2e/app-front-redirect-issue",
+    use: { baseURL: "http://localhost:4186" },
+    server: {
+      command:
+        "(test -e node_modules || test -L node_modules || ln -s ../../../fixtures/app-basic/node_modules node_modules) && npx vp run vinext#build && NEXT_DEPLOYMENT_ID=vinext-front-redirect-e2e node ../../../../packages/vinext/dist/cli.js build && NEXT_DEPLOYMENT_ID=vinext-front-redirect-e2e node ../../../../packages/vinext/dist/cli.js start --port 4186",
+      cwd: "./tests/e2e/app-front-redirect-issue/fixture",
+      port: 4186,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+  },
 };
 
 type ProjectName = keyof typeof projectServers;
