@@ -15,7 +15,6 @@ import {
   resolvePublicFileRoute,
   validateCsrfOrigin,
   validateServerActionPayload,
-  validateImageUrl,
   processMiddlewareHeaders,
   VINEXT_INTERNAL_HEADERS,
 } from "../packages/vinext/src/server/request-pipeline.js";
@@ -641,46 +640,6 @@ describe("validateServerActionPayload", () => {
     }
 
     await expect(validateServerActionPayload(body)).resolves.toBeNull();
-  });
-});
-
-// ── validateImageUrl ────────────────────────────────────────────────────
-
-describe("validateImageUrl", () => {
-  const requestUrl = "http://localhost:3000/page";
-
-  it("returns the normalized image URL for valid relative paths", () => {
-    expect(validateImageUrl("/images/photo.png", requestUrl)).toBe("/images/photo.png");
-  });
-
-  it("returns 400 for missing url parameter", () => {
-    const res = validateImageUrl(null, requestUrl);
-    expect(res).toBeInstanceOf(Response);
-    expect((res as Response).status).toBe(400);
-  });
-
-  it("returns 400 for empty string", () => {
-    const res = validateImageUrl("", requestUrl);
-    expect(res).toBeInstanceOf(Response);
-    expect((res as Response).status).toBe(400);
-  });
-
-  it("returns 400 for absolute URLs", () => {
-    const res = validateImageUrl("http://evil.com/image.png", requestUrl);
-    expect(res).toBeInstanceOf(Response);
-    expect((res as Response).status).toBe(400);
-  });
-
-  it("returns 400 for protocol-relative URLs", () => {
-    const res = validateImageUrl("//evil.com/image.png", requestUrl);
-    expect(res).toBeInstanceOf(Response);
-    expect((res as Response).status).toBe(400);
-  });
-
-  it("normalizes backslashes and blocks protocol-relative variants", () => {
-    const res = validateImageUrl("/\\evil.com/image.png", requestUrl);
-    expect(res).toBeInstanceOf(Response);
-    expect((res as Response).status).toBe(400);
   });
 });
 

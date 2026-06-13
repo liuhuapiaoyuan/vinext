@@ -669,6 +669,16 @@ describe("generateAppRouterWorkerEntry", () => {
     expect(content).toContain("handleImageOptimization");
   });
 
+  it("threads configured image widths and qualities into the App Router worker", () => {
+    const content = generateAppRouterWorkerEntry();
+    expect(content).toContain("process.env.__VINEXT_IMAGE_DEVICE_SIZES");
+    expect(content).toContain("process.env.__VINEXT_IMAGE_SIZES");
+    expect(content).toContain("process.env.__VINEXT_IMAGE_QUALITIES");
+    expect(content).toContain("JSON.stringify(DEFAULT_DEVICE_SIZES)");
+    expect(content).toContain("JSON.stringify(DEFAULT_IMAGE_SIZES)");
+    expect(content).toContain("}, allowedWidths, imageConfig)");
+  });
+
   it("declares Env interface with IMAGES binding", () => {
     const content = generateAppRouterWorkerEntry();
     expect(content).toContain("interface Env");
@@ -1258,6 +1268,14 @@ describe("generatePagesRouterWorkerEntry", () => {
     expect(basePathPos).toBeGreaterThan(-1);
     expect(imagePos).toBeGreaterThan(-1);
     expect(basePathPos).toBeLessThan(imagePos);
+  });
+
+  it("threads configured image widths and qualities into optimization validation", () => {
+    const content = generatePagesRouterWorkerEntry();
+    expect(content).toContain("vinextConfig?.images?.deviceSizes ?? DEFAULT_DEVICE_SIZES");
+    expect(content).toContain("vinextConfig?.images?.imageSizes ?? DEFAULT_IMAGE_SIZES");
+    expect(content).toContain("qualities: vinextConfig.images.qualities");
+    expect(content).toContain("}, allowedWidths, imageConfig)");
   });
 
   it("uses segment-boundary check before skipping redirect destination prefixing", () => {

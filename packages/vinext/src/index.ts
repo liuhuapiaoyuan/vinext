@@ -25,7 +25,13 @@ import {
 } from "./routing/file-matcher.js";
 import { createSSRHandler } from "./server/dev-server.js";
 import { handleApiRoute } from "./server/api-handler.js";
-import { isImageOptimizationPath } from "./server/image-optimization.js";
+import {
+  DEFAULT_DEVICE_SIZES,
+  DEFAULT_IMAGE_QUALITIES,
+  DEFAULT_IMAGE_SIZES,
+  isImageOptimizationPath,
+  resolveDevImageRedirect,
+} from "./server/image-optimization.js";
 
 import { installSocketErrorBackstop } from "./server/socket-error-backstop.js";
 import { shouldInvalidateAppRouteFile } from "./server/dev-route-files.js";
@@ -1363,6 +1369,9 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             JSON.stringify(deviceSizes),
           );
           defines["process.env.__VINEXT_IMAGE_SIZES"] = JSON.stringify(JSON.stringify(imageSizes));
+          defines["process.env.__VINEXT_IMAGE_QUALITIES"] = JSON.stringify(
+            JSON.stringify(nextConfig.images?.qualities ?? DEFAULT_IMAGE_QUALITIES),
+          );
         }
         // Expose dangerouslyAllowSVG flag for the image shim's auto-skip logic.
         // When false (default), .svg sources bypass the optimization endpoint.
@@ -2645,6 +2654,11 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               cacheMaxMemorySize: nextConfig?.cacheMaxMemorySize,
               inlineCss: nextConfig?.inlineCss,
               i18n: nextConfig?.i18n,
+              imageConfig: {
+                deviceSizes: nextConfig?.images?.deviceSizes,
+                imageSizes: nextConfig?.images?.imageSizes,
+                qualities: nextConfig?.images?.qualities,
+              },
               hasPagesDir,
               publicFiles: scanPublicFileRoutes(root),
               globalNotFoundPath,
@@ -3361,35 +3375,21 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               // ── Image optimization passthrough (dev mode) ─────────────
               // In dev, redirect to the original asset URL so Vite serves it.
               if (isImageOptimizationPath(url.split("?")[0]!)) {
-                const imgParams = new URLSearchParams(url.split("?")[1] ?? "");
-                const rawImgUrl = imgParams.get("url");
-                // Normalize backslashes: browsers and the URL constructor treat
-                // /\evil.com as //evil.com, bypassing the // check.
-                const imgUrl = rawImgUrl?.replaceAll("\\", "/") ?? null;
-                // Allowlist: must start with "/" but not "//" — blocks absolute
-                // URLs, protocol-relative, backslash variants, and exotic schemes.
-                // Also block internal Vite paths (/@*, /__vite*, /node_modules*)
-                // to prevent redirecting to dev server endpoints.
-                if (
-                  !imgUrl ||
-                  !imgUrl.startsWith("/") ||
-                  imgUrl.startsWith("//") ||
-                  imgUrl.startsWith("/@") ||
-                  imgUrl.startsWith("/__vite") ||
-                  imgUrl.startsWith("/node_modules")
-                ) {
+                const imageRequestUrl = new URL(url, `http://${req.headers.host || "localhost"}`);
+                const allowedWidths = [
+                  ...(nextConfig.images?.deviceSizes ?? DEFAULT_DEVICE_SIZES),
+                  ...(nextConfig.images?.imageSizes ?? DEFAULT_IMAGE_SIZES),
+                ];
+                const encodedLocation = resolveDevImageRedirect(
+                  imageRequestUrl,
+                  allowedWidths,
+                  nextConfig.images?.qualities ?? DEFAULT_IMAGE_QUALITIES,
+                );
+                if (!encodedLocation) {
                   res.writeHead(400);
-                  res.end(!rawImgUrl ? "Missing url parameter" : "Only relative URLs allowed");
+                  res.end("Invalid image optimization parameters");
                   return;
                 }
-                // Validate the constructed URL's origin hasn't changed (defense in depth).
-                const resolvedImg = new URL(imgUrl, `http://${req.headers.host || "localhost"}`);
-                if (resolvedImg.origin !== `http://${req.headers.host || "localhost"}`) {
-                  res.writeHead(400);
-                  res.end("Only relative URLs allowed");
-                  return;
-                }
-                const encodedLocation = resolvedImg.pathname + resolvedImg.search;
                 res.writeHead(302, { Location: encodedLocation });
                 res.end();
                 return;
@@ -4397,6 +4397,9 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           if (!outDir) return;
 
           const imageConfig = {
+            deviceSizes: nextConfig?.images?.deviceSizes,
+            imageSizes: nextConfig?.images?.imageSizes,
+            qualities: nextConfig?.images?.qualities,
             dangerouslyAllowSVG: nextConfig?.images?.dangerouslyAllowSVG,
             contentDispositionType: nextConfig?.images?.contentDispositionType,
             contentSecurityPolicy: nextConfig?.images?.contentSecurityPolicy,
