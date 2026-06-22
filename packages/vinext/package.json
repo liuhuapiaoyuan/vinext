@@ -1,5 +1,5 @@
 {
-  "name": "vinext",
+  "name": "@qzsy/vinext",
   "version": "0.1.7",
   "description": "Run Next.js apps on Vite. Drop-in replacement for the next CLI.",
   "license": "MIT",
@@ -85,6 +85,9 @@
       "types": "./dist/utils/query.d.ts",
       "import": "./dist/utils/query.js"
     }
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "build": "vp pack",

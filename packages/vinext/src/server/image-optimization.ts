@@ -82,6 +82,24 @@ export type ParseImageParamsOptions = {
   isDev?: boolean;
 };
 
+/**
+ * Pick the allowed width numerically closest to the requested value.
+ * On a tie, prefer the larger width so the served image is not undersized.
+ */
+export function snapToNearestAllowedWidth(requestedWidth: number, allowedWidths: number[]): number {
+  if (allowedWidths.length === 0) return requestedWidth;
+  let closest = allowedWidths[0]!;
+  let minDiff = Math.abs(requestedWidth - closest);
+  for (const candidate of allowedWidths) {
+    const diff = Math.abs(requestedWidth - candidate);
+    if (diff < minDiff || (diff === minDiff && candidate > closest)) {
+      minDiff = diff;
+      closest = candidate;
+    }
+  }
+  return closest;
+}
+
 export function resolveDevImageRedirect(
   requestUrl: URL,
   allowedWidths: number[] = [...DEFAULT_DEVICE_SIZES, ...DEFAULT_IMAGE_SIZES],
@@ -139,7 +157,11 @@ export function parseImageParams(
 
   const isDevBlurWidth = options.isDev && width <= DEV_BLUR_MAX_WIDTH;
   const isDevBlurQuality = options.isDev && quality === DEV_BLUR_QUALITY;
-  if (width <= 0 || (!allowedWidths.includes(width) && !isDevBlurWidth)) return null;
+  if (width <= 0) return null;
+  const resolvedWidth =
+    isDevBlurWidth || allowedWidths.includes(width)
+      ? width
+      : snapToNearestAllowedWidth(width, allowedWidths);
   if (quality < 1 || quality > 100) return null;
   // Only enforce the quality allowlist when `images.qualities` is configured.
   // Matches Next.js: an unset `qualities` permits any quality from 1-100.
@@ -169,7 +191,7 @@ export function parseImageParams(
     return null;
   }
 
-  return { imageUrl: normalizedUrl, width, quality };
+  return { imageUrl: normalizedUrl, width: resolvedWidth, quality };
 }
 
 /**

@@ -198,6 +198,13 @@ export type NextConfig = {
     }>;
     domains?: string[];
     unoptimized?: boolean;
+    /** Image loader implementation. Defaults to "default". */
+    loader?: "default" | "custom" | "imgix" | "cloudinary" | "akamai";
+    /**
+     * Path to a custom image loader module, relative to the project root.
+     * Requires `loader` to be `"custom"` (or `"default"`).
+     */
+    loaderFile?: string;
     /** Allowed device widths for image optimization. Defaults to Next.js defaults: [640, 750, 828, 1080, 1200, 1920, 2048, 3840] */
     deviceSizes?: number[];
     /** Allowed image sizes for fixed-width images. Defaults to Next.js defaults: [16, 32, 48, 64, 96, 128, 256, 384] */
@@ -1114,6 +1121,35 @@ function resolveCacheHandlerPathToFilesystem(filePath: string): string {
   return filePath;
 }
 
+/**
+ * Validate and resolve `images.loaderFile`, mirroring Next.js config normalization.
+ * @see https://github.com/vercel/next.js/blob/canary/packages/next/src/server/config.ts
+ */
+function resolveImagesConfig(images: NextConfig["images"], root: string): NextConfig["images"] {
+  if (!images) return undefined;
+
+  const resolved = { ...images };
+
+  if (!resolved.loader) {
+    resolved.loader = "default";
+  }
+
+  if (resolved.loaderFile) {
+    if (resolved.loader !== "default" && resolved.loader !== "custom") {
+      throw new Error(
+        `Specified images.loader property (${resolved.loader}) cannot be used with images.loaderFile property. Please set images.loader to "custom".`,
+      );
+    }
+    const absolutePath = path.resolve(root, resolved.loaderFile);
+    if (!fs.existsSync(absolutePath)) {
+      throw new Error(`Specified images.loaderFile does not exist at "${absolutePath}".`);
+    }
+    resolved.loaderFile = absolutePath;
+  }
+
+  return resolved;
+}
+
 function resolveHtmlLimitedBots(value: NextConfig["htmlLimitedBots"]): string | undefined {
   const source =
     value instanceof RegExp ? value.source : typeof value === "string" ? value : undefined;
@@ -1605,7 +1641,7 @@ export async function resolveNextConfig(
     redirects,
     rewrites,
     headers,
-    images: config.images,
+    images: resolveImagesConfig(config.images, root),
     i18n,
     mdx,
     aliases,

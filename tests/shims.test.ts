@@ -18962,18 +18962,30 @@ describe("image optimization request parsing", () => {
     expect(result!.imageUrl).toBe("/images/hero.webp");
   });
 
-  it("parseImageParams rejects width exceeding absolute maximum (3840)", async () => {
+  it("parseImageParams snaps oversized widths to the nearest allowed size", async () => {
     const { parseImageParams } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    expect(
-      parseImageParams(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=3841&q=75")),
-    ).toBeNull();
+    const params = parseImageParams(
+      new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=3841&q=75"),
+    );
+    expect(params).not.toBeNull();
+    expect(params!.width).toBe(3840);
     expect(
       parseImageParams(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=999999999&q=75")),
-    ).toBeNull();
-    expect(
-      parseImageParams(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=2147483647&q=75")),
-    ).toBeNull();
+    ).toMatchObject({ width: 3840 });
+  });
+
+  it("parseImageParams snaps intrinsic widths to the nearest allowed size", async () => {
+    const { parseImageParams } =
+      await import("../packages/vinext/src/server/image-optimization.js");
+    const params = parseImageParams(
+      new URL(
+        "http://localhost/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fdata.e9801a51.png&w=1280&q=75",
+      ),
+    );
+    expect(params).not.toBeNull();
+    expect(params!.width).toBe(1200);
+    expect(params!.imageUrl).toBe("/_next/static/media/data.e9801a51.png");
   });
 
   it("parseImageParams accepts width at the absolute maximum (3840)", async () => {
@@ -18986,24 +18998,24 @@ describe("image optimization request parsing", () => {
     expect(params!.width).toBe(3840);
   });
 
-  it("parseImageParams validates against allowedWidths when provided", async () => {
+  it("parseImageParams snaps to allowedWidths when provided", async () => {
     const { parseImageParams } =
       await import("../packages/vinext/src/server/image-optimization.js");
     const allowedWidths = [640, 750, 828, 1080, 1200, 1920, 2048, 3840];
-    // Allowed width passes
+    // Allowed width passes unchanged
     const params = parseImageParams(
       new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=1080&q=75"),
       allowedWidths,
     );
     expect(params).not.toBeNull();
     expect(params!.width).toBe(1080);
-    // Non-allowed width is rejected
+    // Non-allowed width snaps to the nearest configured size
     expect(
       parseImageParams(
         new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=999&q=75"),
         allowedWidths,
       ),
-    ).toBeNull();
+    ).toMatchObject({ width: 1080 });
     expect(
       parseImageParams(
         new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=0&q=75"),

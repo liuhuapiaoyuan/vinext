@@ -2472,6 +2472,86 @@ describe("resolveNextConfig cacheHandler", () => {
   });
 });
 
+describe("resolveNextConfig images.loaderFile", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = makeTempDir();
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("resolves loaderFile to an absolute path when the file exists", async () => {
+    const loaderPath = path.join(tmpDir, "my-loader.js");
+    fs.writeFileSync(loaderPath, "export default function loader() {}\n");
+
+    const resolved = await resolveNextConfig(
+      {
+        images: {
+          loader: "custom",
+          loaderFile: "./my-loader.js",
+        },
+      },
+      tmpDir,
+    );
+
+    expect(resolved.images?.loaderFile).toBe(loaderPath);
+    expect(resolved.images?.loader).toBe("custom");
+  });
+
+  it("allows loaderFile with the default loader", async () => {
+    const loaderPath = path.join(tmpDir, "my-loader.js");
+    fs.writeFileSync(loaderPath, "export default function loader() {}\n");
+
+    const resolved = await resolveNextConfig(
+      {
+        images: {
+          loaderFile: "./my-loader.js",
+        },
+      },
+      tmpDir,
+    );
+
+    expect(resolved.images?.loaderFile).toBe(loaderPath);
+    expect(resolved.images?.loader).toBe("default");
+  });
+
+  it("throws when loaderFile does not exist", async () => {
+    await expect(
+      resolveNextConfig(
+        {
+          images: {
+            loader: "custom",
+            loaderFile: "./missing-loader.js",
+          },
+        },
+        tmpDir,
+      ),
+    ).rejects.toThrow("Specified images.loaderFile does not exist at");
+  });
+
+  it("throws when loader is incompatible with loaderFile", async () => {
+    const loaderPath = path.join(tmpDir, "my-loader.js");
+    fs.writeFileSync(loaderPath, "export default function loader() {}\n");
+
+    await expect(
+      resolveNextConfig(
+        {
+          images: {
+            loader: "imgix",
+            loaderFile: "./my-loader.js",
+          },
+        },
+        tmpDir,
+      ),
+    ).rejects.toThrow(
+      'Specified images.loader property (imgix) cannot be used with images.loaderFile property. Please set images.loader to "custom".',
+    );
+  });
+});
+
 describe("resolveNextConfig enablePrerenderSourceMaps", () => {
   it("defaults enablePrerenderSourceMaps to true when not configured", async () => {
     const resolved = await resolveNextConfig({});
