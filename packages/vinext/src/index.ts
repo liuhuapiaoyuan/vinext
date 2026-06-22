@@ -608,6 +608,33 @@ const _appRscHandlerPath = resolveShimModulePath(
 // do not execute a stale dist build. Published packages resolve to emitted JS,
 // which Node can load natively outside the RSC transform graph.
 const _canExternalizeAppRscHandler = _appRscHandlerPath.endsWith(".js");
+const _defaultImageLoaderShimPath = resolveShimModulePath(_shimsDir, "default-image-loader");
+/** Absolute path to `images.loaderFile` when configured; set in vinext:config. */
+let _imageLoaderFile: string | undefined;
+
+function isImageShimModule(importer: string | undefined): boolean {
+  if (!importer) return false;
+  const normalized = normalizePathSeparators(importer.split("?")[0]);
+  return /\/shims\/image\.(tsx?|jsx?)$/.test(normalized);
+}
+
+function isDefaultImageLoaderRequest(id: string, importer?: string): boolean {
+  const cleanId = id.startsWith(VIRTUAL_PREFIX) ? id.slice(1) : id;
+  const normalizedId = normalizePathSeparators(cleanId.split("?")[0]);
+  const shimPath = normalizePathSeparators(_defaultImageLoaderShimPath);
+  if (normalizedId === shimPath) return true;
+  if (/\/shims\/default-image-loader\.(tsx?|jsx?)$/.test(normalizedId)) return true;
+  if (
+    isImageShimModule(importer) &&
+    (cleanId === "./default-image-loader.js" ||
+      cleanId === "./default-image-loader" ||
+      cleanId === "./default-image-loader.ts" ||
+      cleanId === "./default-image-loader.tsx")
+  ) {
+    return true;
+  }
+  return false;
+}
 
 function isValidExportIdentifier(name: string): boolean {
   return /^[$A-Z_a-z][$\w]*$/.test(name);
@@ -1259,6 +1286,19 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
     // `css-modules-data-urls` fixture. See plugins/css-data-url.ts.
     dataUrlCssPlugin(),
     {
+      name: "vinext:image-loader-file",
+      enforce: "pre",
+
+      resolveId: {
+        filter: { id: /default-image-loader/ },
+        handler(id, importer) {
+          if (_imageLoaderFile && isDefaultImageLoaderRequest(id, importer)) {
+            return _imageLoaderFile;
+          }
+        },
+      },
+    },
+    {
       name: "vinext:config",
       enforce: "pre",
 
@@ -1865,10 +1905,8 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             ? {}
             : { modules: { Loader: sassComposesLoader.Loader } as CSSModulesOptions };
 
-        const defaultImageLoaderShimPath = resolveShimModulePath(shimsDir, "default-image-loader");
         const imageLoaderFile = nextConfig.images?.loaderFile;
-        const imageLoaderAlias: Record<string, string> =
-          imageLoaderFile != null ? { [defaultImageLoaderShimPath]: imageLoaderFile } : {};
+        _imageLoaderFile = imageLoaderFile;
 
         const viteConfig: UserConfig = {
           // Disable Vite's default HTML serving - we handle all routing
@@ -2083,7 +2121,6 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               ...tsconfigPathAliases,
               ...nextConfig.aliases,
               ...nextShimMap,
-              ...imageLoaderAlias,
             },
             // Dedupe React packages to prevent dual-instance errors.
             // When vinext is linked (npm link / bun link) or any dependency
@@ -2269,13 +2306,13 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         // these aliases injected separately. See #834.
         const depOptimizeAliasPlugin = {
           name: "vinext:dep-optimize-alias",
-          resolveId(id: string) {
+          resolveId(id: string, importer?: string) {
             const shimBase = _reactServerShims.get(id);
             if (shimBase !== undefined) {
               return resolveShimModulePath(shimsDir, shimBase);
             }
-            if (imageLoaderFile != null && id === defaultImageLoaderShimPath) {
-              return imageLoaderFile;
+            if (_imageLoaderFile && isDefaultImageLoaderRequest(id, importer)) {
+              return _imageLoaderFile;
             }
           },
         };

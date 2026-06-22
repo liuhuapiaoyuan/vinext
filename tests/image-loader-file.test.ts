@@ -23,17 +23,14 @@ async function collectPlugins(plugins: PluginOption[]): Promise<Plugin[]> {
   return collected;
 }
 
-async function findConfigPlugin(plugins: ReturnType<typeof vinext>) {
+async function findImageLoaderPlugin(plugins: ReturnType<typeof vinext>) {
   const collected = await collectPlugins(plugins);
-  const plugin = collected.find((p) => p.name === "vinext:config");
-  if (!plugin || !("config" in plugin)) {
-    throw new Error("vinext:config plugin not found");
+  const plugin = collected.find((p) => p.name === "vinext:image-loader-file");
+  if (!plugin?.resolveId || typeof plugin.resolveId === "function") {
+    throw new Error("vinext:image-loader-file resolveId hook not found");
   }
-  return plugin as {
-    config?: (
-      config: { root: string },
-      env: { command: "serve"; mode: string },
-    ) => Promise<{ resolve?: { alias?: Record<string, string> } }>;
+  return plugin.resolveId as {
+    handler: (id: string, importer?: string) => string | undefined;
   };
 }
 
@@ -57,9 +54,12 @@ describe("images.loaderFile runtime wiring", () => {
     );
   });
 
-  it("vinext:config aliases default-image-loader to loaderFile", async () => {
+  it("resolveId redirects default-image-loader imports from next/image shim", async () => {
     const loaderPath = path.join(tmpDir, "my-loader.js");
-    fs.writeFileSync(loaderPath, "export default function myLoader() { return ''; }\n");
+    fs.writeFileSync(
+      loaderPath,
+      "export default function myLoader({ src, width }) { return `https://cdn.example/${src}?w=${width}`; }\n",
+    );
     fs.mkdirSync(path.join(tmpDir, "pages"), { recursive: true });
     fs.writeFileSync(
       path.join(tmpDir, "pages", "index.tsx"),
@@ -75,15 +75,22 @@ describe("images.loaderFile runtime wiring", () => {
         },
       },
     });
-    const configPlugin = await findConfigPlugin(plugins);
-    const resolved = await configPlugin.config?.(
-      { root: tmpDir },
-      { command: "serve", mode: "development" },
-    );
 
-    const alias = resolved?.resolve?.alias as Record<string, string> | undefined;
-    const loaderAlias = Object.entries(alias ?? {}).find(([, value]) => value === loaderPath);
-    expect(loaderAlias?.[0].replace(/\\/g, "/")).toContain("default-image-loader");
+    // Prime _imageLoaderFile by running vinext:config once.
+    const configPlugin = (await collectPlugins(plugins)).find((p) => p.name === "vinext:config");
+    const configHook = configPlugin?.config;
+    const runConfig = (typeof configHook === "function" ? configHook : configHook?.handler) as
+      | ((config: { root: string }, env: { command: string; mode: string }) => Promise<unknown>)
+      | undefined;
+    await runConfig?.({ root: tmpDir }, { command: "serve", mode: "development" });
+
+    const resolveId = await findImageLoaderPlugin(plugins);
+    const imageShimPath = path
+      .resolve(import.meta.dirname, "../packages/vinext/src/shims/image.tsx")
+      .replace(/\\/g, "/");
+
+    expect(resolveId.handler("./default-image-loader.js", imageShimPath)).toBe(loaderPath);
+    expect(resolveId.handler(loaderPath.replace(/\\/g, "/"), imageShimPath)).toBeUndefined();
   });
 
   it("getImageProps uses images.loaderFile when configured", async () => {
