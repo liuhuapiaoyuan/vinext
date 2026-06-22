@@ -15,8 +15,12 @@
 import React, { forwardRef, useEffect, useLayoutEffect, useRef, useState } from "react";
 import * as ReactDOM from "react-dom";
 import { Image as UnpicImage } from "@unpic/react";
+import configDefaultLoader from "./default-image-loader.js";
 import { hasRemoteMatch, isPrivateIp, type RemotePattern } from "./image-config.js";
+import { imageOptimizationUrl } from "./image-optimization-url.js";
 import { useMergedRef } from "./use-merged-ref.js";
+
+type ImageLoader = (params: { src: string; width: number; quality?: number }) => string;
 
 export type StaticImageData = {
   src: string;
@@ -68,6 +72,19 @@ const __dangerouslyAllowSVG = process.env.__VINEXT_IMAGE_DANGEROUSLY_ALLOW_SVG =
  * are blocked to mitigate SSRF risk.
  */
 const __dangerouslyAllowLocalIP = process.env.__VINEXT_IMAGE_DANGEROUSLY_ALLOW_LOCAL_IP === "true";
+/** Set when next.config.js configures images.loaderFile. */
+const __imageLoaderConfigured = process.env.__VINEXT_IMAGE_LOADER_CONFIGURED === "true";
+
+function resolveEffectiveLoader(loader: ImageLoader | undefined): ImageLoader | undefined {
+  if (loader) return loader;
+  if (!__imageLoaderConfigured) return undefined;
+  if (typeof configDefaultLoader !== "function") {
+    throw new Error(
+      "images.loaderFile detected but the file is missing default export.\nRead more: https://nextjs.org/docs/messages/invalid-images-config",
+    );
+  }
+  return configDefaultLoader;
+}
 
 /**
  * Validate that a remote URL is allowed by the configured remote patterns.
@@ -271,16 +288,7 @@ function resolveImageSource(v: {
  */
 const RESPONSIVE_WIDTHS = __imageDeviceSizes;
 
-/**
- * Build a `/_next/image` optimization URL.
- *
- * In production (Cloudflare Workers), the worker intercepts this path and uses
- * the Images binding to resize/transcode on the fly. In dev, the Vite dev
- * server handles it as a passthrough (serves the original file).
- */
-export function imageOptimizationUrl(src: string, width: number, quality: number = 75): string {
-  return `/_next/image?url=${encodeURIComponent(src)}&w=${width}&q=${quality}`;
-}
+export { imageOptimizationUrl };
 
 function preloadImageResource(input: {
   shouldPreload: boolean;
@@ -389,6 +397,7 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
   const shouldPreload = preload === true || priority === true;
   const priorityFetchPriority = priority ? "high" : undefined;
   const imageLoading = priority ? "eager" : shouldPreload ? loading : (loading ?? "lazy");
+  const effectiveLoader = resolveEffectiveLoader(loader);
 
   const [completedBlurSrc, setCompletedBlurSrc] = useState<string | undefined>(undefined);
   const blurComplete = completedBlurSrc === src;
@@ -515,9 +524,9 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
     );
   }
 
-  // If a custom loader is provided, use basic img with loader URL
-  if (loader) {
-    const resolvedSrc = loader({ src, width: imgWidth ?? 0, quality: quality ?? 75 });
+  // If a custom loader is provided (prop or images.loaderFile), use basic img with loader URL
+  if (effectiveLoader) {
+    const resolvedSrc = effectiveLoader({ src, width: imgWidth ?? 0, quality: quality ?? 75 });
     preloadImageResource({
       shouldPreload,
       src: resolvedSrc,
@@ -749,6 +758,7 @@ export function getImageProps(props: ImageProps): {
     blurDataURL: imgBlurDataURL,
   } = resolveImageSource({ src: srcProp, width, height, blurDataURL: blurDataURLProp });
   const shouldPreload = _preload === true || priority === true;
+  const effectiveLoader = resolveEffectiveLoader(loader);
 
   if (_unoptimized === true) {
     // As in the component path, unoptimized images never reach the server-side
@@ -799,8 +809,8 @@ export function getImageProps(props: ImageProps): {
   const imgQuality = _quality ?? 75;
   const resolvedSrc = blockedInProd
     ? ""
-    : loader
-      ? loader({ src, width: imgWidth ?? 0, quality: imgQuality })
+    : effectiveLoader
+      ? effectiveLoader({ src, width: imgWidth ?? 0, quality: imgQuality })
       : src;
 
   // For local images (no loader, not remote), route through optimization endpoint.
@@ -808,7 +818,10 @@ export function getImageProps(props: ImageProps): {
   // SVG sources auto-skip unless dangerouslyAllowSVG is enabled.
   const isSvg = isSvgUrl(resolvedSrc);
   const skipOpt =
-    (isSvg && !__dangerouslyAllowSVG) || blockedInProd || !!loader || isRemoteUrl(resolvedSrc);
+    (isSvg && !__dangerouslyAllowSVG) ||
+    blockedInProd ||
+    !!effectiveLoader ||
+    isRemoteUrl(resolvedSrc);
   const optimizedSrc = skipOpt
     ? resolvedSrc
     : imgWidth
@@ -817,7 +830,7 @@ export function getImageProps(props: ImageProps): {
 
   // Build srcSet for local images — each width points to /_next/image
   const srcSet =
-    imgWidth && !fill && !isRemoteUrl(resolvedSrc) && !loader && !skipOpt
+    imgWidth && !fill && !isRemoteUrl(resolvedSrc) && !effectiveLoader && !skipOpt
       ? generateSrcSet(resolvedSrc, imgWidth, imgQuality)
       : undefined;
 

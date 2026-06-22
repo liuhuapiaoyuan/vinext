@@ -434,6 +434,11 @@ declare global {
       __VINEXT_PREFETCH_INLINING?: string;
 
       /**
+       * `"true"` when `next.config.js` configures `images.loaderFile`.
+       */
+      __VINEXT_IMAGE_LOADER_CONFIGURED?: string;
+
+      /**
        * JSON-encoded array of `RemotePattern` objects from
        * `next.config.js` → `images.remotePatterns`.
        */

@@ -1514,6 +1514,9 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         defines["process.env.__VINEXT_IMAGE_DANGEROUSLY_ALLOW_LOCAL_IP"] = JSON.stringify(
           String(nextConfig.images?.dangerouslyAllowLocalIP ?? false),
         );
+        defines["process.env.__VINEXT_IMAGE_LOADER_CONFIGURED"] = JSON.stringify(
+          nextConfig.images?.loaderFile ? "true" : "false",
+        );
         // Build ID — resolved from next.config generateBuildId() or random UUID.
         // Exposed so server entries and the next/server shim can inject it.
         // Also used to namespace ISR cache keys so old cached entries from a
@@ -1862,6 +1865,11 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             ? {}
             : { modules: { Loader: sassComposesLoader.Loader } as CSSModulesOptions };
 
+        const defaultImageLoaderShimPath = resolveShimModulePath(shimsDir, "default-image-loader");
+        const imageLoaderFile = nextConfig.images?.loaderFile;
+        const imageLoaderAlias: Record<string, string> =
+          imageLoaderFile != null ? { [defaultImageLoaderShimPath]: imageLoaderFile } : {};
+
         const viteConfig: UserConfig = {
           // Disable Vite's default HTML serving - we handle all routing
           appType: "custom",
@@ -2075,6 +2083,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               ...tsconfigPathAliases,
               ...nextConfig.aliases,
               ...nextShimMap,
+              ...imageLoaderAlias,
             },
             // Dedupe React packages to prevent dual-instance errors.
             // When vinext is linked (npm link / bun link) or any dependency
@@ -2264,6 +2273,9 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             const shimBase = _reactServerShims.get(id);
             if (shimBase !== undefined) {
               return resolveShimModulePath(shimsDir, shimBase);
+            }
+            if (imageLoaderFile != null && id === defaultImageLoaderShimPath) {
+              return imageLoaderFile;
             }
           },
         };
