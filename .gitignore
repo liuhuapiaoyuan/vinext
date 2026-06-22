@@ -15,6 +15,7 @@ out-e2e
 .env
 .env.*
 !.env.example
+.npmrc
 # wrangler convention for local-only secrets passed to `wrangler dev`
 .dev.vars
 .dev.vars.*
