@@ -123,6 +123,167 @@ describe("App RSC route matching", () => {
     });
   });
 
+  it("prefers static interception targets over dynamic targets", () => {
+    // Ported from Next.js:
+    // test/e2e/app-dir/interception-dynamic-segment/interception-dynamic-segment.test.ts
+    // https://github.com/vercel/next.js/blob/ee6e79b1792a4d401ddf2480f40a83549fe8e722/test/e2e/app-dir/interception-dynamic-segment/interception-dynamic-segment.test.ts
+    const matcher = createAppRscRouteMatcher([
+      route("/", [], {
+        modal: {
+          intercepts: [
+            {
+              sourceMatchPattern: "/",
+              targetPattern: "/:username/:id",
+              interceptLayouts: [],
+              page: "dynamic-page",
+              params: ["username", "id"],
+            },
+            {
+              sourceMatchPattern: "/",
+              targetPattern: "/explicit-layout/deeper",
+              interceptLayouts: ["explicit-layout"],
+              page: "static-page",
+              params: [],
+            },
+          ],
+        },
+      }),
+    ]);
+
+    expect(matcher.findIntercept("/explicit-layout/deeper", "/")).toMatchObject({
+      targetPattern: "/explicit-layout/deeper",
+      interceptLayouts: ["explicit-layout"],
+      page: "static-page",
+      matchedParams: {},
+    });
+  });
+
+  it("orders overlapping interception targets segment by segment", () => {
+    const matcher = createAppRscRouteMatcher([
+      route("/", [], {
+        modal: {
+          intercepts: [
+            {
+              targetPattern: "/:name/static",
+              interceptLayouts: [],
+              page: "dynamic-prefix",
+              params: ["name"],
+            },
+            {
+              targetPattern: "/foo/:id",
+              interceptLayouts: [],
+              page: "static-prefix",
+              params: ["id"],
+            },
+            {
+              targetPattern: "/files/:slug*",
+              interceptLayouts: [],
+              page: "optional-catch-all",
+              params: ["slug"],
+            },
+            {
+              targetPattern: "/files/:slug+",
+              interceptLayouts: [],
+              page: "catch-all",
+              params: ["slug"],
+            },
+            {
+              targetPattern: "/files/:id",
+              interceptLayouts: [],
+              page: "dynamic",
+              params: ["id"],
+            },
+          ],
+        },
+      }),
+    ]);
+
+    expect(matcher.findIntercept("/foo/static", "/")).toMatchObject({
+      targetPattern: "/foo/:id",
+      page: "static-prefix",
+      matchedParams: { id: "static" },
+    });
+    expect(matcher.findIntercept("/files/one", "/")).toMatchObject({
+      targetPattern: "/files/:id",
+      page: "dynamic",
+      matchedParams: { id: "one" },
+    });
+    expect(matcher.findIntercept("/files/one/two", "/")).toMatchObject({
+      targetPattern: "/files/:slug+",
+      page: "catch-all",
+      matchedParams: { slug: ["one", "two"] },
+    });
+    expect(matcher.findIntercept("/files", "/")).toMatchObject({
+      targetPattern: "/files/:slug*",
+      page: "optional-catch-all",
+      matchedParams: {},
+    });
+  });
+
+  it("orders equally specific dynamic interception segments lexicographically", () => {
+    // Mirrors Next.js compareRouteSegments, including dynamic parameter names:
+    // packages/next/src/shared/lib/router/utils/sortable-routes.ts
+    const matcher = createAppRscRouteMatcher([
+      route("/", [], {
+        modal: {
+          intercepts: [
+            {
+              targetPattern: "/:name/foo",
+              interceptLayouts: [],
+              page: "name-page",
+              params: ["name"],
+            },
+            {
+              targetPattern: "/:id/foo",
+              interceptLayouts: [],
+              page: "id-page",
+              params: ["id"],
+            },
+          ],
+        },
+      }),
+    ]);
+
+    expect(matcher.findIntercept("/value/foo", "/")).toMatchObject({
+      targetPattern: "/:id/foo",
+      page: "id-page",
+      matchedParams: { id: "value" },
+    });
+  });
+
+  it("preserves declaration order for identical interception targets", () => {
+    const matcher = createAppRscRouteMatcher([
+      route("/", [], {
+        first: {
+          intercepts: [
+            {
+              targetPattern: "/photos/:id",
+              interceptLayouts: [],
+              page: "first-page",
+              params: ["id"],
+            },
+          ],
+        },
+        second: {
+          intercepts: [
+            {
+              targetPattern: "/photos/:id",
+              interceptLayouts: [],
+              page: "second-page",
+              params: ["id"],
+            },
+          ],
+        },
+      }),
+    ]);
+
+    expect(matcher.findIntercept("/photos/42", "/")).toMatchObject({
+      slotKey: "first",
+      page: "first-page",
+      matchedParams: { id: "42" },
+    });
+  });
+
   it("shares lazy intercept load state across fresh match objects", () => {
     const matcher = createAppRscRouteMatcher([
       route("/feed", ["feed"], {
