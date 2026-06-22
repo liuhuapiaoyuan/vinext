@@ -28,6 +28,7 @@ import { runWithExecutionContext, type ExecutionContextLike } from "vinext/shims
 import { registerConfiguredCacheAdapters } from "virtual:vinext-cache-adapters";
 import { resolveStaticAssetSignal } from "./worker-utils.js";
 import {
+  bufferRequestBodyForHeaderClone,
   cloneRequestWithHeaders,
   filterInternalHeaders,
   isOpenRedirectShaped,
@@ -109,6 +110,7 @@ async function handleRequest(
   // middleware sees them. Must happen before the RSC handler runs.
   // Builds a new Headers — Request.headers is immutable in Workers.
   {
+    request = await bufferRequestBodyForHeaderClone(request);
     const prerenderRouteParamsPayload = readTrustedPrerenderRouteParams(request);
     const filteredHeaders = filterInternalHeaders(request.headers);
     const prerenderRouteParamsHeader = serializePrerenderRouteParamsHeader(

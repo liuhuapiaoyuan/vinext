@@ -2004,6 +2004,30 @@ describe("createAppRscHandler", () => {
     expect(dispatchMatchedPage).not.toHaveBeenCalled();
   });
 
+  it("preserves server-action POST bodies through internal header filtering", async () => {
+    const payload = JSON.stringify(["hello"]);
+    const handleServerActionRequest = vi.fn(async (options) => {
+      const body = await options.request.text();
+      return new Response(body, { status: 200 });
+    });
+    const handler = createHandler({ handleServerActionRequest });
+
+    const response = await handler(
+      new Request("https://example.test/docs/about", {
+        method: "POST",
+        headers: {
+          "content-type": "text/plain;charset=UTF-8",
+          "next-action": "/app/about/actions.ts#echoAction",
+        },
+        body: payload,
+      }),
+      null,
+    );
+
+    expect(handleServerActionRequest).toHaveBeenCalled();
+    expect(await response.text()).toBe(payload);
+  });
+
   it("accepts the vinext action header name for server actions", async () => {
     const handleServerActionRequest = vi.fn(async () => new Response("action", { status: 200 }));
     const handler = createHandler({ handleServerActionRequest });

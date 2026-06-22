@@ -71,6 +71,7 @@ import type { AppRscRenderMode } from "./app-rsc-render-mode.js";
 import type { AppPagePprFallbackCacheShell } from "./app-ppr-fallback-shell.js";
 import type { ClientReuseManifestParseResult } from "./client-reuse-manifest.js";
 import {
+  bufferRequestBodyForHeaderClone,
   cloneRequestWithHeaders,
   cloneRequestWithUrl,
   filterInternalHeaders,
@@ -1095,6 +1096,11 @@ export function createAppRscHandler<TRoute extends AppRscHandlerRoute>(
     // bindings available.
     options.registerCacheAdapters();
     await options.ensureInstrumentation?.();
+
+    // Materialize POST bodies before internal header/url cloning. Without this,
+    // server actions can fall through to page render with empty args when the
+    // body stream is lost on Node/undici (see bufferRequestBodyForHeaderClone).
+    rawRequest = await bufferRequestBodyForHeaderClone(rawRequest);
 
     // Strip forged internal headers at the App Router request boundary.
     // Must happen BEFORE headersContextFromRequest() and

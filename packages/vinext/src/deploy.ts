@@ -556,7 +556,7 @@ import { fetchWorkerFilesystemRoute, runPagesRequest, wrapMiddlewareWithBasePath
 import type { PagesPipelineDeps } from "vinext/server/pages-request-pipeline";
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES, isImageOptimizationPath } from "vinext/server/image-optimization";
 import type { ImageConfig } from "vinext/server/image-optimization";
-import { cloneRequestWithHeaders, cloneRequestWithUrl, filterInternalHeaders, isOpenRedirectShaped } from "vinext/server/request-pipeline";
+import { bufferRequestBodyForHeaderClone, cloneRequestWithHeaders, cloneRequestWithUrl, filterInternalHeaders, isOpenRedirectShaped } from "vinext/server/request-pipeline";
 import { notFoundStaticAssetResponse } from "vinext/server/http-error-responses";
 import { assetPrefixPathname, isNextStaticPath } from "vinext/utils/asset-prefix";
 import { hasBasePath, stripBasePath } from "vinext/utils/base-path";
@@ -630,6 +630,7 @@ export default {
       // forged to influence routing or impersonate internal state.
       // Request.headers is immutable in Workers, so build a clean copy.
       {
+        request = await bufferRequestBodyForHeaderClone(request);
         const filteredHeaders = filterInternalHeaders(request.headers);
         request = cloneRequestWithHeaders(request, filteredHeaders);
       }

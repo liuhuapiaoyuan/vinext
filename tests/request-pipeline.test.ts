@@ -2,6 +2,7 @@ import { describe, it, expect } from "vite-plus/test";
 import {
   applyConfigHeadersToHeaderRecord,
   applyConfigHeadersToResponse,
+  bufferRequestBodyForHeaderClone,
   cloneRequestWithHeaders,
   cloneRequestWithUrl,
   createStaticFileSignal,
@@ -894,6 +895,41 @@ describe("buildRequestHeadersFromMiddlewareResponse", () => {
     expect(result!.get("authorization")).toBeNull();
     expect(result!.get("cookie")).toBeNull();
     expect(result!.get("x-keep")).toBe("updated");
+  });
+});
+
+// ── bufferRequestBodyForHeaderClone ──────────────────────────────────────
+
+describe("bufferRequestBodyForHeaderClone", () => {
+  it("materializes POST bodies so header cloning can read them", async () => {
+    const payload = JSON.stringify(["arg"]);
+    const original = new Request("http://localhost/action", {
+      method: "POST",
+      headers: {
+        "content-type": "text/plain;charset=UTF-8",
+        "next-action": "/app/actions.ts#getData",
+      },
+      body: payload,
+    });
+    const buffered = await bufferRequestBodyForHeaderClone(original);
+    const cloned = cloneRequestWithHeaders(buffered, new Headers(buffered.headers));
+    expect(await cloned.text()).toBe(payload);
+  });
+
+  it("leaves GET requests untouched", async () => {
+    const original = new Request("http://localhost/page", { method: "GET" });
+    const buffered = await bufferRequestBodyForHeaderClone(original);
+    expect(buffered).toBe(original);
+  });
+
+  it("skips multipart bodies", async () => {
+    const original = new Request("http://localhost/action", {
+      method: "POST",
+      headers: { "content-type": "multipart/form-data; boundary=vinext" },
+      body: "--vinext\r\n\r\n",
+    });
+    const buffered = await bufferRequestBodyForHeaderClone(original);
+    expect(buffered).toBe(original);
   });
 });
 

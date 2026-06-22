@@ -605,6 +605,65 @@ function getRequestCf(request: Request): unknown {
   return cf === undefined ? undefined : cf;
 }
 
+const METHODS_THAT_MAY_HAVE_BODY = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+/**
+ * Materialize the request body before header/url cloning.
+ *
+ * `cloneRequestWithHeaders` / `cloneRequestWithUrl` can lose a streaming body
+ * on Node/undici when the input is a foreign Request or when the underlying
+ * stream was partially consumed. Server actions and route handlers both rely on
+ * the body surviving internal header filtering, so we read it once up front
+ * and rebuild a fresh Request for the rest of the pipeline.
+ *
+ * Multipart bodies are left streaming so FormData parsing still works.
+ */
+export async function bufferRequestBodyForHeaderClone(request: Request): Promise<Request> {
+  if (!METHODS_THAT_MAY_HAVE_BODY.has(request.method.toUpperCase())) {
+    return request;
+  }
+  if (request.body === null) {
+    return request;
+  }
+  const contentType = request.headers.get("content-type") ?? "";
+  if (contentType.startsWith("multipart/form-data")) {
+    return request;
+  }
+  try {
+    const bytes = await request.arrayBuffer();
+    const init: RequestInitWithCf = {
+      method: request.method,
+      headers: request.headers,
+      body: bytes,
+      redirect: request.redirect,
+      referrer: request.referrer,
+      referrerPolicy: request.referrerPolicy,
+      signal: request.signal,
+      credentials: request.credentials,
+      integrity: request.integrity,
+      keepalive: request.keepalive,
+      mode: request.mode,
+      cache: request.cache,
+    };
+    if (bytes.byteLength > 0) {
+      // @ts-expect-error — duplex needed for bodied requests on Node/undici
+      init.duplex = "half";
+    }
+    const buffered = new Request(request.url, init);
+    const cf = getRequestCf(request);
+    if (cf !== undefined) {
+      Object.defineProperty(buffered, "cf", {
+        value: cf,
+        enumerable: true,
+        configurable: true,
+      });
+    }
+    return buffered;
+  } catch {
+    return request;
+  }
+}
+
 /**
  * Clone a Request while overriding headers, preserving metadata when possible.
  *
