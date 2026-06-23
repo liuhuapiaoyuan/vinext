@@ -14,8 +14,10 @@ import {
   consumeInvalidDynamicUsageError,
   getAndClearPendingCookies,
   getDraftModeCookieHeader,
+  getHeadersContext,
   isDraftModeRequest,
   markDynamicUsage,
+  peekDynamicUsage,
   peekRenderRequestApiUsage,
   setHeadersContext,
 } from "vinext/shims/headers";
@@ -120,7 +122,10 @@ type AppPageDispatchIntercept<TPage = unknown> = {
   // transport-level `interceptLayouts` on the route-matching/request types so an
   // intercept match flows through `toInterceptOptions` in both directions.
   interceptLayouts?: readonly unknown[] | null;
+  interceptLayoutSegments?: readonly (readonly string[])[] | null;
+  interceptBranchSegments?: readonly string[] | null;
   matchedParams: AppPageParams;
+  sourceMatchedParams?: AppPageParams;
   page: TPage;
   slotId?: string | null;
   slotKey: string;
@@ -131,6 +136,8 @@ type AppPageDispatchIntercept<TPage = unknown> = {
 type AppPageDispatchInterceptOptions<TPage = unknown> = {
   interceptionContext: string | null;
   interceptLayouts?: readonly unknown[] | null;
+  interceptLayoutSegments?: readonly (readonly string[])[] | null;
+  interceptBranchSegments?: readonly string[] | null;
   interceptPage: TPage;
   interceptParams: AppPageParams;
   interceptSlotId?: string | null;
@@ -230,6 +237,10 @@ export type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
     opts: AppPageDispatchInterceptOptions | undefined,
     searchParams: URLSearchParams,
     layoutParamAccess?: AppLayoutParamAccessTracker,
+    options?: {
+      observeMetadataSearchParamsAccess?: boolean;
+      observePageSearchParamsAccess?: boolean;
+    },
   ) => Promise<AppPageElement>;
   clientReuseManifest?: ClientReuseManifestParseResult;
   cleanPathname: string;
@@ -301,9 +312,12 @@ export type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
   staticParamsValidationParams?: AppPageParams;
   rootParams?: RootParams;
   probeLayoutAt: (layoutIndex: number, layoutParamAccess?: AppLayoutParamAccessTracker) => unknown;
-  probePage: () => unknown;
+  probePage: (searchParams?: URLSearchParams) => unknown;
   expireSeconds?: number;
-  renderErrorBoundaryPage: (error: unknown) => Promise<Response | null>;
+  renderErrorBoundaryPage: (
+    error: unknown,
+    errorOrigin?: "rsc" | "ssr",
+  ) => Promise<Response | null>;
   renderHttpAccessFallbackPage: (
     statusCode: number,
     opts: {
@@ -467,6 +481,7 @@ async function runAppPageRevalidationContext<
 ): Promise<TResult> {
   const { createStaticGenerationHeadersContext } = await import("./app-static-generation.js");
   const headersContext = createStaticGenerationHeadersContext({
+    draftModeEnabled: false,
     draftModeSecret: options.draftModeSecret,
     dynamicConfig: options.dynamicConfig,
     routeKind: "page",
@@ -499,6 +514,8 @@ function toInterceptOptions(
   return {
     interceptionContext,
     interceptLayouts: intercept.interceptLayouts,
+    interceptLayoutSegments: intercept.interceptLayoutSegments,
+    interceptBranchSegments: intercept.interceptBranchSegments,
     interceptPage: intercept.page,
     interceptParams: intercept.matchedParams,
     interceptSlotId: intercept.slotId ?? null,
@@ -529,7 +546,15 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
   const isDynamicError = dynamicConfig === "error";
   const isForceDynamic = dynamicConfig === "force-dynamic";
   const isDraftMode = isDraftModeRequest(options.request, options.draftModeSecret);
+  const requestHeadersContext = getHeadersContext();
+  const hasRequestSearchParams = !isForceStatic && hasSearchParams(options.searchParams);
+  const pageSearchParams = isForceStatic ? new URLSearchParams() : options.searchParams;
   const layoutParamAccess = createAppLayoutParamAccessTracker();
+  const hasActiveLoadingBoundary = shouldSuppressLoadingBoundaries(
+    options.renderMode ?? APP_RSC_RENDER_MODE_NAVIGATION,
+  )
+    ? false
+    : Boolean(route.loading?.default);
 
   setCurrentFetchSoftTags(buildAppPageTags(options.cleanPathname, [], route.routeSegments));
   setCurrentFetchCacheMode(options.fetchCache ?? null);
@@ -553,10 +578,11 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     return methodResponse;
   }
 
-  if ((isForceStatic || isDynamicError) && !isDraftMode) {
+  if (isForceStatic || isDynamicError) {
     const { createStaticGenerationHeadersContext } = await import("./app-static-generation.js");
     setHeadersContext(
       createStaticGenerationHeadersContext({
+        draftModeEnabled: isDraftMode,
         draftModeSecret: options.draftModeSecret,
         dynamicConfig,
         routeKind: "page",
@@ -591,7 +617,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     const cachedPageResponse = await readAppPageCacheResponse({
       cleanPathname: options.cleanPathname,
       clearRequestContext: options.clearRequestContext,
-      hasRequestSearchParams: !isForceStatic && hasSearchParams(options.searchParams),
+      hasRequestSearchParams,
       isEdgeRuntime: options.isEdgeRuntime,
       isRscRequest: options.isRscRequest,
       isrDebug: options.isrDebug,
@@ -641,6 +667,9 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
         // Hydrate the (possibly different) source route before reading its
         // page module for fetch-cache-mode resolution.
         await options.ensureRouteLoaded?.(revalidationTarget.route);
+        const revalidationDynamicConfig =
+          options.resolveRouteDynamicConfig?.(revalidationTarget.route) ??
+          (revalidationTarget.route === route ? dynamicConfig : undefined);
         return runAppPageRevalidationContext(
           {
             cleanPathname: options.cleanPathname,
@@ -649,9 +678,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
               options.resolveRouteFetchCacheMode?.(revalidationTarget.route) ??
               (revalidationTarget.route === route ? (options.fetchCache ?? null) : null),
             draftModeSecret: options.draftModeSecret,
-            dynamicConfig:
-              options.resolveRouteDynamicConfig?.(revalidationTarget.route) ??
-              (revalidationTarget.route === route ? dynamicConfig : undefined),
+            dynamicConfig: revalidationDynamicConfig,
             params: revalidationTarget.navigationParams,
             routePattern: revalidationTarget.route.pattern,
             routeSegments: revalidationTarget.route.routeSegments,
@@ -664,6 +691,11 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
               revalidationTarget.params,
               revalidationTarget.interceptOpts,
               new URLSearchParams(),
+              undefined,
+              {
+                observeMetadataSearchParamsAccess: revalidationDynamicConfig !== "force-static",
+                observePageSearchParamsAccess: revalidationDynamicConfig !== "force-static",
+              },
             );
             const revalidatedOnError = options.createRscOnErrorHandler(
               options.cleanPathname,
@@ -742,6 +774,8 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     return fallbackShellResponse;
   }
 
+  let interceptDynamicConfig: string | null | undefined;
+  let interceptDynamicConfigResolved = false;
   const interceptResult = await resolveAppPageIntercept<
     TRoute,
     unknown,
@@ -755,24 +789,41 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
       interceptSearchParams,
       interceptLayoutParamAccess,
     ) {
-      // Hydrate the intercept source route before reading its page module.
-      await options.ensureRouteLoaded?.(interceptRoute);
       // Deliberately no save/restore around buildPageElement: when this
       // callback runs, resolveAppPageIntercept returns the intercept response
       // directly and the dispatch never falls through to the original route.
       // The intercept route's fetch defaults must also stay active past this
       // call — its server components fetch lazily during the
       // renderToReadableStream in renderInterceptResponse below.
+      const sourceDynamicConfig = interceptDynamicConfigResolved
+        ? interceptDynamicConfig
+        : options.resolveRouteDynamicConfig?.(interceptRoute);
+      if (sourceDynamicConfig === "force-static" || sourceDynamicConfig === "error") {
+        const { createStaticGenerationHeadersContext } = await import("./app-static-generation.js");
+        setHeadersContext(
+          createStaticGenerationHeadersContext({
+            draftModeEnabled: isDraftMode,
+            draftModeSecret: options.draftModeSecret,
+            dynamicConfig: sourceDynamicConfig,
+            routeKind: "page",
+            routePattern: interceptRoute.pattern,
+          }),
+        );
+      } else {
+        setHeadersContext(requestHeadersContext);
+      }
       setCurrentFetchCacheMode(options.resolveRouteFetchCacheMode?.(interceptRoute) ?? null);
-      setCurrentForceDynamicFetchDefault(
-        options.resolveRouteDynamicConfig?.(interceptRoute) === "force-dynamic",
-      );
+      setCurrentForceDynamicFetchDefault(sourceDynamicConfig === "force-dynamic");
       return options.buildPageElement(
         interceptRoute,
         interceptParams,
         interceptOpts,
         interceptSearchParams,
         interceptLayoutParamAccess,
+        {
+          observeMetadataSearchParamsAccess: sourceDynamicConfig !== "force-static",
+          observePageSearchParamsAccess: sourceDynamicConfig !== "force-static",
+        },
       );
     },
     cleanPathname: options.cleanPathname,
@@ -812,6 +863,12 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
         headers: interceptHeaders,
       });
     },
+    async resolveSearchParams(sourceRoute, searchParams) {
+      await options.ensureRouteLoaded?.(sourceRoute);
+      interceptDynamicConfig = options.resolveRouteDynamicConfig?.(sourceRoute);
+      interceptDynamicConfigResolved = true;
+      return interceptDynamicConfig === "force-static" ? new URLSearchParams() : searchParams;
+    },
     searchParams: options.searchParams,
     setNavigationContext: options.setNavigationContext,
     toInterceptOpts(intercept) {
@@ -832,8 +889,12 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
           route,
           options.params,
           interceptResult.interceptOpts,
-          options.searchParams,
+          pageSearchParams,
           layoutParamAccess,
+          {
+            observeMetadataSearchParamsAccess: !isForceStatic,
+            observePageSearchParamsAccess: !isForceStatic,
+          },
         );
       },
       async probePageSpecialError() {
@@ -844,7 +905,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
           return null;
         }
         const pageError = await probeAppPageThrownError({
-          probePage: options.probePage,
+          probePage: () => options.probePage(pageSearchParams),
           runWithSuppressedHookWarning(probe) {
             return options.runWithSuppressedHookWarning(probe);
           },
@@ -879,6 +940,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
   if (pageBuildResult.response) {
     return pageBuildResult.response;
   }
+
   const navigationParams = resolveAppPageNavigationParams(
     route,
     options.params,
@@ -887,7 +949,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
   );
   options.setNavigationContext({
     pathname: options.displayPathname ?? options.cleanPathname,
-    searchParams: options.searchParams,
+    searchParams: pageSearchParams,
     params: navigationParams,
   });
 
@@ -906,6 +968,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     cleanPathname: options.cleanPathname,
     clearRequestContext: options.clearRequestContext,
     consumeDynamicUsage,
+    peekDynamicUsage,
     consumeInvalidDynamicUsageError,
     consumeRenderObservationState: consumeAppPageRenderObservationState,
     createRscOnErrorHandler(pathname, routePath) {
@@ -928,11 +991,8 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
       return _peekRequestScopedCacheLife();
     },
     handlerStart: options.handlerStart,
-    hasLoadingBoundary: shouldSuppressLoadingBoundaries(
-      options.renderMode ?? APP_RSC_RENDER_MODE_NAVIGATION,
-    )
-      ? false
-      : Boolean(route.loading?.default),
+    hasLoadingBoundary: hasActiveLoadingBoundary,
+    omitPendingDynamicCacheState: !options.isRscRequest && hasRequestSearchParams,
     formState: options.formState ?? null,
     isProgressiveActionRender: options.isProgressiveActionRender === true,
     isDynamicError,
@@ -973,8 +1033,9 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
       return options.probeLayoutAt(layoutIndex, layoutParamAccess);
     },
     probePage() {
-      return options.probePage();
+      return options.probePage(pageSearchParams);
     },
+    probePageBeforeRender: options.isRscRequest,
     classification: {
       getLayoutId(index) {
         const treePosition = route.layoutTreePositions?.[index] ?? 0;
@@ -1006,8 +1067,8 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     revalidateSeconds: currentRevalidateSeconds,
     mountedSlotsHeader: options.mountedSlotsHeader,
     renderMode: options.renderMode ?? APP_RSC_RENDER_MODE_NAVIGATION,
-    renderErrorBoundaryResponse(renderError) {
-      return options.renderErrorBoundaryPage(renderError);
+    renderErrorBoundaryResponse(renderError, errorOrigin) {
+      return options.renderErrorBoundaryPage(renderError, errorOrigin);
     },
     renderLayoutSpecialError(specialError, layoutIndex) {
       return renderLayoutSpecialError(options, specialError, layoutIndex);

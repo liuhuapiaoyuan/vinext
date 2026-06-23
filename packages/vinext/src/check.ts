@@ -308,6 +308,11 @@ const LIBRARY_SUPPORT: Record<string, { status: Status; detail?: string }> = {
 
 /**
  * Recursively find all source files in a directory.
+ *
+ * `dir` must be forward-slash, and the returned paths are forward-slash too:
+ * each entry is joined with `path.posix.join`, which only stays canonical when
+ * the base already is. This keeps downstream substring checks (e.g.
+ * `f.includes("/api/")`) and reported paths consistent across platforms.
  */
 function findSourceFiles(
   dir: string,
@@ -318,10 +323,7 @@ function findSourceFiles(
 
   const entries = fs.readdirSync(dir, { withFileTypes: true });
   for (const entry of entries) {
-    // Forward slashes so downstream substring checks (e.g. `f.includes("/api/")`)
-    // and reported paths are consistent across platforms — path.join yields
-    // backslashes on Windows, which would break those checks.
-    const fullPath = normalizePathSeparators(path.join(dir, entry.name));
+    const fullPath = path.posix.join(dir, entry.name);
     if (entry.isDirectory()) {
       if (
         entry.name === "node_modules" ||
@@ -568,6 +570,10 @@ export function hasFreeCjsGlobal(content: string): boolean {
 
 /**
  * Scan source files for `import ... from 'next/...'` statements.
+ *
+ * `root` must be forward-slash: it is passed to `findSourceFiles` (which
+ * requires it) and used as the base of `path.posix.relative`, which only yields
+ * a canonical relative path when both operands are forward-slash.
  */
 export function scanImports(root: string): CheckItem[] {
   const files = findSourceFiles(root);
@@ -596,7 +602,7 @@ export function scanImports(root: string): CheckItem[] {
         // Normalize: next/font/google -> next/font/google
         const normalized = mod === "next" ? "next" : mod;
         if (!importUsage.has(normalized)) importUsage.set(normalized, []);
-        const relFile = normalizePathSeparators(path.relative(root, file));
+        const relFile = path.posix.relative(root, file);
         const usedInFiles = importUsage.get(normalized) ?? [];
         if (!usedInFiles.includes(relFile)) {
           usedInFiles.push(relFile);
@@ -932,11 +938,9 @@ export function checkConventions(root: string): CheckItem[] {
   const items: CheckItem[] = [];
 
   // Check for pages/ and app/ at root level, then fall back to src/
-  const pagesDir = findDir(root, "pages", path.join("src", "pages"));
-  const appDirPath = findDir(root, "app", path.join("src", "app"));
+  const pagesDir = findDir(root, "pages", "src/pages");
+  const appDirPath = findDir(root, "app", "src/app");
 
-  const hasPages = pagesDir !== null;
-  const hasApp = appDirPath !== null;
   const hasProxy =
     fs.existsSync(path.join(root, "proxy.ts")) || fs.existsSync(path.join(root, "proxy.js"));
   const hasMiddleware =
@@ -944,7 +948,7 @@ export function checkConventions(root: string): CheckItem[] {
     fs.existsSync(path.join(root, "middleware.js"));
 
   if (pagesDir !== null) {
-    const isSrc = pagesDir.includes(path.join("src", "pages"));
+    const isSrc = pagesDir.includes("src/pages");
     items.push({
       name: isSrc ? "Pages Router (src/pages/)" : "Pages Router (pages/)",
       status: "supported",
@@ -975,7 +979,7 @@ export function checkConventions(root: string): CheckItem[] {
   }
 
   if (appDirPath !== null) {
-    const isSrc = appDirPath.includes(path.join("src", "app"));
+    const isSrc = appDirPath.includes("src/app");
     items.push({
       name: isSrc ? "App Router (src/app/)" : "App Router (app/)",
       status: "supported",
@@ -1009,7 +1013,7 @@ export function checkConventions(root: string): CheckItem[] {
     items.push({ name: "middleware.ts (deprecated in Next.js 16)", status: "supported" });
   }
 
-  if (!hasPages && !hasApp) {
+  if (pagesDir === null && appDirPath === null) {
     items.push({
       name: "No pages/ or app/ directory found",
       status: "unsupported",
@@ -1111,6 +1115,10 @@ export function checkConventions(root: string): CheckItem[] {
 
 /**
  * Run the full compatibility check.
+ *
+ * `root` must be forward-slash — callers normalize it at the CLI entry, and it
+ * is forwarded to `scanImports` / `checkConventions` / `findDir`, which build
+ * paths with `path.posix.*`.
  */
 export function runCheck(root: string): CheckResult {
   const imports = scanImports(root);
