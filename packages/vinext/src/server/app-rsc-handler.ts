@@ -666,7 +666,11 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     );
     if (!imageRedirect)
       return new Response("Invalid image optimization parameters", { status: 400 });
-    return Response.redirect(new URL(imageRedirect, url.origin).href, 302);
+    // Use a relative Location so browsers resolve it against the request URL
+    // they actually used (HTTPS). Response.redirect() rejects relative URLs in
+    // Node, and absolute redirects built from url.origin break behind TLS-
+    // terminating proxies that present http:// to the app (Mixed Content).
+    return new Response(null, { status: 302, headers: { Location: imageRedirect } });
   }
 
   if (options.handleMetadataRouteRequest) {

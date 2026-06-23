@@ -163,14 +163,24 @@ describe("createAppRscHandler", () => {
       null,
     );
     expect(allowed.status).toBe(302);
-    expect(allowed.headers.get("location")).toBe("https://example.test/img.jpg");
+    expect(allowed.headers.get("location")).toBe("/img.jpg");
 
     const snappedWidth = await handler(
       new Request("https://example.test/docs/_next/image?url=%2Fimg.jpg&w=640&q=60"),
       null,
     );
     expect(snappedWidth.status).toBe(302);
-    expect(snappedWidth.headers.get("location")).toBe("https://example.test/img.jpg");
+    expect(snappedWidth.headers.get("location")).toBe("/img.jpg");
+  });
+
+  it("redirects image optimization to a relative asset path behind http origin", async () => {
+    const handler = createHandler({ isDev: false });
+    const response = await handler(
+      new Request("http://example.test/docs/_next/image?url=%2Findex-bg.webp&w=941&q=75"),
+      null,
+    );
+    expect(response.status).toBe(302);
+    expect(response.headers.get("location")).toBe("/index-bg.webp");
   });
 
   it("allows independent Next.js blur width and quality exceptions in pure App Router dev", async () => {
