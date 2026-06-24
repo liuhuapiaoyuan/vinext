@@ -27,6 +27,7 @@ import { runWithExecutionContext, type ExecutionContextLike } from "vinext/shims
 // @ts-expect-error -- virtual module resolved by vinext at build time
 import { registerConfiguredCacheAdapters } from "virtual:vinext-cache-adapters";
 import { finalizeMissingStaticAssetResponse, resolveStaticAssetSignal } from "./worker-utils.js";
+import { handleAppRouterImageOptimizationRequest } from "./app-router-image-optimization.js";
 import {
   bufferRequestBodyForHeaderClone,
   cloneRequestWithHeaders,
@@ -56,6 +57,13 @@ const __workerAssetPathPrefix: string = assetPrefixPathname(
 type WorkerAssetEnv = {
   ASSETS?: {
     fetch(request: Request): Promise<Response> | Response;
+  };
+  IMAGES?: {
+    input(stream: ReadableStream): {
+      transform(options: Record<string, unknown>): {
+        output(options: { format: string; quality: number }): Promise<{ response(): Response }>;
+      };
+    };
   };
 };
 
@@ -121,6 +129,14 @@ async function handleRequest(
       filteredHeaders.set(VINEXT_PRERENDER_ROUTE_PARAMS_HEADER, prerenderRouteParamsHeader);
     }
     request = cloneRequestWithHeaders(request, filteredHeaders);
+  }
+
+  const imageResponse = await handleAppRouterImageOptimizationRequest(request, {
+    basePath: __workerBasePath,
+    env: env ?? {},
+  });
+  if (imageResponse) {
+    return imageResponse;
   }
 
   // Do NOT decode/normalize the pathname here. The RSC handler
