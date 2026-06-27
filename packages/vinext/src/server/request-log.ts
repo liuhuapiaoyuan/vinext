@@ -12,6 +12,8 @@
  *  - Method: bold
  */
 
+import { formatActionArgs, type ServerActionLogInfo } from "./server-action-logger.js";
+
 const isTTY = () => process.stdout.isTTY;
 const pretty = {
   bold: (s: string) => (isTTY() ? `\x1b[1m${s}\x1b[0m` : s),
@@ -34,7 +36,7 @@ function formatDuration(ms: number): string {
   return `${Math.round(ms)}ms`;
 }
 
-type RequestLogOptions = {
+export type RequestLogOptions = {
   method: string;
   url: string;
   status: number;
@@ -45,6 +47,14 @@ type RequestLogOptions = {
   /** Time spent in React rendering / HTML streaming. */
   renderMs?: number;
 };
+
+/** Print the nested server action log line under the request log. */
+export function logServerAction(info: ServerActionLogInfo): void {
+  const argsStr = formatActionArgs(info.args);
+  process.stdout.write(
+    ` └─ ƒ ${info.functionName}(${argsStr}) in ${info.duration}ms ${pretty.dim(info.location)}\n`,
+  );
+}
 
 /**
  * Print a single request log line to stdout.

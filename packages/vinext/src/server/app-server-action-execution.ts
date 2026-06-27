@@ -61,6 +61,12 @@ import {
 } from "./server-action-not-found.js";
 import { internalServerErrorResponse, payloadTooLargeResponse } from "./http-error-responses.js";
 import { createStaticGenerationHeadersContext } from "./app-static-generation.js";
+import {
+  applyServerActionLogHeader,
+  createServerActionLogInfo,
+  isDevServerActionLoggingEnabled,
+  type ServerActionLogInfo,
+} from "./server-action-logger.js";
 
 type AppPageParams = Record<string, string | string[]>;
 
@@ -1197,6 +1203,9 @@ export async function handleServerActionRscRequest<
     let actionThrew = false;
     const actionWasForwarded = Boolean(options.request.headers.get(ACTION_FORWARDED_HEADER));
     const rootParamsUsage = createRootParamsUsageController();
+    const shouldLogAction = isDevServerActionLoggingEnabled();
+    const actionLogStart = shouldLogAction ? performance.now() : 0;
+    let actionLogInfo: ServerActionLogInfo | null = null;
     const previousHeadersPhase = options.setHeadersAccessPhase("action");
     try {
       try {
@@ -1225,6 +1234,13 @@ export async function handleServerActionRscRequest<
         }
       }
     } finally {
+      if (shouldLogAction) {
+        actionLogInfo = createServerActionLogInfo({
+          actionId: options.actionId,
+          args,
+          durationMs: Math.round(performance.now() - actionLogStart),
+        });
+      }
       options.setHeadersAccessPhase(previousHeadersPhase);
       if (actionThrew && !actionWasForwarded) rootParamsUsage.transitionToRender();
     }
@@ -1258,6 +1274,7 @@ export async function handleServerActionRscRequest<
       }
       if (actionDraftCookie) redirectHeaders.append("Set-Cookie", actionDraftCookie);
       setActionRevalidatedHeader(redirectHeaders, actionRevalidationKind);
+      applyServerActionLogHeader(redirectHeaders, actionLogInfo);
 
       const redirectTarget = resolveInternalActionRedirectTarget(
         actionRedirectUrl,
@@ -1407,6 +1424,7 @@ export async function handleServerActionRscRequest<
       }
       if (actionDraftCookie) actionHeaders.append("Set-Cookie", actionDraftCookie);
       setActionRevalidatedHeader(actionHeaders, actionRevalidationKind);
+      applyServerActionLogHeader(actionHeaders, actionLogInfo);
 
       return createServerActionRscResponse(
         rscStream,
@@ -1521,6 +1539,7 @@ export async function handleServerActionRscRequest<
     mergeMiddlewareResponseHeaders(actionHeaders, options.middlewareHeaders);
     applyRscCompatibilityIdHeader(actionHeaders);
     setActionRevalidatedHeader(actionHeaders, actionRevalidationKind);
+    applyServerActionLogHeader(actionHeaders, actionLogInfo);
     const actionResponse = createServerActionRscResponse(
       rscStream,
       {

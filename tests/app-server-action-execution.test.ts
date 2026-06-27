@@ -21,6 +21,8 @@ import {
   VINEXT_RSC_COMPATIBILITY_ID_HEADER,
   VINEXT_RSC_VARY_HEADER,
 } from "../packages/vinext/src/server/app-rsc-cache-busting.js";
+import { VINEXT_ACTION_LOG_HEADER } from "../packages/vinext/src/server/headers.js";
+import { parseServerActionLogHeader } from "../packages/vinext/src/server/server-action-logger.js";
 import {
   getAndClearActionRevalidationKind,
   refresh,
@@ -1213,6 +1215,57 @@ describe("app server action execution helpers", () => {
     });
     expect(phaseCalls).toEqual(["action", "render"]);
     expect(navigationContexts).toEqual([{ params: {}, pathname: "/dashboard" }]);
+  });
+
+  // Ported from Next.js: test/e2e/app-dir/server-action-logging/server-action-logging.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/server-action-logging/server-action-logging.test.ts
+  it("attaches dev server action log metadata to fetch action responses", async () => {
+    await withEnvVar("NODE_ENV", "development", async () => {
+      const response = await handleServerActionRscRequest(
+        createRscOptions({
+          actionId: "/app/actions/actions.ts#successAction",
+          decodeReply() {
+            return Promise.resolve([5]);
+          },
+          loadServerAction(actionId) {
+            expect(actionId).toBe("/app/actions/actions.ts#successAction");
+            return Promise.resolve((value: unknown) => value);
+          },
+          renderToReadableStream(_model) {
+            return new Response("flight-payload").body;
+          },
+        }),
+      );
+
+      const actionLogHeader = response?.headers.get(VINEXT_ACTION_LOG_HEADER);
+      expect(actionLogHeader).not.toBeNull();
+      expect(parseServerActionLogHeader(actionLogHeader!)).toMatchObject({
+        functionName: "successAction",
+        args: [5],
+        location: "app/actions/actions.ts",
+      });
+    });
+  });
+
+  it("does not attach dev server action log metadata in production", async () => {
+    await withEnvVar("NODE_ENV", "production", async () => {
+      const response = await handleServerActionRscRequest(
+        createRscOptions({
+          actionId: "/app/actions/actions.ts#successAction",
+          decodeReply() {
+            return Promise.resolve([5]);
+          },
+          loadServerAction() {
+            return Promise.resolve((value: unknown) => value);
+          },
+          renderToReadableStream() {
+            return new Response("flight-payload").body;
+          },
+        }),
+      );
+
+      expect(response?.headers.get(VINEXT_ACTION_LOG_HEADER)).toBeNull();
+    });
   });
 
   // Ported from Next.js: test/e2e/app-dir/app-root-params-getters/simple.test.ts
