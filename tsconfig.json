@@ -15,6 +15,7 @@
     // them here (safe: this project is noEmit).
     "allowImportingTsExtensions": true,
     "paths": {
+      "vinext/*": ["./packages/vinext/src/*"],
       "vinext/shims/*": ["./packages/vinext/src/shims/*"],
       "@vinext/cloudflare/cache/*": ["./packages/cloudflare/src/cache/*"]
     }

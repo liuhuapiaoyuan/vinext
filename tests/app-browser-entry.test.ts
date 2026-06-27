@@ -21,6 +21,7 @@ import {
   parseServerActionRevalidationHeader,
   readInvalidServerActionResponseError,
   shouldClearClientNavigationCachesForServerActionResult,
+  shouldSyncServerActionHttpFallbackHead,
   shouldScheduleRefreshForDiscardedServerAction,
 } from "../packages/vinext/src/server/app-browser-action-result.js";
 import {
@@ -54,12 +55,12 @@ import {
   formatViteOpenInEditorFile,
   installReactRefreshErrorRecovery,
   normalizeViteHmrError,
-} from "../packages/vinext/src/server/dev-error-overlay.js";
+} from "../packages/vinext/src/client/dev-error-overlay.js";
 import {
   dismissOverlay,
   reportToOverlay,
   subscribeOverlay,
-} from "../packages/vinext/src/server/dev-error-overlay-store.js";
+} from "../packages/vinext/src/client/dev-error-overlay-store.js";
 import { VINEXT_DEV_ERROR_RECOVERY_EVENT } from "../packages/vinext/src/utils/dev-error-recovery-event.js";
 import {
   APP_CACHE_ENTRY_REUSE_PROOF_KEY,
@@ -900,6 +901,23 @@ describe("app browser entry navigation scheduling", () => {
     } else {
       throw new Error("Expected fallback to have a digest property");
     }
+  });
+
+  it("lets thrown action HTTP fallbacks own their boundary robots metadata", () => {
+    expect(
+      shouldSyncServerActionHttpFallbackHead({
+        returnValue: { ok: false, data: new Error("sanitized") },
+      }),
+    ).toBe(false);
+    expect(shouldSyncServerActionHttpFallbackHead({ returnValue: { ok: true, data: null } })).toBe(
+      true,
+    );
+    expect(
+      shouldSyncServerActionHttpFallbackHead({
+        root: { __route: "/current" },
+        returnValue: { ok: false, data: new Error("sanitized") },
+      }),
+    ).toBe(false);
   });
 
   it("preserves ordinary server action errors for 500 responses", () => {

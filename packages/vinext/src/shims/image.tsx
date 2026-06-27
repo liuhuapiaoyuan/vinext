@@ -58,6 +58,13 @@ const __imageDeviceSizes: number[] = (() => {
     return [640, 750, 828, 1080, 1200, 1920, 2048, 3840];
   }
 })();
+const __imageSizes: number[] = (() => {
+  try {
+    return JSON.parse(process.env.__VINEXT_IMAGE_SIZES ?? "[16,32,48,64,96,128,256,384]");
+  } catch {
+    return [16, 32, 48, 64, 96, 128, 256, 384];
+  }
+})();
 /**
  * Whether dangerouslyAllowSVG is enabled in next.config.js.
  * When false (default), .svg sources auto-skip the optimization endpoint
@@ -85,6 +92,7 @@ function resolveEffectiveLoader(loader: ImageLoader | undefined): ImageLoader | 
   }
   return configDefaultLoader;
 }
+const __globallyUnoptimized = process.env.__VINEXT_IMAGE_UNOPTIMIZED === "true";
 
 /**
  * Validate that a remote URL is allowed by the configured remote patterns.
@@ -286,7 +294,10 @@ function resolveImageSource(v: {
  * These are the breakpoints used for srcSet generation.
  * Configurable via `images.deviceSizes` in next.config.js.
  */
-const RESPONSIVE_WIDTHS = __imageDeviceSizes;
+const RESPONSIVE_WIDTHS = [...__imageDeviceSizes].sort((left, right) => left - right);
+const ALL_IMAGE_WIDTHS = [...RESPONSIVE_WIDTHS, ...__imageSizes].sort(
+  (left, right) => left - right,
+);
 
 export { imageOptimizationUrl };
 
@@ -311,14 +322,57 @@ function preloadImageResource(input: {
  * Generate a srcSet string for responsive images.
  *
  * Each width points to the `/_next/image` optimization endpoint so the
- * server can resize and transcode the image. Only includes widths that are
- * <= 2x the original image width to avoid pointless upscaling.
+ * server can resize and transcode the image.
  */
-function generateSrcSet(src: string, originalWidth: number, quality: number = 75): string {
-  const widths = RESPONSIVE_WIDTHS.filter((w) => w <= originalWidth * 2);
-  if (widths.length === 0)
-    return `${imageOptimizationUrl(src, originalWidth, quality)} ${originalWidth}w`;
-  return widths.map((w) => `${imageOptimizationUrl(src, w, quality)} ${w}w`).join(", ");
+function getImageWidths(width: number): number[] {
+  return [
+    ...new Set(
+      [width, width * 2].map(
+        (targetWidth) =>
+          ALL_IMAGE_WIDTHS.find((configuredWidth) => configuredWidth >= targetWidth) ??
+          ALL_IMAGE_WIDTHS[ALL_IMAGE_WIDTHS.length - 1],
+      ),
+    ),
+  ];
+}
+
+function generateImageAttributes(
+  src: string,
+  width: number,
+  quality: number = 75,
+  sizes?: string,
+): { src: string; srcSet: string } {
+  if (sizes) {
+    const viewportWidthPattern = /(^|\s)(1?\d?\d)vw/g;
+    const viewportPercentages = Array.from(sizes.matchAll(viewportWidthPattern), (match) =>
+      Number.parseInt(match[2], 10),
+    );
+    const minimumWidth =
+      viewportPercentages.length > 0
+        ? RESPONSIVE_WIDTHS[0] * (Math.min(...viewportPercentages) * 0.01)
+        : 0;
+    const candidates = ALL_IMAGE_WIDTHS.filter((candidateWidth) => candidateWidth >= minimumWidth);
+    return {
+      src: imageOptimizationUrl(src, candidates[candidates.length - 1], quality),
+      srcSet: candidates
+        .map(
+          (candidateWidth) =>
+            `${imageOptimizationUrl(src, candidateWidth, quality)} ${candidateWidth}w`,
+        )
+        .join(", "),
+    };
+  }
+
+  const widths = getImageWidths(width);
+  return {
+    src: imageOptimizationUrl(src, widths[widths.length - 1], quality),
+    srcSet: widths
+      .map(
+        (candidateWidth, index) =>
+          `${imageOptimizationUrl(src, candidateWidth, quality)} ${index + 1}x`,
+      )
+      .join(", "),
+  };
 }
 
 const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
@@ -484,7 +538,7 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
         }
       : undefined;
 
-  if (_unoptimized === true) {
+  if (_unoptimized === true || __globallyUnoptimized) {
     // Unoptimized images are fetched directly by the browser, so intentionally
     // skip remote URL validation: there is no server-side optimizer fetch and
     // therefore no SSRF surface. This matches Next.js behavior.
@@ -658,21 +712,24 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
 
   // Build srcSet for responsive local images (common breakpoints).
   // Each entry points to /_next/image with the appropriate width.
-  const srcSet =
+  const optimizedAttributes =
     imgWidth && !fill && !skipOptimization
-      ? generateSrcSet(src, imgWidth, imgQuality)
-      : imgWidth && !fill
-        ? RESPONSIVE_WIDTHS.filter((w) => w <= imgWidth * 2)
-            .map((w) => `${src} ${w}w`)
-            .join(", ") || `${src} ${imgWidth}w`
-        : undefined;
+      ? generateImageAttributes(src, imgWidth, imgQuality, sizes)
+      : undefined;
+  const srcSet = optimizedAttributes
+    ? optimizedAttributes.srcSet
+    : imgWidth && !fill
+      ? RESPONSIVE_WIDTHS.filter((w) => w <= imgWidth * 2)
+          .map((w) => `${src} ${w}w`)
+          .join(", ") || `${src} ${imgWidth}w`
+      : undefined;
 
   // The main `src` also goes through the optimization endpoint. Use the
   // declared width (or the first responsive width as fallback).
   const optimizedSrc = skipOptimization
     ? src
-    : imgWidth
-      ? imageOptimizationUrl(src, imgWidth, imgQuality)
+    : optimizedAttributes
+      ? optimizedAttributes.src
       : imageOptimizationUrl(src, RESPONSIVE_WIDTHS[0], imgQuality);
 
   // Blur placeholder: show a low-quality background while the image loads.
@@ -760,7 +817,7 @@ export function getImageProps(props: ImageProps): {
   const shouldPreload = _preload === true || priority === true;
   const effectiveLoader = resolveEffectiveLoader(loader);
 
-  if (_unoptimized === true) {
+  if (_unoptimized === true || __globallyUnoptimized) {
     // As in the component path, unoptimized images never reach the server-side
     // optimizer, so remote URL validation is intentionally unnecessary.
     const renderedSrc = overrideSrc || src;
@@ -822,17 +879,18 @@ export function getImageProps(props: ImageProps): {
     blockedInProd ||
     !!effectiveLoader ||
     isRemoteUrl(resolvedSrc);
+  const optimizedAttributes =
+    imgWidth && !fill && !skipOpt
+      ? generateImageAttributes(resolvedSrc, imgWidth, imgQuality, sizes)
+      : null;
   const optimizedSrc = skipOpt
     ? resolvedSrc
-    : imgWidth
-      ? imageOptimizationUrl(resolvedSrc, imgWidth, imgQuality)
+    : optimizedAttributes
+      ? optimizedAttributes.src
       : imageOptimizationUrl(resolvedSrc, RESPONSIVE_WIDTHS[0], imgQuality);
 
   // Build srcSet for local images — each width points to /_next/image
-  const srcSet =
-    imgWidth && !fill && !isRemoteUrl(resolvedSrc) && !effectiveLoader && !skipOpt
-      ? generateSrcSet(resolvedSrc, imgWidth, imgQuality)
-      : undefined;
+  const srcSet = optimizedAttributes?.srcSet;
 
   // Blur placeholder styles — sanitize to prevent CSS injection
   const sanitizedBlurURL = imgBlurDataURL ? sanitizeBlurDataURL(imgBlurDataURL) : undefined;

@@ -261,11 +261,21 @@ export function findInNodeModules(start: string, subPath: string): string | null
  * Check if a vite.config file exists in the project root.
  */
 export function hasViteConfig(root: string): boolean {
-  return (
-    fs.existsSync(path.join(root, "vite.config.ts")) ||
-    fs.existsSync(path.join(root, "vite.config.js")) ||
-    fs.existsSync(path.join(root, "vite.config.mjs"))
-  );
+  return findViteConfigPath(root) !== undefined;
+}
+
+/** Return the config file Vite will load, using Vite's default precedence. */
+export function findViteConfigPath(root: string): string | undefined {
+  return [
+    "vite.config.js",
+    "vite.config.mjs",
+    "vite.config.ts",
+    "vite.config.cjs",
+    "vite.config.mts",
+    "vite.config.cts",
+  ]
+    .map((fileName) => path.join(root, fileName))
+    .find((candidate) => fs.existsSync(candidate));
 }
 
 /**
@@ -291,7 +301,9 @@ export function findDir(root: string, ...candidates: string[]): string | null {
 
 /**
  * Check if the project uses App Router (has an app/ directory).
+ *
+ * `root` must be forward-slash — it is passed straight to `findDir`.
  */
 export function hasAppDir(root: string): boolean {
-  return findDir(root, "app", path.join("src", "app")) !== null;
+  return findDir(root, "app", "src/app") !== null;
 }

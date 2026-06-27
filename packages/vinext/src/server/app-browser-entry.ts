@@ -145,13 +145,6 @@ import {
 } from "../client/app-nav-failure-handler.js";
 import { createClientReuseManifestHeaderFromVisibleAppState } from "./app-browser-client-reuse-manifest.js";
 import {
-  devOnCaughtError,
-  dismissOverlay,
-  installDevErrorOverlay,
-  installViteHmrErrorHandler,
-  reportInitialDevServerErrors,
-} from "./dev-error-overlay.js";
-import {
   createRscRequestHeaders,
   createRscRequestUrl,
   getVinextRscCompatibilityId,
@@ -181,6 +174,7 @@ import {
 import { hasServerActions, loadServerActionClient } from "virtual:vinext-app-capabilities";
 
 type SearchParamInput = ConstructorParameters<typeof URLSearchParams>[0];
+type DevErrorOverlayModule = typeof import("../client/dev-error-overlay.js");
 
 type ServerActionResult = AppBrowserServerActionResult<AppWireElements>;
 
@@ -750,6 +744,11 @@ type NavigationRequestState = {
   previousNextUrl: string | null;
 };
 
+function getCurrentMatchedRoutePathname(): string | null {
+  const routeKey = AppElementsWire.parseElementKey(getBrowserRouterState().routeId);
+  return routeKey?.kind === "route" ? routeKey.path : null;
+}
+
 function getRequestState(
   navigationKind: NavigationKind,
   targetPathname: string,
@@ -811,6 +810,7 @@ function getRequestState(
       const middlewareRewriteInterceptionContext =
         resolveMiddlewareRewriteNavigationInterceptionContext({
           basePath: __basePath,
+          currentMatchedPathname: getCurrentMatchedRoutePathname(),
           currentPathname: window.location.pathname,
           routeManifest: getBrowserRouteManifest(),
           targetPathname,
@@ -1398,10 +1398,12 @@ async function main(): Promise<void> {
   if (hasServerActions) registerServerActionCallback();
   installAppNavigationFailureListeners();
 
+  let devErrorOverlay: DevErrorOverlayModule | null = null;
   if (import.meta.env.DEV) {
-    installDevErrorOverlay();
-    installViteHmrErrorHandler(import.meta.hot);
-    reportInitialDevServerErrors();
+    devErrorOverlay = await import("../client/dev-error-overlay.js");
+    devErrorOverlay.installDevErrorOverlay();
+    devErrorOverlay.installViteHmrErrorHandler(import.meta.hot);
+    devErrorOverlay.reportInitialDevServerErrors();
   }
 
   const rscStream = await readInitialRscStream();
@@ -1413,10 +1415,13 @@ async function main(): Promise<void> {
   // The recovery path reloads the document, which resets the "starting" claim;
   // this module instance is intentionally not eligible to retry bootstrap.
   if (rscStream === null) return;
-  bootstrapHydration(rscStream);
+  bootstrapHydration(rscStream, devErrorOverlay);
 }
 
-function bootstrapHydration(rscStream: ReadableStream<Uint8Array>): void {
+function bootstrapHydration(
+  rscStream: ReadableStream<Uint8Array>,
+  devErrorOverlay: DevErrorOverlayModule | null,
+): void {
   const root = decodeAppElementsPromise(createFromReadableStream<AppWireElements>(rscStream));
   const initialNavigationSnapshot = createClientNavigationRenderSnapshot(
     window.location.href,
@@ -1426,18 +1431,19 @@ function bootstrapHydration(rscStream: ReadableStream<Uint8Array>): void {
 
   const onUncaughtError = createOnUncaughtError();
   const formState = consumeInitialFormState(getVinextBrowserGlobal());
-  const hydrateRootOptions = import.meta.env.DEV
-    ? createVinextHydrateRootOptions({
-        formState,
-        onCaughtError: createDevOnCaughtError(devOnCaughtError, onUncaughtError),
-        onUncaughtError,
-      })
-    : createVinextHydrateRootOptions({
-        formState,
-        onCaughtError: createProdOnCaughtError(onUncaughtError),
-        onRecoverableError: prodOnRecoverableError,
-        onUncaughtError,
-      });
+  const hydrateRootOptions =
+    import.meta.env.DEV && devErrorOverlay
+      ? createVinextHydrateRootOptions({
+          formState,
+          onCaughtError: createDevOnCaughtError(devErrorOverlay.devOnCaughtError, onUncaughtError),
+          onUncaughtError,
+        })
+      : createVinextHydrateRootOptions({
+          formState,
+          onCaughtError: createProdOnCaughtError(onUncaughtError),
+          onRecoverableError: prodOnRecoverableError,
+          onUncaughtError,
+        });
   const children = createElement(BrowserRoot, {
     initialElements: root,
     initialNavigationSnapshot,
@@ -2112,7 +2118,7 @@ function bootstrapHydration(rscStream: ReadableStream<Uint8Array>): void {
     }
   });
 
-  if (import.meta.hot) {
+  if (import.meta.env.DEV && import.meta.hot) {
     const applyRscHmrUpdate = async (updateId: number): Promise<void> => {
       if (updateId !== latestRscHmrUpdateId) return;
 
@@ -2164,7 +2170,7 @@ function bootstrapHydration(rscStream: ReadableStream<Uint8Array>): void {
       // empty; if it throws again, devOnCaughtError/devOnUncaughtError
       // re-populates it. Without this, an old "DropZone is not defined"
       // error would linger after the developer fixed the bug.
-      dismissOverlay();
+      devErrorOverlay?.dismissOverlay();
       // Interception context on HMR re-renders is intentionally deferred:
       // preserving intercepted modal state across HMR reloads is out of scope
       // for the previousNextUrl mechanism.
