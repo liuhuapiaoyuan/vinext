@@ -547,7 +547,7 @@ function prefetchUrl(href: string, mode: LinkPrefetchMode, priority: "low" | "hi
             optimisticRouteShell: isOptimisticRouteShellPrefetch,
           },
         );
-      } else if (HAS_PAGES_ROUTER && window.__NEXT_DATA__) {
+      } else if (HAS_PAGES_ROUTER && getBrowserNextData()) {
         // Pages Router prefetch. When a code-split loader is registered for
         // the target route (prod builds expose them on window via the
         // generated client entry), prefetch the data JSON + warm the page
@@ -683,6 +683,13 @@ function getSharedObserver(): IntersectionObserver | null {
   return sharedObserver;
 }
 
+type BrowserWindowWithNextData = typeof globalThis & { __NEXT_DATA__?: VinextNextData };
+
+function getBrowserNextData(): VinextNextData | undefined {
+  if (typeof window === "undefined") return undefined;
+  return (window as BrowserWindowWithNextData).__NEXT_DATA__;
+}
+
 function getDefaultLocale(): string | undefined {
   if (typeof window !== "undefined") {
     return window.__VINEXT_DEFAULT_LOCALE__;
@@ -703,7 +710,7 @@ function getCurrentLocale(): string | undefined {
 
 function getDomainLocales(): readonly DomainLocale[] | undefined {
   if (typeof window !== "undefined") {
-    return (window.__NEXT_DATA__ as VinextNextData | undefined)?.domainLocales;
+    return getBrowserNextData()?.domainLocales;
   }
   return getI18nContext()?.domainLocales;
 }
@@ -1167,7 +1174,7 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
       const pagesRouter = Router && "reload" in Router ? Router : undefined;
       await navigatePagesRouterLinkWithFallback({
         router: pagesRouter,
-        loadRouter: async () => (await import("next/router")).default,
+        loadRouter: async () => (await import("./router.js")).default,
         navigation: {
           href: pagesHrefForLink,
           as: pagesAsForLink,
