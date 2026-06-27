@@ -30,6 +30,7 @@ import {
   ACTION_REDIRECT_STATUS_HEADER,
   ACTION_REDIRECT_TYPE_HEADER,
   ACTION_REVALIDATED_HEADER,
+  VINEXT_ACTION_BODY_HEADER,
 } from "./headers.js";
 import {
   VINEXT_RSC_CONTENT_TYPE,
@@ -52,7 +53,11 @@ import {
   parseNextHttpErrorDigest,
   parseNextRedirectDigest,
 } from "./next-error-digest.js";
-import { validateCsrfOrigin, validateServerActionPayload } from "./request-pipeline.js";
+import {
+  readRawNodeRequestBytes,
+  validateCsrfOrigin,
+  validateServerActionPayload,
+} from "./request-pipeline.js";
 import { readStreamAsTextWithLimit } from "../utils/text-stream.js";
 import {
   createServerActionNotFoundResponse,
@@ -567,11 +572,42 @@ function validateServerActionArgs(args: readonly unknown[]): void {
   }
 }
 
+function decodeBase64Utf8(value: string): string {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new TextDecoder().decode(bytes);
+}
+
 export async function readActionBodyWithLimit(request: Request, maxBytes: number): Promise<string> {
-  if (!request.body) return "";
-  return readStreamAsTextWithLimit(request.body, maxBytes, () => {
-    throw new Error("Request body too large");
-  });
+  const actionBodyHeader =
+    process.env.NODE_ENV === "production" ? null : request.headers.get(VINEXT_ACTION_BODY_HEADER);
+  if (actionBodyHeader) {
+    const restored = decodeBase64Utf8(actionBodyHeader);
+    if (new TextEncoder().encode(restored).byteLength > maxBytes) {
+      throw new Error("Request body too large");
+    }
+    return restored;
+  }
+
+  const contentLength = Number(request.headers.get("content-length") ?? "0");
+  if (request.body && !request.bodyUsed) {
+    const body = await readStreamAsTextWithLimit(request.body, maxBytes, () => {
+      throw new Error("Request body too large");
+    });
+    if (body.length > 0 || contentLength === 0) return body;
+  }
+
+  if (contentLength > 0) {
+    const rawBody = await readRawNodeRequestBytes(request, maxBytes);
+    if (rawBody !== null && rawBody.byteLength > 0) {
+      return new TextDecoder().decode(rawBody);
+    }
+  }
+
+  return "";
 }
 
 export async function readActionFormDataWithLimit(

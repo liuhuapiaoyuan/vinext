@@ -916,6 +916,59 @@ describe("bufferRequestBodyForHeaderClone", () => {
     expect(await cloned.text()).toBe(payload);
   });
 
+  it("keeps the original request when a foreign clone reads an empty body", async () => {
+    const original = new Request("http://localhost/action", {
+      method: "POST",
+      headers: {
+        "content-length": "2",
+        "content-type": "text/plain;charset=UTF-8",
+        "next-action": "/app/actions.ts#getData",
+      },
+      body: "[]",
+    });
+    Object.defineProperty(original, "clone", {
+      value: () =>
+        new Request("http://localhost/action", {
+          method: "POST",
+          headers: original.headers,
+          body: "",
+        }),
+    });
+
+    const buffered = await bufferRequestBodyForHeaderClone(original);
+
+    expect(buffered).toBe(original);
+    expect(await original.text()).toBe("[]");
+  });
+
+  it("materializes srvx NodeRequest bodies from the raw request stream", async () => {
+    const rawRequest = {
+      async *[Symbol.asyncIterator]() {
+        yield new TextEncoder().encode("[]");
+      },
+    };
+    const original = new Request("http://localhost/action", {
+      method: "POST",
+      headers: {
+        "content-length": "2",
+        "content-type": "text/plain;charset=UTF-8",
+        "next-action": "/app/actions.ts#getData",
+      },
+      body: "",
+    });
+    Object.defineProperty(original, "_request", {
+      value: rawRequest,
+      enumerable: true,
+      configurable: true,
+    });
+
+    const buffered = await bufferRequestBodyForHeaderClone(original);
+
+    expect(buffered).not.toBe(original);
+    expect(Reflect.get(buffered, "_request")).toBe(rawRequest);
+    expect(await buffered.text()).toBe("[]");
+  });
+
   it("leaves GET requests untouched", async () => {
     const original = new Request("http://localhost/page", { method: "GET" });
     const buffered = await bufferRequestBodyForHeaderClone(original);
@@ -983,6 +1036,17 @@ describe("cloneRequestWithHeaders", () => {
     expect(cloned.method).toBe("POST");
     const text = await cloned.text();
     expect(text).toBe(bodyText);
+  });
+
+  it("does not consume the original body when replacing headers", async () => {
+    const original = new Request("http://localhost", {
+      method: "POST",
+      body: "hello world",
+    });
+    const cloned = cloneRequestWithHeaders(original, new Headers({ "x-foo": "bar" }));
+
+    await expect(cloned.text()).resolves.toBe("hello world");
+    await expect(original.text()).resolves.toBe("hello world");
   });
 
   it("preserves cf property when defined via Object.defineProperty", () => {
@@ -1072,6 +1136,17 @@ describe("cloneRequestWithUrl", () => {
     expect(cloned.url).toBe("http://localhost/path");
     const text = await cloned.text();
     expect(text).toBe(bodyText);
+  });
+
+  it("does not consume the original body when overriding the URL", async () => {
+    const original = new Request("http://localhost/path?_rsc=abc", {
+      method: "POST",
+      body: "payload",
+    });
+    const cloned = cloneRequestWithUrl(original, "http://localhost/path");
+
+    await expect(cloned.text()).resolves.toBe("payload");
+    await expect(original.text()).resolves.toBe("payload");
   });
 
   it("preserves redirect mode", () => {

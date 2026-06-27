@@ -27,6 +27,7 @@ import {
   ACTION_REDIRECT_HEADER,
   ACTION_REDIRECT_STATUS_HEADER,
   ACTION_REDIRECT_TYPE_HEADER,
+  VINEXT_ACTION_BODY_HEADER,
 } from "./headers.js";
 
 type ServerActionResult = AppBrowserServerActionResult<AppWireElements>;
@@ -120,6 +121,14 @@ class ServerActionRedirectError extends Error {
   }
 }
 
+function encodeActionBodyHeader(body: string): string | null {
+  const bytes = new TextEncoder().encode(body);
+  if (bytes.byteLength > 6000) return null;
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
 export async function invokeClientServerAction(
   id: string,
   args: unknown[],
@@ -139,6 +148,12 @@ export async function invokeClientServerAction(
     elements: actionInitiation.routerState.elements,
     previousNextUrl: actionInitiation.routerState.previousNextUrl,
   }).headers;
+  if (process.env.NODE_ENV !== "production" && typeof body === "string") {
+    const actionBodyHeader = encodeActionBodyHeader(body);
+    if (actionBodyHeader !== null) {
+      headers.set(VINEXT_ACTION_BODY_HEADER, actionBodyHeader);
+    }
+  }
   const fetchResponse = await fetch(createServerActionRequestUrl(actionInitiation.path), {
     method: "POST",
     headers,

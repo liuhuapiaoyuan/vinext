@@ -21,7 +21,10 @@ import {
   VINEXT_RSC_COMPATIBILITY_ID_HEADER,
   VINEXT_RSC_VARY_HEADER,
 } from "../packages/vinext/src/server/app-rsc-cache-busting.js";
-import { VINEXT_ACTION_LOG_HEADER } from "../packages/vinext/src/server/headers.js";
+import {
+  VINEXT_ACTION_BODY_HEADER,
+  VINEXT_ACTION_LOG_HEADER,
+} from "../packages/vinext/src/server/headers.js";
 import { parseServerActionLogHeader } from "../packages/vinext/src/server/server-action-logger.js";
 import {
   getAndClearActionRevalidationKind,
@@ -371,6 +374,39 @@ describe("app server action execution helpers", () => {
     await expect(readActionBodyWithLimit(oversizedRequest, 5)).rejects.toThrow(
       "Request body too large",
     );
+  });
+
+  it("restores small string action bodies from the fallback header", async () => {
+    const body = "[]";
+    const encoded = btoa(String.fromCharCode(...new TextEncoder().encode(body)));
+    const request = new Request("https://example.com/action", {
+      method: "POST",
+      headers: {
+        [VINEXT_ACTION_BODY_HEADER]: encoded,
+        "content-length": String(body.length),
+      },
+      body: "",
+    });
+
+    await expect(readActionBodyWithLimit(request, 5)).resolves.toBe(body);
+    await expect(readActionBodyWithLimit(request.clone(), 1)).rejects.toThrow(
+      "Request body too large",
+    );
+  });
+
+  it("ignores the fallback action body header in production", async () => {
+    await withEnvVar("NODE_ENV", "production", async () => {
+      const encoded = btoa("[]");
+      const request = new Request("https://example.com/action", {
+        method: "POST",
+        headers: {
+          [VINEXT_ACTION_BODY_HEADER]: encoded,
+        },
+        body: "real-body",
+      });
+
+      await expect(readActionBodyWithLimit(request, 32)).resolves.toBe("real-body");
+    });
   });
 
   it("rejects cloned streamed action text without waiting for the sibling branch", async () => {

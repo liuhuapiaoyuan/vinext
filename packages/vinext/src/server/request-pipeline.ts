@@ -605,6 +605,74 @@ function getRequestCf(request: Request): unknown {
   return cf === undefined ? undefined : cf;
 }
 
+function getRawNodeRequest(request: Request): unknown {
+  const raw = Reflect.get(request, "_request");
+  return raw === undefined ? undefined : raw;
+}
+
+function copyPrivateRequestMetadata(source: Request, target: Request): void {
+  const cf = getRequestCf(source);
+  if (cf !== undefined) {
+    // new Request() does not copy Workers-specific cf, so re-attach it.
+    Object.defineProperty(target, "cf", {
+      value: cf,
+      enumerable: true,
+      configurable: true,
+    });
+  }
+
+  const rawRequest = getRawNodeRequest(source);
+  if (rawRequest !== undefined) {
+    // srvx attaches the original Node request here. Preserve it so later
+    // fallbacks can still read from the runtime-native stream when needed.
+    Object.defineProperty(target, "_request", {
+      value: rawRequest,
+      enumerable: true,
+      configurable: true,
+    });
+  }
+}
+
+export async function readRawNodeRequestBytes(
+  request: Request,
+  maxBytes?: number,
+): Promise<Uint8Array | null> {
+  const rawRequest = getRawNodeRequest(request);
+  if (
+    !rawRequest ||
+    typeof rawRequest !== "object" ||
+    typeof (rawRequest as AsyncIterable<unknown>)[Symbol.asyncIterator] !== "function"
+  ) {
+    return null;
+  }
+
+  const encoder = new TextEncoder();
+  const chunks: Uint8Array[] = [];
+  let totalSize = 0;
+
+  for await (const chunk of rawRequest as AsyncIterable<unknown>) {
+    const bytes =
+      typeof chunk === "string"
+        ? encoder.encode(chunk)
+        : chunk instanceof Uint8Array
+          ? chunk
+          : new Uint8Array(chunk as ArrayBufferLike);
+    totalSize += bytes.byteLength;
+    if (maxBytes !== undefined && totalSize > maxBytes) {
+      throw new Error("Request body too large");
+    }
+    chunks.push(bytes);
+  }
+
+  const combined = new Uint8Array(totalSize);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return combined;
+}
+
 const METHODS_THAT_MAY_HAVE_BODY = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 /**
@@ -630,11 +698,20 @@ export async function bufferRequestBodyForHeaderClone(request: Request): Promise
     return request;
   }
   try {
-    const bytes = await request.arrayBuffer();
+    const contentLength = Number(request.headers.get("content-length") ?? "0");
+    const rawBytes = contentLength > 0 ? await readRawNodeRequestBytes(request) : null;
+    const bytes =
+      rawBytes && rawBytes.byteLength > 0
+        ? rawBytes
+        : new Uint8Array(await request.clone().arrayBuffer());
+    if (bytes.byteLength === 0 && contentLength > 0) {
+      return request;
+    }
+    const bodyBytes = Uint8Array.from(bytes);
     const init: RequestInitWithCf = {
       method: request.method,
       headers: request.headers,
-      body: bytes,
+      body: bodyBytes,
       redirect: request.redirect,
       referrer: request.referrer,
       referrerPolicy: request.referrerPolicy,
@@ -650,14 +727,7 @@ export async function bufferRequestBodyForHeaderClone(request: Request): Promise
       init.duplex = "half";
     }
     const buffered = new Request(request.url, init);
-    const cf = getRequestCf(request);
-    if (cf !== undefined) {
-      Object.defineProperty(buffered, "cf", {
-        value: cf,
-        enumerable: true,
-        configurable: true,
-      });
-    }
+    copyPrivateRequestMetadata(request, buffered);
     return buffered;
   } catch {
     return request;
@@ -675,12 +745,15 @@ export async function bufferRequestBodyForHeaderClone(request: Request): Promise
 export function cloneRequestWithHeaders(request: Request, headers: Headers): Request {
   let cloned: Request;
   try {
+    if (request.body) throw new Error("clone with body may drop stream");
     cloned = new Request(request, { headers });
   } catch {
+    const hasReadableBody = Boolean(request.body && !request.bodyUsed);
+    const bodySource = hasReadableBody ? request.clone() : request;
     const init: RequestInitWithCf = {
       method: request.method,
       headers,
-      body: request.body ?? undefined,
+      body: hasReadableBody ? (bodySource.body ?? undefined) : undefined,
       redirect: request.redirect,
       signal: request.signal,
       integrity: request.integrity,
@@ -690,21 +763,13 @@ export function cloneRequestWithHeaders(request: Request, headers: Headers): Req
       referrer: request.referrer,
       referrerPolicy: request.referrerPolicy,
     };
-    if (request.body) {
+    if (hasReadableBody) {
       // @ts-expect-error — duplex needed for streaming request bodies
       init.duplex = "half";
     }
     cloned = new Request(request.url, init);
   }
-  const cf = getRequestCf(request);
-  if (cf !== undefined) {
-    // new Request() does not copy Workers-specific cf, so re-attach it.
-    Object.defineProperty(cloned, "cf", {
-      value: cf,
-      enumerable: true,
-      configurable: true,
-    });
-  }
+  copyPrivateRequestMetadata(request, cloned);
   return cloned;
 }
 
@@ -723,12 +788,15 @@ export function cloneRequestWithHeaders(request: Request, headers: Headers): Req
 export function cloneRequestWithUrl(request: Request, url: string): Request {
   let cloned: Request;
   try {
+    if (request.body) throw new Error("clone with body may drop stream");
     cloned = new Request(url, request);
   } catch {
+    const hasReadableBody = Boolean(request.body && !request.bodyUsed);
+    const bodySource = hasReadableBody ? request.clone() : request;
     const init: RequestInitWithCf = {
       method: request.method,
       headers: request.headers,
-      body: request.body ?? undefined,
+      body: hasReadableBody ? (bodySource.body ?? undefined) : undefined,
       redirect: request.redirect,
       signal: request.signal,
       integrity: request.integrity,
@@ -738,20 +806,12 @@ export function cloneRequestWithUrl(request: Request, url: string): Request {
       referrer: request.referrer,
       referrerPolicy: request.referrerPolicy,
     };
-    if (request.body) {
+    if (hasReadableBody) {
       // @ts-expect-error — duplex needed for streaming request bodies
       init.duplex = "half";
     }
     cloned = new Request(url, init);
   }
-  const cf = getRequestCf(request);
-  if (cf !== undefined) {
-    // new Request() does not copy Workers-specific cf, so re-attach it.
-    Object.defineProperty(cloned, "cf", {
-      value: cf,
-      enumerable: true,
-      configurable: true,
-    });
-  }
+  copyPrivateRequestMetadata(request, cloned);
   return cloned;
 }

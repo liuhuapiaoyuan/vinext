@@ -34,6 +34,9 @@ export const VINEXT_TIMING_HEADER = "x-vinext-timing";
 /** Dev-only server action log payload (JSON). Stripped before the response reaches the client. */
 export const VINEXT_ACTION_LOG_HEADER = "x-vinext-action-log";
 
+/** Small string Server Action body side-channel used when dev Request cloning drops the stream. */
+export const VINEXT_ACTION_BODY_HEADER = "x-vinext-action-body";
+
 export {
   VINEXT_MW_CTX_HEADER,
   VINEXT_PRERENDER_ROUTE_PARAMS_HEADER,

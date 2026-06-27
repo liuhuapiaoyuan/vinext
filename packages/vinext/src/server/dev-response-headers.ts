@@ -85,6 +85,16 @@ export function interceptDevResponseHeaders(
     return origSetHeader(name, value);
   };
 
+  const origAppendHeader = res.appendHeader?.bind(res);
+  if (origAppendHeader) {
+    res.appendHeader = function (name, value) {
+      if (consumeDevInternalHeader(String(name), value, reqStart, metrics)) {
+        return res;
+      }
+      return origAppendHeader(name, value);
+    };
+  }
+
   const origWriteHead = res.writeHead.bind(res);
   // oxlint-disable-next-line typescript/no-explicit-any
   res.writeHead = function (statusCode, ...args: any[]) {

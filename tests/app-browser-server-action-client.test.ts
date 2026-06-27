@@ -7,7 +7,10 @@ import {
   AppElementsWire,
   normalizeAppElements,
 } from "../packages/vinext/src/server/app-elements.js";
-import { ACTION_REDIRECT_HEADER } from "../packages/vinext/src/server/headers.js";
+import {
+  ACTION_REDIRECT_HEADER,
+  VINEXT_ACTION_BODY_HEADER,
+} from "../packages/vinext/src/server/headers.js";
 import { navigationPlanner } from "../packages/vinext/src/server/navigation-planner.js";
 
 vi.mock("@vitejs/plugin-rsc/browser", () => ({
@@ -85,6 +88,10 @@ describe("app browser server action client", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       "/original?tab=1",
       expect.objectContaining({ method: "POST" }),
+    );
+    const [, init] = fetchMock.mock.calls[0];
+    expect((init.headers as Headers).get(VINEXT_ACTION_BODY_HEADER)).toBe(
+      btoa("encoded-action-args"),
     );
   });
 });

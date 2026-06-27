@@ -26,6 +26,19 @@ function createMockResponse(): ServerResponse & {
       : (value as string | number);
     return res;
   }) as typeof res.setHeader;
+  res.appendHeader = ((name: string, value: string | number | readonly string[]) => {
+    const key = name.toLowerCase();
+    const existing = forwardedHeaders[key];
+    const values = Array.isArray(value) ? [...value] : [value as string | number];
+    if (existing === undefined) {
+      forwardedHeaders[key] = values.length === 1 ? values[0]! : values;
+    } else if (Array.isArray(existing)) {
+      forwardedHeaders[key] = [...existing, ...values];
+    } else {
+      forwardedHeaders[key] = [existing, ...values];
+    }
+    return res;
+  }) as typeof res.appendHeader;
   res.writeHead = ((statusCode: number, maybeHeaders?: Record<string, string>) => {
     res.statusCode = statusCode;
     if (maybeHeaders) {
@@ -66,6 +79,26 @@ describe("dev-response-headers", () => {
     });
     expect(res.forwardedHeaders).toEqual({
       "content-type": "text/html",
+    });
+  });
+
+  it("strips internal dev headers written through appendHeader", () => {
+    const reqStart = 100;
+    const metrics = {};
+    const res = createMockResponse();
+    interceptDevResponseHeaders(res, reqStart, metrics);
+
+    res.appendHeader(
+      VINEXT_ACTION_LOG_HEADER,
+      '{"functionName":"a","args":[],"location":"app/a.ts","duration":1}',
+    );
+    res.appendHeader("vary", "RSC");
+
+    expect(metrics).toEqual({
+      actionLogRaw: '{"functionName":"a","args":[],"location":"app/a.ts","duration":1}',
+    });
+    expect(res.forwardedHeaders).toEqual({
+      vary: "RSC",
     });
   });
 
