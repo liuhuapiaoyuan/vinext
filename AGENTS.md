@@ -28,6 +28,10 @@ pnpm run fmt:check                               # oxfmt (check only, no writes)
 pnpm run build                                   # Build the vinext package (via vp pack)
 ```
 
+```bash
+vp exec changeset publish
+```
+
 ### Project Structure
 
 ```

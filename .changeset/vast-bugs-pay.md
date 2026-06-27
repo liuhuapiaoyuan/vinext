@@ -1,5 +1,0 @@
----
-"@qzsy/vinext": major
----
-
-update

@@ -1,6 +1,6 @@
 {
   "name": "@qzsy/vinext",
-  "version": "0.1.123",
+  "version": "0.1.80",
   "description": "Run Next.js apps on Vite. Drop-in replacement for the next CLI.",
   "license": "MIT",
   "repository": {
@@ -95,7 +95,7 @@
   },
   "scripts": {
     "build": "vp pack",
-    "prepack": "cp ../../README.md README.md && vp run build",
+    "prepack": "node --input-type=module -e \"import { copyFileSync } from 'node:fs'; copyFileSync('../../README.md','README.md');\" && vp run build",
     "dev": "vp pack --watch"
   },
   "dependencies": {
