@@ -53,8 +53,73 @@ describe("server-action-logger", () => {
     const headers = new Headers();
     applyServerActionLogHeader(headers, info);
 
-    expect(headers.get(VINEXT_ACTION_LOG_HEADER)).toBe(serializeServerActionLogHeader(info));
-    expect(parseServerActionLogHeader(headers.get(VINEXT_ACTION_LOG_HEADER)!)).toEqual(info);
+    const headerValue = headers.get(VINEXT_ACTION_LOG_HEADER)!;
+    expect(headerValue).toBe(serializeServerActionLogHeader(info));
+    expect(parseServerActionLogHeader(headerValue)).toEqual(info);
+  });
+
+  it("accepts non-ASCII args in HTTP headers via base64 encoding", () => {
+    const info = {
+      functionName: "getPendingAdminMandatoryAnnouncements",
+      args: [{ title: "系统公告" }],
+      location: "src/sys-announcement/actions.ts",
+      duration: 2,
+    };
+
+    const headers = new Headers();
+    expect(() => applyServerActionLogHeader(headers, info)).not.toThrow();
+
+    const parsed = parseServerActionLogHeader(headers.get(VINEXT_ACTION_LOG_HEADER)!);
+    expect(parsed).toMatchObject({
+      functionName: "getPendingAdminMandatoryAnnouncements",
+      args: [{ title: "系统公告" }],
+      location: "src/sys-announcement/actions.ts",
+      duration: 2,
+    });
+  });
+
+  it("truncates long string arguments in dev logs", () => {
+    const longText = "中".repeat(200);
+    const formatted = formatActionArgs([longText]);
+    expect(formatted.length).toBeLessThan(longText.length + 10);
+    expect(formatted).toContain("...");
+  });
+
+  it("keeps leading arg content when the header payload exceeds the budget", () => {
+    const hugeArgs = Array.from({ length: 20 }, (_, i) => ({
+      id: i,
+      title: `公告-${"中".repeat(100)}-${i}`,
+      payload: "x".repeat(500),
+    }));
+
+    const info = {
+      functionName: "bulkAction",
+      args: hugeArgs,
+      location: "app/actions.ts",
+      duration: 5,
+    };
+
+    const headers = new Headers();
+    expect(() => applyServerActionLogHeader(headers, info)).not.toThrow();
+
+    const parsed = parseServerActionLogHeader(headers.get(VINEXT_ACTION_LOG_HEADER)!);
+    expect(parsed?.functionName).toBe("bulkAction");
+    expect(parsed?.args.length).toBeGreaterThan(0);
+    expect(parsed?.args).not.toEqual(["..."]);
+
+    const formatted = formatActionArgs(parsed!.args);
+    expect(formatted).toContain("公告");
+    expect(formatted).toContain("...");
+  });
+
+  it("still parses legacy raw JSON action log headers", () => {
+    const legacy = '{"functionName":"a","args":[],"location":"app/a.ts","duration":1}';
+    expect(parseServerActionLogHeader(legacy)).toEqual({
+      functionName: "a",
+      args: [],
+      location: "app/a.ts",
+      duration: 1,
+    });
   });
 
   it("creates log info only in development", () => {

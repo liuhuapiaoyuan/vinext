@@ -20,8 +20,153 @@ export type ServerActionLogInfo = {
   duration: number;
 };
 
+/** Max characters per string arg in dev action logs. */
+const MAX_ARG_STRING_LENGTH = 80;
+
+/** Max UTF-8 bytes for the JSON payload before base64 encoding. */
+const MAX_HEADER_JSON_BYTES = 2048;
+
 const INLINE_ACTION_PREFIXES = ["$$RSC_SERVER_ACTION_", "$$hoist_"] as const;
 const USE_CACHE_ACTION_PREFIX = "$$RSC_SERVER_CACHE_";
+
+function truncateString(value: string, maxLength = MAX_ARG_STRING_LENGTH): string {
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, maxLength)}...`;
+}
+
+/** Shrink args for dev logs and HTTP header transport. */
+type ArgSanitizeLimits = {
+  maxStringLength: number;
+  maxArrayItems: number;
+  maxObjectKeys: number;
+  maxDepth: number;
+};
+
+const DEFAULT_ARG_SANITIZE_LIMITS: ArgSanitizeLimits = {
+  maxStringLength: MAX_ARG_STRING_LENGTH,
+  maxArrayItems: 3,
+  maxObjectKeys: 3,
+  maxDepth: 2,
+};
+
+function sanitizeArgForLog(
+  arg: unknown,
+  depth = 0,
+  limits: ArgSanitizeLimits = DEFAULT_ARG_SANITIZE_LIMITS,
+): unknown {
+  if (arg === null || arg === undefined) return arg;
+  if (typeof arg === "string") return truncateString(arg, limits.maxStringLength);
+  if (typeof arg === "number" || typeof arg === "boolean" || typeof arg === "bigint") {
+    return arg;
+  }
+  if (typeof arg === "symbol") return String(arg);
+  if (typeof arg === "function") return "[Function]";
+
+  if (depth >= limits.maxDepth) return "[Object]";
+
+  if (Array.isArray(arg)) {
+    const items = arg
+      .slice(0, limits.maxArrayItems)
+      .map((item) => sanitizeArgForLog(item, depth + 1, limits));
+    if (arg.length > limits.maxArrayItems) items.push("...");
+    return items;
+  }
+
+  if (typeof arg === "object") {
+    try {
+      const entries = Object.entries(arg as Record<string, unknown>).slice(0, limits.maxObjectKeys);
+      const sanitized: Record<string, unknown> = {};
+      for (const [key, value] of entries) {
+        sanitized[key] = sanitizeArgForLog(value, depth + 1, limits);
+      }
+      if (Object.keys(arg as object).length > limits.maxObjectKeys) {
+        sanitized["..."] = "...";
+      }
+      return sanitized;
+    } catch {
+      return "[Object]";
+    }
+  }
+
+  try {
+    return truncateString(JSON.stringify(arg), limits.maxStringLength);
+  } catch {
+    return "[unserializable]";
+  }
+}
+
+function sanitizeArgsForLog(
+  args: unknown[],
+  limits: ArgSanitizeLimits = DEFAULT_ARG_SANITIZE_LIMITS,
+): unknown[] {
+  return args.map((arg) => sanitizeArgForLog(arg, 0, limits));
+}
+
+function headerJsonByteLength(info: ServerActionLogInfo): number {
+  return Buffer.byteLength(JSON.stringify(info), "utf8");
+}
+
+/** Keep as much leading arg content as possible while staying under the header budget. */
+function fitLogInfoForHeader(info: ServerActionLogInfo): ServerActionLogInfo {
+  const limits: ArgSanitizeLimits = { ...DEFAULT_ARG_SANITIZE_LIMITS };
+  let maxArgs = info.args.length;
+
+  while (true) {
+    const args = sanitizeArgsForLog(info.args.slice(0, maxArgs), limits);
+    if (maxArgs < info.args.length) {
+      args.push("...");
+    }
+
+    const candidate: ServerActionLogInfo = {
+      functionName: info.functionName,
+      args,
+      location: info.location,
+      duration: info.duration,
+    };
+
+    if (headerJsonByteLength(candidate) <= MAX_HEADER_JSON_BYTES) {
+      return candidate;
+    }
+
+    if (limits.maxStringLength > 16) {
+      limits.maxStringLength = Math.max(16, Math.floor(limits.maxStringLength / 2));
+      continue;
+    }
+    if (limits.maxArrayItems > 1) {
+      limits.maxArrayItems--;
+      continue;
+    }
+    if (limits.maxObjectKeys > 1) {
+      limits.maxObjectKeys--;
+      continue;
+    }
+    if (limits.maxDepth > 0) {
+      limits.maxDepth--;
+      continue;
+    }
+    if (maxArgs > 1) {
+      maxArgs--;
+      continue;
+    }
+    if (limits.maxStringLength > 1) {
+      limits.maxStringLength = Math.max(1, Math.floor(limits.maxStringLength / 2));
+      continue;
+    }
+
+    const firstArg = info.args[0];
+    const prefix =
+      typeof firstArg === "string"
+        ? truncateString(firstArg, 1)
+        : truncateString(formatArg(firstArg), 1);
+
+    return {
+      functionName: info.functionName,
+      args: [prefix, "..."],
+      location: info.location,
+      duration: info.duration,
+    };
+  }
+}
 
 export function isDevServerActionLoggingEnabled(): boolean {
   return process.env.NODE_ENV !== "production";
@@ -69,7 +214,7 @@ export function resolveServerActionLogMeta(
 function formatArg(arg: unknown, depth = 0): string {
   if (arg === null) return "null";
   if (arg === undefined) return "undefined";
-  if (typeof arg === "string") return JSON.stringify(arg);
+  if (typeof arg === "string") return JSON.stringify(truncateString(arg));
   if (typeof arg === "number" || typeof arg === "boolean" || typeof arg === "bigint") {
     return String(arg);
   }
@@ -109,13 +254,37 @@ export function formatActionArgs(args: unknown[]): string {
   return args.map((arg) => formatArg(arg)).join(", ");
 }
 
+function encodeHeaderPayload(json: string): string {
+  // HTTP header values must be ByteStrings; base64 keeps Unicode args transport-safe.
+  return Buffer.from(json, "utf8").toString("base64");
+}
+
+function decodeHeaderPayload(value: string): string {
+  // Backward compat: older vinext versions wrote raw JSON.
+  if (value.startsWith("{")) return value;
+  return Buffer.from(value, "base64").toString("utf8");
+}
+
+function prepareLogInfoForHeader(info: ServerActionLogInfo): ServerActionLogInfo {
+  const prepared: ServerActionLogInfo = {
+    ...info,
+    args: sanitizeArgsForLog(info.args),
+  };
+
+  if (headerJsonByteLength(prepared) <= MAX_HEADER_JSON_BYTES) {
+    return prepared;
+  }
+
+  return fitLogInfoForHeader(info);
+}
+
 export function serializeServerActionLogHeader(info: ServerActionLogInfo): string {
-  return JSON.stringify(info);
+  return encodeHeaderPayload(JSON.stringify(prepareLogInfoForHeader(info)));
 }
 
 export function parseServerActionLogHeader(value: string): ServerActionLogInfo | null {
   try {
-    const parsed = JSON.parse(value) as Partial<ServerActionLogInfo>;
+    const parsed = JSON.parse(decodeHeaderPayload(value)) as Partial<ServerActionLogInfo>;
     if (
       typeof parsed.functionName === "string" &&
       Array.isArray(parsed.args) &&
@@ -152,7 +321,7 @@ export function createServerActionLogInfo(options: {
 
   return {
     ...meta,
-    args: [...args],
+    args: sanitizeArgsForLog([...args]),
     duration: options.durationMs,
   };
 }
