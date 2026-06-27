@@ -49,6 +49,18 @@ const DEFAULT_ARG_SANITIZE_LIMITS: ArgSanitizeLimits = {
   maxDepth: 2,
 };
 
+function isPlainObject(value: object): boolean {
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+function describeOpaqueArg(arg: object): string {
+  if (Array.isArray(arg)) return `[Array(${arg.length})]`;
+  if (typeof FormData !== "undefined" && arg instanceof FormData) return "[FormData]";
+  if (typeof Blob !== "undefined" && arg instanceof Blob) return `[${arg.constructor.name}]`;
+  return `[${arg.constructor.name}]`;
+}
+
 function sanitizeArgForLog(
   arg: unknown,
   depth = 0,
@@ -73,6 +85,12 @@ function sanitizeArgForLog(
   }
 
   if (typeof arg === "object") {
+    // Flight decodeReply can return lazy values. Avoid Object.entries/getters on
+    // non-plain objects — dev logging must never materialize action args.
+    if (!isPlainObject(arg)) {
+      return describeOpaqueArg(arg);
+    }
+
     try {
       const entries = Object.entries(arg as Record<string, unknown>).slice(0, limits.maxObjectKeys);
       const sanitized: Record<string, unknown> = {};
@@ -93,6 +111,26 @@ function sanitizeArgForLog(
   } catch {
     return "[unserializable]";
   }
+}
+
+/** Snapshot args without spreading lazy Flight arrays or throwing on bad payloads. */
+function safeArgsSnapshotForLog(args: readonly unknown[]): unknown[] {
+  let length: number;
+  try {
+    length = args.length;
+  } catch {
+    return ["(args unavailable)"];
+  }
+
+  const snapshot: unknown[] = [];
+  for (let index = 0; index < length; index++) {
+    try {
+      snapshot.push(sanitizeArgForLog(args[index]));
+    } catch {
+      snapshot.push("(arg unavailable)");
+    }
+  }
+  return snapshot;
 }
 
 function sanitizeArgsForLog(
@@ -317,11 +355,20 @@ export function createServerActionLogInfo(options: {
   const meta = resolveServerActionLogMeta(options.actionId);
   if (!meta) return null;
 
-  const args = Array.isArray(options.args) ? options.args : [options.args];
+  try {
+    const args = Array.isArray(options.args) ? options.args : [options.args];
 
-  return {
-    ...meta,
-    args: sanitizeArgsForLog([...args]),
-    duration: options.durationMs,
-  };
+    return {
+      ...meta,
+      args: safeArgsSnapshotForLog(args),
+      duration: options.durationMs,
+    };
+  } catch {
+    // Dev logging must never break action responses.
+    return {
+      ...meta,
+      args: ["(args unavailable)"],
+      duration: options.durationMs,
+    };
+  }
 }

@@ -136,15 +136,66 @@ describe("server-action-logger", () => {
     withEnvVar("NODE_ENV", "development", () => {
       expect(
         createServerActionLogInfo({
-          actionId: "/app/actions.ts#successAction",
+          actionId: "/app/actions/actions.ts#successAction",
           args: [5],
           durationMs: 2,
         }),
       ).toEqual({
         functionName: "successAction",
         args: [5],
-        location: "app/actions.ts",
+        location: "app/actions/actions.ts",
         duration: 2,
+      });
+    });
+  });
+
+  it("does not throw when lazy Flight args fail to materialize for dev logs", () => {
+    const lazyArgs = new Proxy([] as unknown[], {
+      get(_target, prop) {
+        if (prop === "length") return 1;
+        if (prop === "0") {
+          throw new SyntaxError("JSON Parse error: Unexpected EOF");
+        }
+        return undefined;
+      },
+    });
+
+    withEnvVar("NODE_ENV", "development", () => {
+      expect(
+        createServerActionLogInfo({
+          actionId: "/app/user/products/user-shop-actions.ts#getUserEnterpriseWithShops",
+          args: lazyArgs,
+          durationMs: 2,
+        }),
+      ).toEqual({
+        functionName: "getUserEnterpriseWithShops",
+        args: ["(arg unavailable)"],
+        location: "app/user/products/user-shop-actions.ts",
+        duration: 2,
+      });
+    });
+  });
+
+  it("describes opaque Flight objects without traversing them", () => {
+    withEnvVar("NODE_ENV", "development", () => {
+      const opaque = new Proxy(
+        { secret: "lazy" },
+        {
+          ownKeys() {
+            throw new SyntaxError("JSON Parse error: Unexpected EOF");
+          },
+        },
+      );
+
+      expect(
+        createServerActionLogInfo({
+          actionId: "/app/actions.ts#loadData",
+          args: [opaque],
+          durationMs: 1,
+        }),
+      ).toMatchObject({
+        functionName: "loadData",
+        args: ["[Object]"],
       });
     });
   });

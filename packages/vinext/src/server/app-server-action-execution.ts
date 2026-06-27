@@ -1235,11 +1235,16 @@ export async function handleServerActionRscRequest<
       }
     } finally {
       if (shouldLogAction) {
-        actionLogInfo = createServerActionLogInfo({
-          actionId: options.actionId,
-          args,
-          durationMs: Math.round(performance.now() - actionLogStart),
-        });
+        try {
+          actionLogInfo = createServerActionLogInfo({
+            actionId: options.actionId,
+            args,
+            durationMs: Math.round(performance.now() - actionLogStart),
+          });
+        } catch {
+          // Dev logging must never break action responses.
+          actionLogInfo = null;
+        }
       }
       options.setHeadersAccessPhase(previousHeadersPhase);
       if (actionThrew && !actionWasForwarded) rootParamsUsage.transitionToRender();

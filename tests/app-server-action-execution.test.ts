@@ -1268,6 +1268,47 @@ describe("app server action execution helpers", () => {
     });
   });
 
+  it("does not fail fetch actions when dev log arg snapshots throw", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const lazyArgs = new Proxy([] as unknown[], {
+      get(_target, prop) {
+        if (prop === "length") return 0;
+        if (prop === Symbol.iterator) {
+          throw new SyntaxError("JSON Parse error: Unexpected EOF");
+        }
+        return undefined;
+      },
+    });
+
+    await withEnvVar("NODE_ENV", "development", async () => {
+      const response = await handleServerActionRscRequest(
+        createRscOptions({
+          actionId: "/app/user/products/user-shop-actions.ts#getUserEnterpriseWithShops",
+          decodeReply() {
+            return Promise.resolve(lazyArgs);
+          },
+          loadServerAction() {
+            return Promise.resolve(() => "ok");
+          },
+          renderToReadableStream() {
+            return new Response("flight-payload").body;
+          },
+        }),
+      );
+
+      expect(response?.status).toBe(200);
+      expect(parseServerActionLogHeader(response?.headers.get(VINEXT_ACTION_LOG_HEADER)!)).toEqual({
+        functionName: "getUserEnterpriseWithShops",
+        args: [],
+        location: "app/user/products/user-shop-actions.ts",
+        duration: expect.any(Number),
+      });
+    });
+
+    expect(errorSpy).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+
   // Ported from Next.js: test/e2e/app-dir/app-root-params-getters/simple.test.ts
   // https://github.com/vercel/next.js/blob/v16.2.6/test/e2e/app-dir/app-root-params-getters/simple.test.ts
   it("rejects next/root-params inside fetch server actions", async () => {
