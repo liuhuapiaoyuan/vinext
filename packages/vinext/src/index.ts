@@ -143,7 +143,7 @@ import { createOgInlineFetchAssetsPlugin, createOgAssetsPlugin } from "./plugins
 import { generateRouteTypes } from "./typegen.js";
 import {
   mergeOptimizeDepsInclude,
-  VINEXT_CLIENT_OPTIMIZE_DEPS_INCLUDE,
+  resolveClientOptimizeDepsInclude,
 } from "./plugins/client-optimize-deps-include.js";
 import {
   mergeOptimizeDepsExclude,
@@ -2574,14 +2574,16 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 entries: optimizeEntries,
                 // React packages aren't crawled from app/ source files,
                 // so must be pre-included to avoid late discovery (#25).
-                include: mergeOptimizeDepsInclude(incomingInclude, [
-                  "react",
-                  "react-dom",
-                  "react-dom/client",
-                  "react/jsx-runtime",
-                  "react/jsx-dev-runtime",
-                  ...VINEXT_CLIENT_OPTIMIZE_DEPS_INCLUDE,
-                ]),
+                include: mergeOptimizeDepsInclude(
+                  incomingInclude,
+                  resolveClientOptimizeDepsInclude(root, [
+                    "react",
+                    "react-dom",
+                    "react-dom/client",
+                    "react/jsx-runtime",
+                    "react/jsx-dev-runtime",
+                  ]),
+                ),
               },
               build: {
                 // Production App Router rendering needs Vite's client manifest
