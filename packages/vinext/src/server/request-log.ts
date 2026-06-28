@@ -13,17 +13,25 @@
  */
 
 import { formatActionArgs, type ServerActionLogInfo } from "./server-action-logger.js";
-import { locationToTerminalFileUrl, terminalHyperlink } from "./terminal-link.js";
+import {
+  locationToTerminalFileUrl,
+  shouldUseTerminalFormat,
+  terminalHyperlink,
+} from "./terminal-link.js";
 
-const isTTY = () => process.stdout.isTTY;
+function colorize(code: string, text: string): string {
+  return shouldUseTerminalFormat() ? `\x1b[${code}m${text}\x1b[0m` : text;
+}
+
 const pretty = {
-  bold: (s: string) => (isTTY() ? `\x1b[1m${s}\x1b[0m` : s),
-  green: (s: string) => (isTTY() ? `\x1b[32m${s}\x1b[0m` : s),
-  cyan: (s: string) => (isTTY() ? `\x1b[36m${s}\x1b[0m` : s),
-  blue: (s: string) => (isTTY() ? `\x1b[34m${s}\x1b[0m` : s),
-  yellow: (s: string) => (isTTY() ? `\x1b[33m${s}\x1b[0m` : s),
-  red: (s: string) => (isTTY() ? `\x1b[31m${s}\x1b[0m` : s),
-  dim: (s: string) => (isTTY() ? `\x1b[2m${s}\x1b[0m` : s),
+  bold: (s: string) => colorize("1", s),
+  boldCyan: (s: string) => colorize("1;36", s),
+  green: (s: string) => colorize("32", s),
+  cyan: (s: string) => colorize("36", s),
+  blue: (s: string) => colorize("34", s),
+  yellow: (s: string) => colorize("33", s),
+  red: (s: string) => colorize("31", s),
+  dim: (s: string) => colorize("2", s),
 };
 
 function colorStatus(status: number, text: string): string {
@@ -53,7 +61,7 @@ export type RequestLogOptions = {
 /** Print the nested server action log line under the request log. */
 export function logServerAction(info: ServerActionLogInfo, projectRoot = process.cwd()): void {
   const argsStr = formatActionArgs(info.args);
-  const fnCall = `${pretty.bold(pretty.cyan(info.functionName))}${pretty.dim(`(${argsStr})`)}`;
+  const fnCall = `${pretty.boldCyan(info.functionName)}${pretty.dim(`(${argsStr})`)}`;
   const duration = `${pretty.dim("in")} ${pretty.yellow(`${info.duration}ms`)}`;
   const fileUrl = locationToTerminalFileUrl(info.location, projectRoot);
   const locationLabel = fileUrl

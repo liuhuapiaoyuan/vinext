@@ -7,10 +7,7 @@ const OSC8_END = "\x1b\\";
 /** Characters that break VS Code/Cursor terminal path detection without OSC 8. */
 const TERMINAL_URL_ESCAPE = /[()[\] ]/g;
 
-export function supportsTerminalHyperlinks(): boolean {
-  if (process.env.FORCE_HYPERLINK === "0") return false;
-  if (process.env.FORCE_HYPERLINK === "1") return true;
-  if (!process.stdout.isTTY) return false;
+function isKnownInteractiveTerminal(): boolean {
   if (process.env.TERM_PROGRAM === "vscode") return true;
   if (process.env.WT_SESSION) return true;
   if (process.env.ITERM_SESSION_ID) return true;
@@ -18,8 +15,35 @@ export function supportsTerminalHyperlinks(): boolean {
   if (process.env.KITTY_WINDOW_ID) return true;
   if (process.env.VTE_VERSION) return true;
   const term = process.env.TERM ?? "";
-  if (term.includes("alacritty") || term.includes("ghostty")) return true;
+  return term.includes("alacritty") || term.includes("ghostty");
+}
+
+/**
+ * Whether ANSI colors and OSC 8 hyperlinks should be emitted.
+ *
+ * Turbo/pnpm prefix child output (`admin:dev:`) so `stdout.isTTY` is often false
+ * even though the integrated terminal still renders escape codes.
+ */
+export function shouldUseTerminalFormat(): boolean {
+  if (process.env.FORCE_COLOR === "0") return false;
+  if (process.env.FORCE_COLOR !== undefined && process.env.FORCE_COLOR !== "0") return true;
+  if (
+    process.env.NO_COLOR !== undefined &&
+    process.env.NO_COLOR !== "" &&
+    process.env.NO_COLOR !== "0"
+  ) {
+    return false;
+  }
+  if (isKnownInteractiveTerminal()) return true;
+  if (process.stdout.isTTY) return true;
+  if (process.stderr.isTTY) return true;
   return false;
+}
+
+export function supportsTerminalHyperlinks(): boolean {
+  if (process.env.FORCE_HYPERLINK === "0") return false;
+  if (process.env.FORCE_HYPERLINK === "1") return true;
+  return shouldUseTerminalFormat();
 }
 
 function escapeTerminalUrl(url: string): string {

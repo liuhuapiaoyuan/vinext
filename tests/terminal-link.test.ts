@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import {
   locationToTerminalFileUrl,
+  shouldUseTerminalFormat,
   supportsTerminalHyperlinks,
   terminalHyperlink,
 } from "../packages/vinext/src/server/terminal-link.js";
@@ -52,14 +53,31 @@ describe("terminal-link", () => {
     });
   });
 
-  it("detects VS Code integrated terminal", () => {
-    vi.stubEnv("FORCE_HYPERLINK", undefined);
+  it("detects VS Code integrated terminal even when stdout is piped", () => {
+    vi.stubEnv("FORCE_COLOR", undefined);
+    vi.stubEnv("NO_COLOR", undefined);
     vi.stubEnv("TERM_PROGRAM", "vscode");
-    Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+    Object.defineProperty(process.stdout, "isTTY", { value: false, configurable: true });
+    Object.defineProperty(process.stderr, "isTTY", { value: false, configurable: true });
     try {
+      expect(shouldUseTerminalFormat()).toBe(true);
       expect(supportsTerminalHyperlinks()).toBe(true);
     } finally {
       delete (process.stdout as { isTTY?: boolean }).isTTY;
+      delete (process.stderr as { isTTY?: boolean }).isTTY;
     }
+  });
+
+  it("respects FORCE_COLOR when turbo/pnpm pipes stdout", () => {
+    withEnvVar("NO_COLOR", undefined, () => {
+      withEnvVar("FORCE_COLOR", "1", () => {
+        Object.defineProperty(process.stdout, "isTTY", { value: false, configurable: true });
+        try {
+          expect(shouldUseTerminalFormat()).toBe(true);
+        } finally {
+          delete (process.stdout as { isTTY?: boolean }).isTTY;
+        }
+      });
+    });
   });
 });
