@@ -13,12 +13,14 @@
  */
 
 import { formatActionArgs, type ServerActionLogInfo } from "./server-action-logger.js";
+import { locationToTerminalFileUrl, terminalHyperlink } from "./terminal-link.js";
 
 const isTTY = () => process.stdout.isTTY;
 const pretty = {
   bold: (s: string) => (isTTY() ? `\x1b[1m${s}\x1b[0m` : s),
   green: (s: string) => (isTTY() ? `\x1b[32m${s}\x1b[0m` : s),
   cyan: (s: string) => (isTTY() ? `\x1b[36m${s}\x1b[0m` : s),
+  blue: (s: string) => (isTTY() ? `\x1b[34m${s}\x1b[0m` : s),
   yellow: (s: string) => (isTTY() ? `\x1b[33m${s}\x1b[0m` : s),
   red: (s: string) => (isTTY() ? `\x1b[31m${s}\x1b[0m` : s),
   dim: (s: string) => (isTTY() ? `\x1b[2m${s}\x1b[0m` : s),
@@ -49,11 +51,16 @@ export type RequestLogOptions = {
 };
 
 /** Print the nested server action log line under the request log. */
-export function logServerAction(info: ServerActionLogInfo): void {
+export function logServerAction(info: ServerActionLogInfo, projectRoot = process.cwd()): void {
   const argsStr = formatActionArgs(info.args);
-  process.stdout.write(
-    ` └─ ƒ ${info.functionName}(${argsStr}) in ${info.duration}ms ${info.location}\n`,
-  );
+  const fnCall = `${pretty.bold(pretty.cyan(info.functionName))}${pretty.dim(`(${argsStr})`)}`;
+  const duration = `${pretty.dim("in")} ${pretty.yellow(`${info.duration}ms`)}`;
+  const fileUrl = locationToTerminalFileUrl(info.location, projectRoot);
+  const locationLabel = fileUrl
+    ? terminalHyperlink(pretty.blue(info.location), fileUrl)
+    : pretty.blue(info.location);
+
+  process.stdout.write(`${pretty.dim(" └─ ƒ")} ${fnCall} ${duration} ${locationLabel}\n`);
 }
 
 /**

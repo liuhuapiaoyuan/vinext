@@ -124,7 +124,7 @@ export function flushDevRequestLogs(
 
   const actionLog = metrics.actionLogRaw ? parseServerActionLogHeader(metrics.actionLogRaw) : null;
   if (actionLog) {
-    logServerAction(withServerActionSourceLocation(actionLog, projectRoot));
+    logServerAction(withServerActionSourceLocation(actionLog, projectRoot), projectRoot);
   }
 }
 
