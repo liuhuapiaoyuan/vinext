@@ -18,8 +18,16 @@ function isKnownInteractiveTerminal(): boolean {
   return term.includes("alacritty") || term.includes("ghostty");
 }
 
+function isLikelyCursor(): boolean {
+  return (
+    process.env.CURSOR_TRACE_ID !== undefined ||
+    process.env.CURSOR_SESSION_ID !== undefined ||
+    process.env.VSCODE_GIT_ASKPASS_MAIN?.includes("cursor") === true
+  );
+}
+
 /**
- * Whether ANSI colors and OSC 8 hyperlinks should be emitted.
+ * Whether ANSI colors should be emitted.
  *
  * Turbo/pnpm prefix child output (`admin:dev:`) so `stdout.isTTY` is often false
  * even though the integrated terminal still renders escape codes.
@@ -40,13 +48,21 @@ export function shouldUseTerminalFormat(): boolean {
   return false;
 }
 
-export function supportsTerminalHyperlinks(): boolean {
+/** Dev log hyperlinks: always emit unless explicitly disabled. */
+export function shouldEmitDevFileHyperlinks(): boolean {
   if (process.env.FORCE_HYPERLINK === "0") return false;
   if (process.env.FORCE_HYPERLINK === "1") return true;
+  // Turbo/pnpm pipe stdout but the integrated terminal still handles OSC 8.
+  if (process.env.NODE_ENV === "development") return true;
   return shouldUseTerminalFormat();
 }
 
-function escapeTerminalUrl(url: string): string {
+/** @deprecated Use shouldEmitDevFileHyperlinks for dev file links. */
+export function supportsTerminalHyperlinks(): boolean {
+  return shouldEmitDevFileHyperlinks();
+}
+
+function encodeTerminalUrl(url: string): string {
   return url.replace(
     TERMINAL_URL_ESCAPE,
     (char) => `%${char.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`,
@@ -67,7 +83,29 @@ function parseLocation(location: string): {
   };
 }
 
-/** Build a file:// URL for OSC 8 terminal hyperlinks (Ctrl+click in VS Code/Cursor). */
+function toPosixAbsolutePath(absolutePath: string): string {
+  const posix = absolutePath.replace(/\\/g, "/");
+  if (process.platform === "win32") {
+    return posix.replace(/^\/([A-Za-z]:)/, "$1");
+  }
+  return posix;
+}
+
+function resolveEditorLinkScheme(): "cursor" | "vscode" | "file" {
+  const forced = process.env.VINEXT_TERMINAL_LINK_SCHEME ?? process.env.FORCE_HYPERLINK_SCHEME;
+  if (forced === "cursor" || forced === "vscode" || forced === "file") return forced;
+  if (isLikelyCursor()) return "cursor";
+  if (process.env.TERM_PROGRAM === "vscode") return "vscode";
+  if (process.env.NODE_ENV === "development") return "vscode";
+  return "file";
+}
+
+/** Paths with these characters break VS Code native terminal link detection. */
+export function needsOsc8FileLink(location: string): boolean {
+  return /[()[\]]/.test(parseLocation(location).filePath);
+}
+
+/** Build an editor-aware URL for OSC 8 hyperlinks (Ctrl+click in VS Code/Cursor). */
 export function locationToTerminalFileUrl(location: string, projectRoot: string): string | null {
   try {
     const { filePath, line, column } = parseLocation(location);
@@ -76,19 +114,40 @@ export function locationToTerminalFileUrl(location: string, projectRoot: string)
       ? normalized
       : path.resolve(projectRoot, normalized);
 
-    let href = pathToFileURL(absolutePath).href;
-    href = escapeTerminalUrl(href);
-    if (line !== undefined) {
-      href += `:${line}:${column}`;
+    const scheme = resolveEditorLinkScheme();
+    if (scheme === "file") {
+      let href = pathToFileURL(absolutePath).href;
+      href = encodeTerminalUrl(href);
+      if (line !== undefined) href += `:${line}:${column}`;
+      return href;
     }
+
+    const encodedPath = encodeTerminalUrl(toPosixAbsolutePath(absolutePath));
+    let href = `${scheme}://file/${encodedPath}`;
+    if (line !== undefined) href += `:${line}:${column}`;
     return href;
   } catch {
     return null;
   }
 }
 
-/** Wrap visible text in an OSC 8 hyperlink when the terminal supports it. */
+/** Wrap visible text in an OSC 8 hyperlink. Link text must stay free of ANSI codes. */
 export function terminalHyperlink(text: string, url: string): string {
-  if (!supportsTerminalHyperlinks()) return text;
+  if (!shouldEmitDevFileHyperlinks()) return text;
   return `${OSC8}${url}${OSC8_END}${text}${OSC8}${OSC8_END}`;
+}
+
+/**
+ * Format a source location for terminal output.
+ *
+ * Clickability is prioritized: always emit OSC 8 with plain link text when a URL
+ * can be built. Uses cursor:// or vscode:// so paths with `(group)` / `[slug]`
+ * open correctly without changing terminal settings.
+ */
+export function formatTerminalLocationLabel(location: string, projectRoot: string): string {
+  const fileUrl = locationToTerminalFileUrl(location, projectRoot);
+  if (fileUrl) {
+    return terminalHyperlink(location, fileUrl);
+  }
+  return location;
 }

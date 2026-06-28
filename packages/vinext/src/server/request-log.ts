@@ -13,11 +13,7 @@
  */
 
 import { formatActionArgs, type ServerActionLogInfo } from "./server-action-logger.js";
-import {
-  locationToTerminalFileUrl,
-  shouldUseTerminalFormat,
-  terminalHyperlink,
-} from "./terminal-link.js";
+import { formatTerminalLocationLabel, shouldUseTerminalFormat } from "./terminal-link.js";
 
 function colorize(code: string, text: string): string {
   return shouldUseTerminalFormat() ? `\x1b[${code}m${text}\x1b[0m` : text;
@@ -28,7 +24,6 @@ const pretty = {
   boldCyan: (s: string) => colorize("1;36", s),
   green: (s: string) => colorize("32", s),
   cyan: (s: string) => colorize("36", s),
-  blue: (s: string) => colorize("34", s),
   yellow: (s: string) => colorize("33", s),
   red: (s: string) => colorize("31", s),
   dim: (s: string) => colorize("2", s),
@@ -63,10 +58,7 @@ export function logServerAction(info: ServerActionLogInfo, projectRoot = process
   const argsStr = formatActionArgs(info.args);
   const fnCall = `${pretty.boldCyan(info.functionName)}${pretty.dim(`(${argsStr})`)}`;
   const duration = `${pretty.dim("in")} ${pretty.yellow(`${info.duration}ms`)}`;
-  const fileUrl = locationToTerminalFileUrl(info.location, projectRoot);
-  const locationLabel = fileUrl
-    ? terminalHyperlink(pretty.blue(info.location), fileUrl)
-    : pretty.blue(info.location);
+  const locationLabel = formatTerminalLocationLabel(info.location, projectRoot);
 
   process.stdout.write(`${pretty.dim(" └─ ƒ")} ${fnCall} ${duration} ${locationLabel}\n`);
 }
