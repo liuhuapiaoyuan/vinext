@@ -1,3 +1,6 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { VINEXT_ACTION_LOG_HEADER } from "../packages/vinext/src/server/headers.js";
 import {
@@ -9,7 +12,22 @@ import {
   serializeServerActionLogHeader,
 } from "../packages/vinext/src/server/server-action-logger.js";
 import { logServerAction } from "../packages/vinext/src/server/request-log.js";
+import { resolveServerActionLogLocation } from "../packages/vinext/src/server/server-action-source-location.js";
 import { withEnvVar } from "./env-test-helpers.js";
+
+function withTempProject(files: Record<string, string>, run: (root: string) => void): void {
+  const root = mkdtempSync(path.join(tmpdir(), "vinext-action-log-"));
+  try {
+    for (const [relativePath, contents] of Object.entries(files)) {
+      const filePath = path.join(root, relativePath);
+      mkdirSync(path.dirname(filePath), { recursive: true });
+      writeFileSync(filePath, contents);
+    }
+    run(root);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
 
 describe("server-action-logger", () => {
   afterEach(() => {
@@ -40,6 +58,51 @@ describe("server-action-logger", () => {
     expect(formatActionArgs([5])).toBe("5");
     expect(formatActionArgs([1, 2, 3])).toBe("1, 2, 3");
     expect(formatActionArgs([{ name: "test", value: 42 }])).toBe('{"name":"test","value":42}');
+  });
+
+  it("resolves clickable source locations for common server action exports", () => {
+    withTempProject(
+      {
+        "app/actions.ts": [
+          '"use server";',
+          "export async function createOrder() {}",
+          "export const updateOrder = async () => {};",
+          "async function deleteOrder() {}",
+          "export { deleteOrder };",
+        ].join("\n"),
+      },
+      (root) => {
+        expect(
+          resolveServerActionLogLocation(
+            { functionName: "createOrder", location: "app/actions.ts" },
+            root,
+          ),
+        ).toBe("app/actions.ts:2:23");
+        expect(
+          resolveServerActionLogLocation(
+            { functionName: "updateOrder", location: "app/actions.ts" },
+            root,
+          ),
+        ).toBe("app/actions.ts:3:14");
+        expect(
+          resolveServerActionLogLocation(
+            { functionName: "deleteOrder", location: "app/actions.ts" },
+            root,
+          ),
+        ).toBe("app/actions.ts:4:16");
+      },
+    );
+  });
+
+  it("keeps the original action location when source lookup misses", () => {
+    withTempProject({}, (root) => {
+      expect(
+        resolveServerActionLogLocation(
+          { functionName: "missingAction", location: "app/missing-actions.ts" },
+          root,
+        ),
+      ).toBe("app/missing-actions.ts");
+    });
   });
 
   it("round-trips log payloads through the response header", () => {
@@ -206,10 +269,10 @@ describe("server-action-logger", () => {
     logServerAction({
       functionName: "successAction",
       args: [5],
-      location: "app/actions.ts",
+      location: "app/actions.ts:2:23",
       duration: 1,
     });
 
-    expect(writeSpy).toHaveBeenCalledWith(" └─ ƒ successAction(5) in 1ms app/actions.ts\n");
+    expect(writeSpy).toHaveBeenCalledWith(" └─ ƒ successAction(5) in 1ms app/actions.ts:2:23\n");
   });
 });

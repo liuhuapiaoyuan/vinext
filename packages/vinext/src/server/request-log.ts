@@ -52,7 +52,7 @@ export type RequestLogOptions = {
 export function logServerAction(info: ServerActionLogInfo): void {
   const argsStr = formatActionArgs(info.args);
   process.stdout.write(
-    ` └─ ƒ ${info.functionName}(${argsStr}) in ${info.duration}ms ${pretty.dim(info.location)}\n`,
+    ` └─ ƒ ${info.functionName}(${argsStr}) in ${info.duration}ms ${info.location}\n`,
   );
 }
 

@@ -3808,7 +3808,7 @@ export const loadServerActionClient = ${
           }
           // App Router request + server action logging in dev server.
           if (hasAppDir) {
-            installAppRouterDevRequestLogging(server.middlewares);
+            installAppRouterDevRequestLogging(server.middlewares, server.config.root);
           }
 
           const handlePagesMiddleware = async (

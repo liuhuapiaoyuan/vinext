@@ -10,6 +10,7 @@ import type { ServerResponse } from "node:http";
 import { VINEXT_ACTION_LOG_HEADER, VINEXT_TIMING_HEADER } from "./headers.js";
 import { logServerAction, logRequest, now, type RequestLogOptions } from "./request-log.js";
 import { parseServerActionLogHeader } from "./server-action-logger.js";
+import { withServerActionSourceLocation } from "./server-action-source-location.js";
 
 export type DevResponseMetrics = {
   compileMs?: number;
@@ -114,12 +115,16 @@ export function interceptDevResponseHeaders(
   };
 }
 
-export function flushDevRequestLogs(metrics: DevResponseMetrics, options: RequestLogOptions): void {
+export function flushDevRequestLogs(
+  metrics: DevResponseMetrics,
+  options: RequestLogOptions,
+  projectRoot = process.cwd(),
+): void {
   logRequest(options);
 
   const actionLog = metrics.actionLogRaw ? parseServerActionLogHeader(metrics.actionLogRaw) : null;
   if (actionLog) {
-    logServerAction(actionLog);
+    logServerAction(withServerActionSourceLocation(actionLog, projectRoot));
   }
 }
 
@@ -134,15 +139,18 @@ function shouldSkipDevRequestLogUrl(url: string): boolean {
 }
 
 /** Install App Router request + server action logging on the Vite dev server. */
-export function installAppRouterDevRequestLogging(middlewares: {
-  use: (
-    handler: (
-      req: import("node:http").IncomingMessage,
-      res: ServerResponse,
-      next: (err?: unknown) => void,
-    ) => void,
-  ) => void;
-}): void {
+export function installAppRouterDevRequestLogging(
+  middlewares: {
+    use: (
+      handler: (
+        req: import("node:http").IncomingMessage,
+        res: ServerResponse,
+        next: (err?: unknown) => void,
+      ) => void,
+    ) => void;
+  },
+  projectRoot = process.cwd(),
+): void {
   middlewares.use((req, res, next) => {
     const url = req.url ?? "/";
     if (shouldSkipDevRequestLogUrl(url)) {
@@ -163,14 +171,18 @@ export function installAppRouterDevRequestLogging(middlewares: {
             ? Math.max(0, Math.round(totalMs - metrics.compileMs))
             : undefined;
 
-      flushDevRequestLogs(metrics, {
-        method: req.method ?? "GET",
-        url: logUrl,
-        status: res.statusCode,
-        totalMs,
-        compileMs: metrics.compileMs,
-        renderMs: resolvedRenderMs,
-      });
+      flushDevRequestLogs(
+        metrics,
+        {
+          method: req.method ?? "GET",
+          url: logUrl,
+          status: res.statusCode,
+          totalMs,
+          compileMs: metrics.compileMs,
+          renderMs: resolvedRenderMs,
+        },
+        projectRoot,
+      );
     });
 
     next();
