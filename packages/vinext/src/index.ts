@@ -142,6 +142,10 @@ import { createDynamicPreloadMetadataPlugin } from "./plugins/dynamic-preload-me
 import { createOgInlineFetchAssetsPlugin, createOgAssetsPlugin } from "./plugins/og-assets.js";
 import { generateRouteTypes } from "./typegen.js";
 import {
+  mergeOptimizeDepsInclude,
+  VINEXT_CLIENT_OPTIMIZE_DEPS_INCLUDE,
+} from "./plugins/client-optimize-deps-include.js";
+import {
   mergeOptimizeDepsExclude,
   SSR_EXTERNAL_REACT_ENTRIES,
   VINEXT_OPTIMIZE_DEPS_EXCLUDE,
@@ -2570,16 +2574,14 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 entries: optimizeEntries,
                 // React packages aren't crawled from app/ source files,
                 // so must be pre-included to avoid late discovery (#25).
-                include: [
-                  ...new Set([
-                    ...incomingInclude,
-                    "react",
-                    "react-dom",
-                    "react-dom/client",
-                    "react/jsx-runtime",
-                    "react/jsx-dev-runtime",
-                  ]),
-                ],
+                include: mergeOptimizeDepsInclude(incomingInclude, [
+                  "react",
+                  "react-dom",
+                  "react-dom/client",
+                  "react/jsx-runtime",
+                  "react/jsx-dev-runtime",
+                  ...VINEXT_CLIENT_OPTIMIZE_DEPS_INCLUDE,
+                ]),
               },
               build: {
                 // Production App Router rendering needs Vite's client manifest

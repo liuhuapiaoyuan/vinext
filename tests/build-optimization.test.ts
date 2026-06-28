@@ -279,6 +279,10 @@ describe("optimizeDeps.exclude for vinext", () => {
       expect(clientInclude).toContain("some-lib");
       expect(clientInclude).toContain("react");
       expect(clientInclude).toContain("react-dom");
+      expect(clientInclude).toContain("next/dynamic");
+      expect(clientInclude).toContain("nuqs");
+      expect(clientInclude).toContain("better-auth/react");
+      expect(new Set(clientInclude).size).toBe(clientInclude.length);
     } finally {
       await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     }
