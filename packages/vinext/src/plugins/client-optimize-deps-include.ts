@@ -12,6 +12,19 @@ import path from "node:path";
 export const VINEXT_SHIM_OPTIMIZE_DEPS_INCLUDE = Object.freeze(["next/dynamic", "next/image"]);
 
 /**
+ * Runtime deps pulled by the `next/image` shim (`@unpic/react` for remote CDN
+ * transforms, `ipaddr.js` for private-IP validation). Pre-included on the
+ * client so first `<Image>` render does not trigger a dep-optimizer reload.
+ *
+ * SSR keeps `ipaddr.js` in `optimizeDeps.exclude` — it is externalized there
+ * and must not be pre-bundled into `deps_ssr/`.
+ */
+export const VINEXT_IMAGE_RUNTIME_OPTIMIZE_DEPS_INCLUDE = Object.freeze([
+  "@unpic/react",
+  "ipaddr.js",
+]);
+
+/**
  * Common client deps imported behind route boundaries, lazy client components,
  * or `next/dynamic()` / dynamic `import()` that static crawl misses.
  *
@@ -152,6 +165,36 @@ export function mergeOptimizeDepsInclude(
   return [...seen];
 }
 
+function getOptimizeDepsIncludeParent(entry: string): string | null {
+  if (!entry.includes("/")) return null;
+
+  if (entry.startsWith("@")) {
+    const secondSlash = entry.indexOf("/", entry.indexOf("/") + 1);
+    return secondSlash === -1 ? null : entry.slice(0, secondSlash);
+  }
+
+  const slashIndex = entry.indexOf("/");
+  return slashIndex === -1 ? null : entry.slice(0, slashIndex);
+}
+
+function canPrebundleOptimizeDepsEntry(projectRequire: NodeRequire, entry: string): boolean {
+  try {
+    projectRequire.resolve(entry);
+    return true;
+  } catch {
+    const parent = getOptimizeDepsIncludeParent(entry);
+    if (parent === null) return false;
+    try {
+      projectRequire.resolve(parent);
+      // Parent is installed — keep the subpath entry so Vite pre-bundles the
+      // deep import (e.g. lucide-react/dynamic) instead of discovering it late.
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
 export function filterInstalledOptimizeDepsInclude(
   projectRoot: string,
   entries: readonly string[],
@@ -168,13 +211,9 @@ export function filterInstalledOptimizeDepsInclude(
 
   for (const entry of entries) {
     if (seen.has(entry)) continue;
-    try {
-      projectRequire.resolve(entry);
-      seen.add(entry);
-      installed.push(entry);
-    } catch {
-      // Optional dep not installed in this project — skip pre-bundling.
-    }
+    if (!canPrebundleOptimizeDepsEntry(projectRequire, entry)) continue;
+    seen.add(entry);
+    installed.push(entry);
   }
 
   return installed;
@@ -186,6 +225,7 @@ export function resolveClientOptimizeDepsInclude(
 ): string[] {
   return mergeOptimizeDepsInclude(
     VINEXT_SHIM_OPTIMIZE_DEPS_INCLUDE,
+    VINEXT_IMAGE_RUNTIME_OPTIMIZE_DEPS_INCLUDE,
     filterInstalledOptimizeDepsInclude(projectRoot, VINEXT_OPTIONAL_CLIENT_OPTIMIZE_DEPS_INCLUDE),
     ...extraGroups,
   );

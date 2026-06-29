@@ -3,6 +3,7 @@ import fsp from "node:fs/promises";
 import { type ViteDevServer } from "vite";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { APP_FIXTURE_DIR, fetchHtml, startFixtureServer } from "./helpers.js";
+import { getAppRouterDevWarmupTargets } from "../packages/vinext/src/server/app-router-dev-warmup.js";
 
 function decodeHtmlText(text: string): string {
   return text
@@ -2009,6 +2010,25 @@ describe("App Router integration", () => {
     expect(ssrGlob).toContain("instrumentation-client.ts");
     expect(clientGlob).toContain("instrumentation.ts");
     expect(clientGlob).toContain("instrumentation-client.ts");
+  });
+
+  it("pre-warms App Router virtual entries during dev server startup", async () => {
+    // `preTransformRequests` must stay on so warming an entry cascades to its
+    // whole static import graph across all three environments.
+    expect(server.config.environments.rsc?.dev?.preTransformRequests).toBe(true);
+    expect(server.config.environments.ssr?.dev?.preTransformRequests).toBe(true);
+    expect(server.config.environments.client?.dev?.preTransformRequests).toBe(true);
+
+    // Each virtual entry must resolve + compile through the bare
+    // `virtual:vinext-*` id used by the warmup helper. A regression to the
+    // broken `/@fs/@id/...` warmup URL would throw "Failed to load url".
+    const targets = getAppRouterDevWarmupTargets({ hybridPagesDir: false });
+    const rsc = await server.environments.rsc.transformRequest(targets.rsc[0]);
+    expect(rsc?.code).toBeTruthy();
+    const ssr = await server.environments.ssr.transformRequest(targets.ssr[0]);
+    expect(ssr?.code).toBeTruthy();
+    const client = await server.environments.client.transformRequest(targets.client[0]);
+    expect(client?.code).toBeTruthy();
   });
 
   it("pre-includes framework dependencies in optimizeDeps.include to avoid late discovery", () => {

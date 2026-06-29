@@ -202,6 +202,12 @@ describe("optimizeDeps.exclude for vinext", () => {
       // No duplicates
       expect(new Set(result.optimizeDeps.exclude).size).toBe(result.optimizeDeps.exclude.length);
       expect(result.environments.ssr.resolve.external).toContain("typescript");
+      const clientInclude = result.environments.client.optimizeDeps?.include ?? [];
+      expect(clientInclude).toContain("next/dynamic");
+      expect(clientInclude).toContain("next/image");
+      expect(clientInclude).toContain("@unpic/react");
+      expect(clientInclude).toContain("ipaddr.js");
+      expect(new Set(clientInclude).size).toBe(clientInclude.length);
       expect(result.define?.["process.env.__VINEXT_HAS_PAGES_ROUTER"]).toBe('"true"');
       expect(result.resolve.alias["vinext/server/pages-client-assets"]).toMatch(
         /server\/pages-client-assets\.ts$/,
@@ -281,6 +287,8 @@ describe("optimizeDeps.exclude for vinext", () => {
       expect(clientInclude).toContain("react-dom");
       expect(clientInclude).toContain("next/dynamic");
       expect(clientInclude).toContain("next/image");
+      expect(clientInclude).toContain("@unpic/react");
+      expect(clientInclude).toContain("ipaddr.js");
       expect(new Set(clientInclude).size).toBe(clientInclude.length);
     } finally {
       await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});

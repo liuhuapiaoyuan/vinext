@@ -40,6 +40,7 @@ import {
 
 import { installSocketErrorBackstop } from "./server/socket-error-backstop.js";
 import { shouldInvalidateAppRouteFile } from "./server/dev-route-files.js";
+import { warmupAppRouterDevServer } from "./server/app-router-dev-warmup.js";
 import { createDirectRunner } from "./server/dev-module-runner.js";
 import { generateRscEntry } from "./entries/app-rsc-entry.js";
 import { generateSsrEntry } from "./entries/app-ssr-entry.js";
@@ -887,6 +888,12 @@ export type VinextOptions = {
    */
   images?: VinextImageConfig;
   /**
+   * Pre-warm App Router virtual entries and probe the root route when the dev
+   * server starts. Disabled automatically for Cloudflare/Nitro runtimes.
+   * @default true
+   */
+  devWarmup?: boolean;
+  /**
    * Experimental vinext-only feature flags.
    */
   experimental?: {
@@ -967,6 +974,21 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   // shim files exist in the vinext package before plugin init, so realpath is
   // safe to evaluate eagerly.
   const canonicalize = (p: string): string => normalizePathSeparators(tryRealpathSync(p) ?? p);
+  // `validate-middleware-exports` runs in a `transform` hook. The middleware
+  // file's realpath never changes during a session, so memoize it instead of
+  // calling `realpathSync` on the (invariant) middleware path for every
+  // candidate module.
+  let canonicalMiddlewarePathMemo: { raw: string; canonical: string } | null = null;
+  const getCanonicalMiddlewarePath = (): string | null => {
+    if (!middlewarePath) return null;
+    if (canonicalMiddlewarePathMemo?.raw !== middlewarePath) {
+      canonicalMiddlewarePathMemo = {
+        raw: middlewarePath,
+        canonical: canonicalize(middlewarePath),
+      };
+    }
+    return canonicalMiddlewarePathMemo.canonical;
+  };
   const pageTransformCanonicalPaths = new Map<string, string>();
   const canonicalizePageTransformPath = (modulePath: string): string => {
     const cached = pageTransformCanonicalPaths.get(modulePath);
@@ -2404,6 +2426,16 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               ),
             ]
           : [];
+        const pagesClientOptimizeDeps =
+          pagesOptimizeEntries.length > 0
+            ? {
+                entries: pagesOptimizeEntries,
+                include: mergeOptimizeDepsInclude(
+                  incomingInclude,
+                  resolveClientOptimizeDepsInclude(root),
+                ),
+              }
+            : undefined;
 
         // If app/ directory exists, configure RSC environments
         if (hasAppDir) {
@@ -2425,8 +2457,32 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             appClientInput["vinext-client-entry"] = VIRTUAL_CLIENT_ENTRY;
           }
 
+          const enableAppRouterDevWarmup =
+            env?.command === "serve" &&
+            !hasCloudflarePlugin &&
+            !hasNitroPlugin &&
+            options.devWarmup !== false;
+          // Virtual entries are warmed via `environment.warmupRequest()` in
+          // `configureServer` (see warmupAppRouterDevServer), not Vite's
+          // `dev.warmup` option — that path globs real files and mangles
+          // virtual URLs into unresolvable `/@fs/@id/...` requests. Here we
+          // only need `preTransformRequests` so warming an entry cascades to
+          // its full static import graph.
+          const appRouterDevConfigFor = (environmentName: "rsc" | "ssr" | "client") => {
+            if (!enableAppRouterDevWarmup) return {};
+            const userDev = (
+              config.environments as
+                | Record<string, { dev?: { preTransformRequests?: boolean } }>
+                | undefined
+            )?.[environmentName]?.dev;
+            return {
+              dev: { preTransformRequests: userDev?.preTransformRequests ?? true },
+            };
+          };
+
           viteConfig.environments = {
             rsc: {
+              ...appRouterDevConfigFor("rsc"),
               ...(hasCloudflarePlugin || hasNitroPlugin
                 ? {}
                 : {
@@ -2484,6 +2540,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               },
             },
             ssr: {
+              ...appRouterDevConfigFor("ssr"),
               ...(hasCloudflarePlugin || hasNitroPlugin
                 ? {}
                 : {
@@ -2547,6 +2604,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               },
             },
             client: {
+              ...appRouterDevConfigFor("client"),
               // Explicitly mark as client consumer so other plugins (e.g. Nitro)
               // can detect this during configEnvironment hooks — before Vite
               // applies the default consumer based on environment name.
@@ -2612,8 +2670,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           viteConfig.environments = {
             client: {
               consumer: "client",
-              optimizeDeps:
-                pagesOptimizeEntries.length > 0 ? { entries: pagesOptimizeEntries } : undefined,
+              optimizeDeps: pagesClientOptimizeDeps,
               build: {
                 manifest: true,
                 ssrManifest: true,
@@ -2638,8 +2695,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           viteConfig.environments = {
             client: {
               consumer: "client",
-              optimizeDeps:
-                pagesOptimizeEntries.length > 0 ? { entries: pagesOptimizeEntries } : undefined,
+              optimizeDeps: pagesClientOptimizeDeps,
               build: {
                 outDir: "dist/client",
                 manifest: true,
@@ -3815,6 +3871,23 @@ export const loadServerActionClient = ${
             installAppRouterDevRequestLogging(server.middlewares, server.config.root);
           }
 
+          if (hasAppDir && !hasCloudflarePlugin && !hasNitroPlugin && options.devWarmup !== false) {
+            const runDevWarmup = () => {
+              warmupAppRouterDevServer(server, {
+                basePath: nextConfig.basePath,
+                hybridPagesDir: hasPagesDir,
+              }).catch((error) => {
+                server.config.logger.warn(
+                  `[vinext] Dev warmup failed: ${
+                    error instanceof Error ? error.message : String(error)
+                  }`,
+                );
+              });
+            };
+            if (server.httpServer?.listening) runDevWarmup();
+            else server.httpServer?.once("listening", runDevWarmup);
+          }
+
           const handlePagesMiddleware = async (
             req: import("node:http").IncomingMessage,
             res: import("node:http").ServerResponse,
@@ -4404,17 +4477,26 @@ export const loadServerActionClient = ${
     {
       name: "vinext:validate-middleware-exports",
       enforce: "pre",
-      transform(code, id) {
-        if (!middlewarePath) return null;
-        const modulePath = stripViteModuleQuery(id);
-        if (canonicalize(modulePath) !== canonicalize(middlewarePath)) return null;
-        validateMiddlewareModuleExports(
-          code,
-          modulePath,
-          middlewarePath,
-          isProxyFile(middlewarePath),
-        );
-        return null;
+      transform: {
+        // Native filter: only the `middleware`/`proxy` convention files can ever
+        // be the middleware entry (see findMiddlewareFile), so skip the JS
+        // handler — and its `realpathSync` canonicalization — for every other
+        // module. The exact `canonicalize` comparison below still guards against
+        // unrelated user files that happen to share the basename.
+        filter: { id: /(?:^|[\\/])(?:middleware|proxy)\.[^\\/]+$/ },
+        handler(code, id) {
+          const canonicalMiddleware = getCanonicalMiddlewarePath();
+          if (!canonicalMiddleware || !middlewarePath) return null;
+          const modulePath = stripViteModuleQuery(id);
+          if (canonicalize(modulePath) !== canonicalMiddleware) return null;
+          validateMiddlewareModuleExports(
+            code,
+            modulePath,
+            middlewarePath,
+            isProxyFile(middlewarePath),
+          );
+          return null;
+        },
       },
     },
     // Next.js rejects `export * from "..."` when compiling Pages Router files
