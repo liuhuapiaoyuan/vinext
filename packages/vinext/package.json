@@ -1,6 +1,6 @@
 {
   "name": "@qzsy/vinext",
-  "version": "0.1.820",
+  "version": "0.1.822",
   "description": "Run Next.js apps on Vite. Drop-in replacement for the next CLI.",
   "license": "MIT",
   "repository": {
@@ -56,6 +56,10 @@
     "./server/pages-client-assets": {
       "types": "./dist/server/pages-client-assets.d.ts",
       "import": "./dist/server/pages-client-assets.js"
+    },
+    "./server/websocket": {
+      "types": "./dist/server/websocket.d.ts",
+      "import": "./dist/server/websocket.js"
     },
     "./server/app-router-entry": {
       "types": "./dist/server/app-router-entry.d.ts",

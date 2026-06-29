@@ -108,6 +108,11 @@ import { emitNextClientRuntimeManifests } from "./build/next-client-runtime-mani
 import { collectInlineCssManifest, injectInlineCssManifestGlobal } from "./build/inline-css.js";
 import { validateDevRequest } from "./server/dev-origin-check.js";
 import { installDevStackSourcemapMiddleware } from "./server/dev-stack-sourcemap.js";
+import {
+  handleNodeWebSocketUpgrade,
+  isViteHmrWebSocketUpgrade,
+  type VinextWebSocketRoute,
+} from "./server/websocket.js";
 
 import { scanMetadataFiles } from "./server/metadata-routes.js";
 
@@ -888,6 +893,18 @@ export type VinextOptions = {
    */
   images?: VinextImageConfig;
   /**
+   * Configure vinext's Node.js WebSocket route support.
+   *
+   * WebSocket routes are enabled by exporting `WEBSOCKET` from App Router
+   * `route.ts` handlers or `websocket` from Pages API routes. By default,
+   * browser upgrades must be same-origin.
+   * Set `allowedOrigins: true` to allow any Origin, or provide an explicit
+   * list of allowed Origin strings.
+   */
+  webSocket?: {
+    allowedOrigins?: true | string[];
+  };
+  /**
    * Pre-warm App Router virtual entries and probe the root route when the dev
    * server starts. Disabled automatically for Cloudflare/Nitro runtimes.
    * @default true
@@ -1030,6 +1047,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
       fileMatcher,
       middlewarePath,
       instrumentationPath,
+      options.webSocket?.allowedOrigins,
     );
   }
 
@@ -1835,6 +1853,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             "vinext/i18n-context": path.posix.join(shimsDir, "i18n-context"),
             "vinext/cache": path.resolve(__dirname, "cache"),
             "vinext/instrumentation": path.resolve(__dirname, "server", "instrumentation"),
+            "vinext/server/websocket": path.resolve(__dirname, "server", "websocket"),
             "vinext/instrumentation-client": path.resolve(
               __dirname,
               "client",
@@ -3086,6 +3105,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               inlineCss: nextConfig?.inlineCss,
               globalNotFound: nextConfig?.globalNotFound,
               cacheComponents: nextConfig?.cacheComponents,
+              webSocketAllowedOrigins: options.webSocket?.allowedOrigins,
               hasServerActions,
               i18n: nextConfig?.i18n,
               imageConfig: {
@@ -3566,10 +3586,21 @@ export const loadServerActionClient = ${
         // — a new reference only when the route set changes (invalidateRouteCache
         // -> re-scan). Keying on `routes` rebuilds exactly then and reuses the
         // handler otherwise, instead of re-running it for every request.
+        let appRunner: import("vite/module-runner").ModuleRunner | null = null;
         let cachedSSRHandler: {
           routes: Awaited<ReturnType<typeof pagesRouter>>;
           handler: ReturnType<typeof createSSRHandler>;
         } | null = null;
+        function getAppRunner() {
+          if (!appRunner) {
+            const env =
+              server.environments["rsc"] ??
+              server.environments["ssr"] ??
+              Object.values(server.environments)[0];
+            appRunner = createDirectRunner(env);
+          }
+          return appRunner;
+        }
         function getPagesRunner() {
           if (!pagesRunner) {
             const env =
@@ -3579,6 +3610,34 @@ export const loadServerActionClient = ${
             pagesRunner = createDirectRunner(env);
           }
           return pagesRunner;
+        }
+
+        async function getDevWebSocketRoutes(): Promise<VinextWebSocketRoute[]> {
+          const routes: VinextWebSocketRoute[] = [];
+          if (hasAppDir) {
+            const appRoutes = await appRouter(appDir, nextConfig?.pageExtensions, fileMatcher);
+            for (const route of appRoutes) {
+              if (!route.routePath) continue;
+              routes.push({
+                pattern: route.pattern,
+                patternParts: route.patternParts,
+                handlerExport: "WEBSOCKET",
+                load: () => getAppRunner().import(route.routePath!),
+              });
+            }
+          }
+          if (hasPagesDir) {
+            const apiRoutes = await apiRouter(pagesDir, nextConfig?.pageExtensions, fileMatcher);
+            for (const route of apiRoutes) {
+              routes.push({
+                pattern: route.pattern,
+                patternParts: route.patternParts,
+                handlerExport: "websocket",
+                load: () => getPagesRunner().import(route.filePath),
+              });
+            }
+          }
+          return routes;
         }
 
         /**
@@ -3725,6 +3784,28 @@ export const loadServerActionClient = ${
         // same reason. See cloudflare/vinext#905.
         server.httpServer?.on("connection", (socket) => {
           socket.on("error", () => {});
+        });
+        server.httpServer?.on("upgrade", (req, socket, head) => {
+          if (isViteHmrWebSocketUpgrade(req)) return;
+          void (async () => {
+            try {
+              await handleNodeWebSocketUpgrade({
+                request: req,
+                socket,
+                head,
+                routes: await getDevWebSocketRoutes(),
+                basePath: nextConfig?.basePath,
+                allowedOrigins: options.webSocket?.allowedOrigins,
+              });
+            } catch (error) {
+              server.config.logger.error(
+                `[vinext] WebSocket upgrade failed: ${
+                  error instanceof Error ? error.stack || error.message : String(error)
+                }`,
+              );
+              if (!socket.destroyed) socket.destroy();
+            }
+          })();
         });
 
         server.watcher.on("add", (filePath: string) => {

@@ -36,6 +36,7 @@ export async function generateServerEntry(
   fileMatcher: ReturnType<typeof createValidFileMatcher>,
   middlewarePath: string | null,
   instrumentationPath: string | null,
+  webSocketAllowedOrigins?: true | string[],
 ): Promise<string> {
   const pageRoutes = await pagesRouter(pagesDir, nextConfig?.pageExtensions, fileMatcher);
   const apiRoutes = await apiRouter(pagesDir, nextConfig?.pageExtensions, fileMatcher);
@@ -101,6 +102,7 @@ export async function generateServerEntry(
 
   // Embed the resolved build ID at build time
   const buildIdJson = JSON.stringify(nextConfig?.buildId ?? null);
+  const webSocketAllowedOriginsJson = JSON.stringify(webSocketAllowedOrigins);
 
   // Serialize the full resolved config for the production server.
   // This embeds redirects, rewrites, headers, basePath, trailingSlash
@@ -237,6 +239,7 @@ const i18nConfig = ${i18nConfigJson};
 // match _next/data requests against the embedded buildId without needing
 // to load next.config.js at runtime.
 export const buildId = ${buildIdJson};
+export const webSocketAllowedOrigins = ${webSocketAllowedOriginsJson};
 export function normalizeDataRequest(request) {
   return __normalizePagesDataRequest(request, buildId);
 }
@@ -303,6 +306,12 @@ const apiRoutes = [
 ${apiRouteEntries.join(",\n")}
 ];
 const _apiRouteTrie = _buildRouteTrie(apiRoutes);
+export const webSocketRoutes = apiRoutes.map((route) => ({
+  pattern: route.pattern,
+  patternParts: route.patternParts,
+  handlerExport: "websocket",
+  load: () => route.module,
+}));
 
 function matchRoute(url, routes) {
   const pathname = url.split("?")[0];

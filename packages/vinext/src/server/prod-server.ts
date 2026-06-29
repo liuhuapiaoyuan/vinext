@@ -79,6 +79,7 @@ import {
   resolveRequestProtocol,
   resolveRequestHost as resolveHost,
 } from "./proxy-trust.js";
+import { handleNodeWebSocketUpgrade, type VinextWebSocketRoute } from "./websocket.js";
 import {
   negotiateEncoding,
   parseAcceptedEncodings,
@@ -995,6 +996,12 @@ type WorkerAppRouterEntry = {
   fetch(request: Request, env?: unknown, ctx?: ExecutionContextLike): Promise<Response> | Response;
 };
 
+type WebSocketRouteExport = readonly VinextWebSocketRoute[];
+
+function readWebSocketRoutes(value: unknown): WebSocketRouteExport {
+  return Array.isArray(value) ? (value as WebSocketRouteExport) : [];
+}
+
 function createNodeExecutionContext(): ExecutionContextLike {
   return {
     waitUntil(promise: Promise<unknown>) {
@@ -1215,6 +1222,11 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
     typeof rscModule.__assetPrefix === "string" ? rscModule.__assetPrefix : "";
   const appRouterBasePath: string =
     typeof rscModule.__basePath === "string" ? rscModule.__basePath : "";
+  const appWebSocketRoutes = readWebSocketRoutes(rscModule.webSocketRoutes);
+  const appWebSocketAllowedOrigins = rscModule.webSocketAllowedOrigins as
+    | true
+    | string[]
+    | undefined;
   const appRouterInlineCss = rscModule.__inlineCss === true;
   const appRouterHasPagesDir = rscModule.__hasPagesDir === true;
   const appImageAllowedWidths: number[] = Array.isArray(rscModule.__imageAllowedWidths)
@@ -1461,6 +1473,19 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
   const server = createServer((req, res) => {
     void handleRequest(req, res);
   });
+  server.on("upgrade", (req, socket, head) => {
+    void handleNodeWebSocketUpgrade({
+      request: req,
+      socket,
+      head,
+      routes: appWebSocketRoutes,
+      basePath: appRouterBasePath,
+      allowedOrigins: appWebSocketAllowedOrigins,
+    }).catch((error) => {
+      console.error("[vinext] WebSocket upgrade failed:", error);
+      if (!socket.destroyed) socket.destroy();
+    });
+  });
 
   await new Promise<void>((resolve) => {
     server.listen(port, host, () => {
@@ -1537,6 +1562,11 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
     typeof serverEntry.matchPageRoute === "function" ? serverEntry.matchPageRoute : undefined;
   const hasMiddleware = serverEntry.hasMiddleware === true;
   const pageRoutes = readPagesServerEntryPageRoutes(serverEntry.pageRoutes);
+  const pagesWebSocketRoutes = readWebSocketRoutes(serverEntry.webSocketRoutes);
+  const pagesWebSocketAllowedOrigins = serverEntry.webSocketAllowedOrigins as
+    | true
+    | string[]
+    | undefined;
 
   // Load prerender secret written at build time by vinext:server-manifest plugin.
   // Used to authenticate internal /__vinext/prerender/* HTTP endpoints.
@@ -1924,6 +1954,19 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
 
   const server = createServer((req, res) => {
     void handleRequest(req, res);
+  });
+  server.on("upgrade", (req, socket, head) => {
+    void handleNodeWebSocketUpgrade({
+      request: req,
+      socket,
+      head,
+      routes: pagesWebSocketRoutes,
+      basePath,
+      allowedOrigins: pagesWebSocketAllowedOrigins,
+    }).catch((error) => {
+      console.error("[vinext] WebSocket upgrade failed:", error);
+      if (!socket.destroyed) socket.destroy();
+    });
   });
 
   await new Promise<void>((resolve) => {

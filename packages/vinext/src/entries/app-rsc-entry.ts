@@ -164,6 +164,8 @@ type AppRouterConfig = {
   globalNotFound?: boolean;
   /** Enables Next.js Cache Components semantics for App Router document HTML. */
   cacheComponents?: boolean;
+  /** vinext-only origin policy for Node production WebSocket upgrades. */
+  webSocketAllowedOrigins?: true | string[];
   /** Whether the RSC build discovered any server references. Defaults to true. */
   hasServerActions?: boolean;
   /** Internationalization routing config for middleware matcher locale handling. */
@@ -527,6 +529,18 @@ function __VINEXT_CLASS_REASONS(routeIdx) {
 const routes = [
 ${routeEntries.join(",\n")}
 ];
+export const webSocketAllowedOrigins = ${JSON.stringify(config?.webSocketAllowedOrigins)};
+export const webSocketRoutes = routes
+  .filter((route) => route.__loadRouteHandler)
+  .map((route) => ({
+    pattern: route.pattern,
+    patternParts: route.patternParts,
+    handlerExport: "WEBSOCKET",
+    async load() {
+      await __ensureRouteLoaded(route);
+      return route.routeHandler ?? {};
+    },
+  }));
 const __routeMatcher = __createAppRscRouteMatcher(routes);
 
 const metadataRoutes = [
