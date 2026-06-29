@@ -1197,11 +1197,12 @@ export default createAppRscHandler({
   matchRoute,
   ${
     middlewarePath
-      ? `runMiddleware({ cleanPathname, context, isDataRequest, request }) {
+      ? `runMiddleware({ cleanPathname, context, hadBasePath, isDataRequest, request }) {
     return __applyAppMiddleware({
       basePath: __basePath,
       cleanPathname,
       context,
+      hadBasePath,
       filePath: ${JSON.stringify(middlewarePath ? normalizePathSeparators(middlewarePath) : "")},
       i18nConfig: __i18nConfig,
       isDataRequest,

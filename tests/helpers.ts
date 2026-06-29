@@ -81,6 +81,8 @@ export async function startFixtureServer(
     plugin = vinext({ appDir: opts?.appDir ?? fixtureDir });
   }
   const plugins = [plugin];
+  const windowsWatchOptions =
+    process.platform === "win32" ? { watch: { interval: 100, usePolling: true } } : {};
 
   const server = await createServer({
     root: fixtureDir,
@@ -96,6 +98,7 @@ export async function startFixtureServer(
     server: {
       port: 0,
       cors: false,
+      ...windowsWatchOptions,
       ...opts?.server,
     },
     logLevel: "silent",

@@ -9,7 +9,10 @@ import {
   type LinkPrefetchRouterMode,
 } from "../packages/vinext/src/shims/link-prefetch.js";
 import { APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL } from "../packages/vinext/src/server/app-rsc-render-mode.js";
-import { VINEXT_RSC_RENDER_MODE_HEADER } from "../packages/vinext/src/server/headers.js";
+import {
+  NEXT_ROUTER_PREFETCH_HEADER,
+  VINEXT_RSC_RENDER_MODE_HEADER,
+} from "../packages/vinext/src/server/headers.js";
 import type { VinextLinkPrefetchRoute } from "../packages/vinext/src/client/vinext-next-data.js";
 
 type CapturedEffect = () => void | (() => void);
@@ -1489,6 +1492,32 @@ describe("Link prefetch scheduling", () => {
     }
   });
 
+  it("does not re-prefetch a visible full-prefetch Link just because dynamic stale time is zero", async () => {
+    vi.stubEnv("__NEXT_CLIENT_ROUTER_DYNAMIC_STALETIME", "0");
+    vi.stubEnv("__NEXT_CLIENT_ROUTER_STATIC_STALETIME", "300");
+    vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+    const observer = stubIntersectionObserver();
+
+    const result = await renderIsolatedLink({
+      href: "/viewport-prefetch-target",
+      nodeEnv: "production",
+    });
+
+    try {
+      observer.dispatchIntersectingEntry(result.anchor);
+      await waitForFetchCalls(result.fetch, 1);
+      expect(result.fetch).toHaveBeenCalledTimes(1);
+
+      vi.spyOn(Date, "now").mockReturnValue(1_000_001);
+      pingVisibleLinksFromRuntime();
+      await flushPrefetchTasks();
+
+      expect(result.fetch).toHaveBeenCalledTimes(1);
+    } finally {
+      result.restoreNodeEnv();
+    }
+  });
+
   it("prefetches visible dynamic links in automatic production mode without seeding navigation cache", async () => {
     const observer = stubIntersectionObserver();
 
@@ -1514,6 +1543,9 @@ describe("Link prefetch scheduling", () => {
       const fetchInit = result.fetch.mock.calls[0]?.[1] as RequestInit | undefined;
       expect((fetchInit?.headers as Headers | undefined)?.get(VINEXT_RSC_RENDER_MODE_HEADER)).toBe(
         APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL,
+      );
+      expect((fetchInit?.headers as Headers | undefined)?.get(NEXT_ROUTER_PREFETCH_HEADER)).toBe(
+        "1",
       );
       const { getPrefetchCache } = await import("../packages/vinext/src/shims/navigation.js");
       const entry = Array.from(getPrefetchCache().values())[0];

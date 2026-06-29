@@ -10,6 +10,10 @@ const MSW_SETUP = path.resolve(import.meta.dirname, "tests/_msw/setup.ts");
 // no prior build required). Shared by both test projects below.
 const WORKSPACE_SRC_ALIAS = {
   "vinext/shims": SHIMS_SRC,
+  "vinext/server/pages-client-assets": path.resolve(
+    import.meta.dirname,
+    "packages/vinext/src/server/pages-client-assets.ts",
+  ),
   "@vinext/cloudflare/cache": path.resolve(import.meta.dirname, "packages/cloudflare/src/cache"),
 };
 
