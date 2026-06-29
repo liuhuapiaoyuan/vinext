@@ -3,7 +3,11 @@ import { createServer, type Server } from "node:http";
 import net from "node:net";
 import { afterAll, describe, expect, it } from "vite-plus/test";
 import {
+  createWebSocketHub,
   handleNodeWebSocketUpgrade,
+  type VinextWebSocket,
+  type VinextWebSocketHubAdapter,
+  type VinextWebSocketHubEnvelope,
   type VinextWebSocketHandler,
   type VinextWebSocketRoute,
 } from "../packages/vinext/src/server/websocket.js";
@@ -15,6 +19,60 @@ type RawWebSocket = {
   readText(): Promise<string>;
   close(): void;
 };
+
+class MockVinextWebSocket extends EventTarget {
+  readonly CONNECTING = 0 as const;
+  readonly OPEN = 1 as const;
+  readonly CLOSING = 2 as const;
+  readonly CLOSED = 3 as const;
+  readyState: 0 | 1 | 2 | 3 = this.OPEN;
+  readonly protocol = "";
+  readonly sent: (string | Buffer)[] = [];
+
+  send(data: string | ArrayBuffer | ArrayBufferView | Buffer): void {
+    if (this.readyState !== this.OPEN) throw new Error("WebSocket is not open");
+    if (typeof data === "string") {
+      this.sent.push(data);
+      return;
+    }
+    if (Buffer.isBuffer(data)) {
+      this.sent.push(data);
+      return;
+    }
+    this.sent.push(
+      ArrayBuffer.isView(data)
+        ? Buffer.from(data.buffer, data.byteOffset, data.byteLength)
+        : Buffer.from(data),
+    );
+  }
+
+  close(code = 1000, reason = ""): void {
+    if (this.readyState === this.CLOSED) return;
+    this.readyState = this.CLOSED;
+    this.dispatchEvent(Object.assign(new Event("close"), { code, reason, wasClean: true }));
+  }
+
+  ping(): void {}
+}
+
+function asVinextWebSocket(socket: MockVinextWebSocket): VinextWebSocket {
+  return socket as unknown as VinextWebSocket;
+}
+
+function createFanoutAdapter(): VinextWebSocketHubAdapter {
+  const listeners = new Set<(envelope: VinextWebSocketHubEnvelope) => void | Promise<void>>();
+  return {
+    publish(envelope) {
+      for (const listener of listeners) void listener(envelope);
+    },
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+  };
+}
 
 function encodeClientTextFrame(message: string): Buffer {
   const payload = Buffer.from(message);
@@ -209,5 +267,108 @@ describe("Node WebSocket routes", () => {
     await expect(connectRawWebSocket(baseUrl, "/api/ws", "http://evil.example")).rejects.toThrow(
       "Expected WebSocket upgrade",
     );
+  });
+});
+
+describe("WebSocket hub", () => {
+  it("sends to connections, users, groups, and de-duplicated multicast targets", async () => {
+    const hub = createWebSocketHub();
+    const socketA = new MockVinextWebSocket();
+    const socketB = new MockVinextWebSocket();
+    const socketC = new MockVinextWebSocket();
+    const connectionA = hub.register(asVinextWebSocket(socketA), {
+      id: "conn-a",
+      userId: "user-a",
+    });
+    const connectionB = hub.register(asVinextWebSocket(socketB), {
+      id: "conn-b",
+      userId: "user-b",
+    });
+    hub.register(asVinextWebSocket(socketC), { id: "conn-c", userId: "user-c" });
+
+    connectionA.join("room:one");
+    connectionB.join("room:one");
+
+    await hub.connection("conn-a").send("direct");
+    await hub.user("user-b").sendJson({ type: "user" });
+    await hub.group("room:one").except(connectionA).send("room");
+    await hub.send({ groups: ["room:one"], userIds: ["user-a"] }, "multi");
+
+    expect(socketA.sent).toEqual(["direct", "multi"]);
+    expect(socketB.sent).toEqual([JSON.stringify({ type: "user" }), "room", "multi"]);
+    expect(socketC.sent).toEqual([]);
+  });
+
+  it("cleans up connection, user, and group indexes when a socket closes", () => {
+    const hub = createWebSocketHub();
+    const socket = new MockVinextWebSocket();
+    const connection = hub.register(asVinextWebSocket(socket), { id: "conn", userId: "user" });
+    connection.join("room");
+
+    expect(hub.size()).toBe(1);
+    expect(hub.groupSize("room")).toBe(1);
+    expect(hub.userConnections("user")).toHaveLength(1);
+
+    socket.close();
+
+    expect(hub.size()).toBe(0);
+    expect(hub.groupSize("room")).toBe(0);
+    expect(hub.userConnections("user")).toHaveLength(0);
+    expect(hub.getConnection("conn")).toBeUndefined();
+  });
+
+  it("registers socket instances that expose an internal socket property", async () => {
+    const hub = createWebSocketHub();
+    const socket = new MockVinextWebSocket();
+    Object.defineProperty(socket, "socket", { value: {} });
+
+    hub.register(asVinextWebSocket(socket), { id: "conn" });
+    await hub.connection("conn").send("hello");
+
+    expect(socket.sent).toEqual(["hello"]);
+  });
+
+  it("does not let a stale duplicate id cleanup remove the active connection", async () => {
+    const hub = createWebSocketHub();
+    const oldSocket = new MockVinextWebSocket();
+    const newSocket = new MockVinextWebSocket();
+    const oldConnection = hub.register(asVinextWebSocket(oldSocket), {
+      id: "conn",
+      userId: "old-user",
+    });
+    oldConnection.join("room");
+
+    const newConnection = hub.register(asVinextWebSocket(newSocket), {
+      id: "conn",
+      userId: "new-user",
+    });
+    newConnection.join("room");
+    oldSocket.close();
+
+    await hub.group("room").send("current");
+
+    expect(oldSocket.sent).toEqual([]);
+    expect(newSocket.sent).toEqual(["current"]);
+    expect(hub.userConnections("old-user")).toHaveLength(0);
+    expect(hub.userConnections("new-user")).toHaveLength(1);
+  });
+
+  it("publishes group sends through the adapter for cross-process delivery", async () => {
+    const adapter = createFanoutAdapter();
+    const hubA = createWebSocketHub({ id: "node-a", adapter });
+    const hubB = createWebSocketHub({ id: "node-b", adapter });
+    const socketA = new MockVinextWebSocket();
+    const socketB = new MockVinextWebSocket();
+    hubA.register(asVinextWebSocket(socketA), { id: "conn-a" }).join("room");
+    hubB.register(asVinextWebSocket(socketB), { id: "conn-b" }).join("room");
+
+    const report = await hubA.group("room").send("hello");
+
+    expect(report).toMatchObject({ attempted: 1, sent: 1, published: true });
+    expect(socketA.sent).toEqual(["hello"]);
+    expect(socketB.sent).toEqual(["hello"]);
+
+    await hubA.close();
+    await hubB.close();
   });
 });

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { Socket } from "node:net";
 import type { Duplex } from "node:stream";
@@ -9,6 +9,8 @@ const WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const DEFAULT_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024;
 
 export type VinextWebSocketMessageData = string | Buffer;
+
+export type VinextWebSocketSendData = string | ArrayBuffer | ArrayBufferView | Buffer;
 
 export type VinextWebSocketMessageEvent = Event & {
   data: VinextWebSocketMessageData;
@@ -90,6 +92,152 @@ export type HandleNodeWebSocketUpgradeOptions = {
   basePath?: string;
   allowedOrigins?: VinextWebSocketOriginPolicy;
   maxPayloadBytes?: number;
+};
+
+type MaybePromise<T> = T | Promise<T>;
+
+export type VinextWebSocketSerializedMessage =
+  | {
+      type: "text";
+      data: string;
+    }
+  | {
+      type: "binary";
+      data: string;
+    };
+
+export type VinextWebSocketHubTargetSelector = {
+  all?: boolean;
+  connectionIds?: readonly string[];
+  userIds?: readonly string[];
+  groups?: readonly string[];
+};
+
+export type VinextWebSocketHubEnvelope = {
+  id: string;
+  sourceId: string;
+  target: VinextWebSocketHubTargetSelector;
+  data: VinextWebSocketSerializedMessage;
+  exceptConnectionIds?: readonly string[];
+};
+
+export type VinextWebSocketHubAdapter = {
+  publish(envelope: VinextWebSocketHubEnvelope): MaybePromise<void>;
+  subscribe(
+    listener: (envelope: VinextWebSocketHubEnvelope) => MaybePromise<void>,
+  ): MaybePromise<void | (() => MaybePromise<void>)>;
+};
+
+export type VinextWebSocketSendFailure = {
+  connectionId: string;
+  error: unknown;
+};
+
+export type VinextWebSocketDeliveryReport = {
+  attempted: number;
+  sent: number;
+  skipped: number;
+  failed: number;
+  failures: VinextWebSocketSendFailure[];
+  published: boolean;
+};
+
+export type VinextWebSocketConnectionRef = string | { readonly id: string };
+
+export type VinextWebSocketSendOptions =
+  | {
+      except?: VinextWebSocketConnectionRef | readonly VinextWebSocketConnectionRef[];
+      localOnly?: boolean;
+    }
+  | undefined;
+
+type VinextWebSocketExceptInput =
+  | VinextWebSocketConnectionRef
+  | readonly VinextWebSocketConnectionRef[]
+  | undefined;
+
+export type VinextWebSocketRegisterOptions<TMeta = unknown> = {
+  id?: string;
+  userId?: string;
+  meta?: TMeta;
+};
+
+export type VinextWebSocketConnection<TMeta = unknown> = {
+  readonly id: string;
+  readonly userId: string | undefined;
+  readonly socket: VinextWebSocket;
+  readonly meta: TMeta | undefined;
+  readonly groups: ReadonlySet<string>;
+  send(
+    data: VinextWebSocketSendData,
+    options?: VinextWebSocketSendOptions,
+  ): Promise<VinextWebSocketDeliveryReport>;
+  sendJson(
+    value: unknown,
+    options?: VinextWebSocketSendOptions,
+  ): Promise<VinextWebSocketDeliveryReport>;
+  close(code?: number, reason?: string): void;
+  join(group: string): void;
+  leave(group: string): void;
+  leaveAll(): void;
+  onMessage(listener: (event: VinextWebSocketMessageEvent) => void): () => void;
+  onClose(listener: (event: VinextWebSocketCloseEvent) => void): () => void;
+};
+
+export type VinextWebSocketTarget<TMeta = unknown> = {
+  except(
+    except: VinextWebSocketConnectionRef | readonly VinextWebSocketConnectionRef[],
+  ): VinextWebSocketTarget<TMeta>;
+  send(
+    data: VinextWebSocketSendData,
+    options?: VinextWebSocketSendOptions,
+  ): Promise<VinextWebSocketDeliveryReport>;
+  sendJson(
+    value: unknown,
+    options?: VinextWebSocketSendOptions,
+  ): Promise<VinextWebSocketDeliveryReport>;
+  connections(): readonly VinextWebSocketConnection<TMeta>[];
+};
+
+export type VinextWebSocketHub<TMeta = unknown> = {
+  readonly id: string;
+  register(
+    context: VinextWebSocketContext | VinextWebSocket,
+    options?: VinextWebSocketRegisterOptions<TMeta>,
+  ): VinextWebSocketConnection<TMeta>;
+  getConnection(id: string): VinextWebSocketConnection<TMeta> | undefined;
+  connection(id: string): VinextWebSocketTarget<TMeta>;
+  user(userId: string): VinextWebSocketTarget<TMeta>;
+  group(group: string): VinextWebSocketTarget<TMeta>;
+  target(selector: VinextWebSocketHubTargetSelector): VinextWebSocketTarget<TMeta>;
+  send(
+    selector: VinextWebSocketHubTargetSelector,
+    data: VinextWebSocketSendData,
+    options?: VinextWebSocketSendOptions,
+  ): Promise<VinextWebSocketDeliveryReport>;
+  sendJson(
+    selector: VinextWebSocketHubTargetSelector,
+    value: unknown,
+    options?: VinextWebSocketSendOptions,
+  ): Promise<VinextWebSocketDeliveryReport>;
+  broadcast(
+    data: VinextWebSocketSendData,
+    options?: VinextWebSocketSendOptions,
+  ): Promise<VinextWebSocketDeliveryReport>;
+  broadcastJson(
+    value: unknown,
+    options?: VinextWebSocketSendOptions,
+  ): Promise<VinextWebSocketDeliveryReport>;
+  size(): number;
+  groupSize(group: string): number;
+  userConnections(userId: string): readonly VinextWebSocketConnection<TMeta>[];
+  close(code?: number, reason?: string): Promise<void>;
+};
+
+export type CreateVinextWebSocketHubOptions = {
+  id?: string;
+  adapter?: VinextWebSocketHubAdapter;
+  onAdapterError?: (error: unknown, envelope?: VinextWebSocketHubEnvelope) => void;
 };
 
 const routeTrieCache = createRouteTrieCache<VinextWebSocketRoute>();
@@ -467,6 +615,419 @@ function toBuffer(data: ArrayBuffer | ArrayBufferView | Buffer): Buffer {
     return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
   }
   return Buffer.from(data);
+}
+
+function serializeWebSocketData(data: VinextWebSocketSendData): VinextWebSocketSerializedMessage {
+  if (typeof data === "string") return { type: "text", data };
+  return { type: "binary", data: toBuffer(data).toString("base64") };
+}
+
+function deserializeWebSocketData(data: VinextWebSocketSerializedMessage): string | Buffer {
+  return data.type === "text" ? data.data : Buffer.from(data.data, "base64");
+}
+
+function isVinextWebSocketContext(
+  context: VinextWebSocketContext | VinextWebSocket,
+): context is VinextWebSocketContext {
+  return "request" in context && "params" in context && "url" in context;
+}
+
+function normalizeExceptIds(except: VinextWebSocketExceptInput): Set<string> {
+  const ids = new Set<string>();
+  if (!except) return ids;
+  const values = Array.isArray(except) ? except : [except];
+  for (const value of values) {
+    ids.add(typeof value === "string" ? value : value.id);
+  }
+  return ids;
+}
+
+class VinextWebSocketConnectionImpl<TMeta> implements VinextWebSocketConnection<TMeta> {
+  readonly groups = new Set<string>();
+
+  constructor(
+    private readonly hub: VinextWebSocketHubImpl<TMeta>,
+    readonly socket: VinextWebSocket,
+    readonly id: string,
+    readonly userId: string | undefined,
+    readonly meta: TMeta | undefined,
+  ) {}
+
+  send(
+    data: VinextWebSocketSendData,
+    options?: VinextWebSocketSendOptions,
+  ): Promise<VinextWebSocketDeliveryReport> {
+    return this.hub.sendLocal(
+      { connectionIds: [this.id] },
+      data,
+      normalizeExceptIds(options?.except),
+    );
+  }
+
+  sendJson(
+    value: unknown,
+    options?: VinextWebSocketSendOptions,
+  ): Promise<VinextWebSocketDeliveryReport> {
+    return this.send(JSON.stringify(value), options);
+  }
+
+  close(code?: number, reason?: string): void {
+    this.socket.close(code, reason);
+  }
+
+  join(group: string): void {
+    this.hub.addConnectionToGroup(this, group);
+  }
+
+  leave(group: string): void {
+    this.hub.removeConnectionFromGroup(this, group);
+  }
+
+  leaveAll(): void {
+    this.hub.removeConnectionFromAllGroups(this);
+  }
+
+  onMessage(listener: (event: VinextWebSocketMessageEvent) => void): () => void {
+    this.socket.addEventListener("message", listener);
+    return () => this.socket.removeEventListener("message", listener as EventListener);
+  }
+
+  onClose(listener: (event: VinextWebSocketCloseEvent) => void): () => void {
+    this.socket.addEventListener("close", listener);
+    return () => this.socket.removeEventListener("close", listener as EventListener);
+  }
+}
+
+class VinextWebSocketTargetImpl<TMeta> implements VinextWebSocketTarget<TMeta> {
+  constructor(
+    private readonly hub: VinextWebSocketHubImpl<TMeta>,
+    private readonly selector: VinextWebSocketHubTargetSelector,
+    private readonly exceptIds = new Set<string>(),
+  ) {}
+
+  except(
+    except: VinextWebSocketConnectionRef | readonly VinextWebSocketConnectionRef[],
+  ): VinextWebSocketTarget<TMeta> {
+    const nextExceptIds = new Set(this.exceptIds);
+    for (const id of normalizeExceptIds(except)) nextExceptIds.add(id);
+    return new VinextWebSocketTargetImpl(this.hub, this.selector, nextExceptIds);
+  }
+
+  send(
+    data: VinextWebSocketSendData,
+    options?: VinextWebSocketSendOptions,
+  ): Promise<VinextWebSocketDeliveryReport> {
+    const exceptIds = new Set(this.exceptIds);
+    for (const id of normalizeExceptIds(options?.except)) exceptIds.add(id);
+    return this.hub.sendWithExceptIds(this.selector, data, exceptIds, options?.localOnly);
+  }
+
+  sendJson(
+    value: unknown,
+    options?: VinextWebSocketSendOptions,
+  ): Promise<VinextWebSocketDeliveryReport> {
+    return this.send(JSON.stringify(value), options);
+  }
+
+  connections(): readonly VinextWebSocketConnection<TMeta>[] {
+    return [...this.hub.resolveLocalConnections(this.selector, this.exceptIds)];
+  }
+}
+
+class VinextWebSocketHubImpl<TMeta> implements VinextWebSocketHub<TMeta> {
+  readonly id: string;
+  private readonly connections = new Map<string, VinextWebSocketConnectionImpl<TMeta>>();
+  private readonly users = new Map<string, Set<string>>();
+  private readonly groups = new Map<string, Set<string>>();
+  private readonly seenEnvelopeIds = new Set<string>();
+  private readonly seenEnvelopeOrder: string[] = [];
+  private unsubscribe: (() => MaybePromise<void>) | undefined;
+  private adapterReady: Promise<void>;
+
+  constructor(private readonly options: CreateVinextWebSocketHubOptions = {}) {
+    this.id = options.id ?? randomUUID();
+    this.adapterReady = this.subscribeAdapter(options.adapter);
+  }
+
+  register(
+    context: VinextWebSocketContext | VinextWebSocket,
+    options: VinextWebSocketRegisterOptions<TMeta> = {},
+  ): VinextWebSocketConnection<TMeta> {
+    const socket = isVinextWebSocketContext(context) ? context.socket : context;
+    const id = options.id ?? randomUUID();
+    const existing = this.connections.get(id);
+    if (existing) this.removeConnection(existing);
+    const connection = new VinextWebSocketConnectionImpl(
+      this,
+      socket,
+      id,
+      options.userId,
+      options.meta,
+    );
+    this.connections.set(connection.id, connection);
+    if (connection.userId) this.addIndexValue(this.users, connection.userId, connection.id);
+    socket.addEventListener("close", () => this.removeConnection(connection), { once: true });
+    return connection;
+  }
+
+  getConnection(id: string): VinextWebSocketConnection<TMeta> | undefined {
+    return this.connections.get(id);
+  }
+
+  connection(id: string): VinextWebSocketTarget<TMeta> {
+    return this.target({ connectionIds: [id] });
+  }
+
+  user(userId: string): VinextWebSocketTarget<TMeta> {
+    return this.target({ userIds: [userId] });
+  }
+
+  group(group: string): VinextWebSocketTarget<TMeta> {
+    return this.target({ groups: [group] });
+  }
+
+  target(selector: VinextWebSocketHubTargetSelector): VinextWebSocketTarget<TMeta> {
+    return new VinextWebSocketTargetImpl(this, selector);
+  }
+
+  async send(
+    selector: VinextWebSocketHubTargetSelector,
+    data: VinextWebSocketSendData,
+    options?: VinextWebSocketSendOptions,
+  ): Promise<VinextWebSocketDeliveryReport> {
+    const exceptIds = normalizeExceptIds(options?.except);
+    return this.sendWithExceptIds(selector, data, exceptIds, options?.localOnly);
+  }
+
+  async sendWithExceptIds(
+    selector: VinextWebSocketHubTargetSelector,
+    data: VinextWebSocketSendData,
+    exceptIds: Set<string>,
+    localOnly?: boolean,
+  ): Promise<VinextWebSocketDeliveryReport> {
+    const report = this.deliverLocal(selector, data, exceptIds);
+    if (!localOnly && this.options.adapter) {
+      const serialized = serializeWebSocketData(data);
+      const envelope: VinextWebSocketHubEnvelope = {
+        id: randomUUID(),
+        sourceId: this.id,
+        target: selector,
+        data: serialized,
+      };
+      if (exceptIds.size > 0) envelope.exceptConnectionIds = [...exceptIds];
+      try {
+        await this.adapterReady;
+        await this.options.adapter.publish(envelope);
+        report.published = true;
+      } catch (error) {
+        this.handleAdapterError(error, envelope);
+      }
+    }
+    return report;
+  }
+
+  sendLocal(
+    selector: VinextWebSocketHubTargetSelector,
+    data: VinextWebSocketSendData,
+    exceptIds = new Set<string>(),
+  ): Promise<VinextWebSocketDeliveryReport> {
+    return Promise.resolve(this.deliverLocal(selector, data, exceptIds));
+  }
+
+  sendJson(
+    selector: VinextWebSocketHubTargetSelector,
+    value: unknown,
+    options?: VinextWebSocketSendOptions,
+  ): Promise<VinextWebSocketDeliveryReport> {
+    return this.send(selector, JSON.stringify(value), options);
+  }
+
+  broadcast(
+    data: VinextWebSocketSendData,
+    options?: VinextWebSocketSendOptions,
+  ): Promise<VinextWebSocketDeliveryReport> {
+    return this.send({ all: true }, data, options);
+  }
+
+  broadcastJson(
+    value: unknown,
+    options?: VinextWebSocketSendOptions,
+  ): Promise<VinextWebSocketDeliveryReport> {
+    return this.broadcast(JSON.stringify(value), options);
+  }
+
+  size(): number {
+    return this.connections.size;
+  }
+
+  groupSize(group: string): number {
+    return this.groups.get(group)?.size ?? 0;
+  }
+
+  userConnections(userId: string): readonly VinextWebSocketConnection<TMeta>[] {
+    return [...(this.users.get(userId) ?? [])]
+      .map((id) => this.connections.get(id))
+      .filter(
+        (connection): connection is VinextWebSocketConnectionImpl<TMeta> =>
+          connection !== undefined,
+      );
+  }
+
+  async close(code = 1001, reason = "WebSocket hub closed"): Promise<void> {
+    await this.adapterReady;
+    await this.unsubscribe?.();
+    this.unsubscribe = undefined;
+    while (this.connections.size > 0) {
+      const connection = this.connections.values().next().value;
+      if (!connection) break;
+      connection.socket.close(code, reason);
+      this.removeConnection(connection);
+    }
+  }
+
+  addConnectionToGroup(connection: VinextWebSocketConnectionImpl<TMeta>, group: string): void {
+    if (!this.connections.has(connection.id)) return;
+    connection.groups.add(group);
+    this.addIndexValue(this.groups, group, connection.id);
+  }
+
+  removeConnectionFromGroup(connection: VinextWebSocketConnectionImpl<TMeta>, group: string): void {
+    connection.groups.delete(group);
+    this.removeIndexValue(this.groups, group, connection.id);
+  }
+
+  removeConnectionFromAllGroups(connection: VinextWebSocketConnectionImpl<TMeta>): void {
+    while (connection.groups.size > 0) {
+      const group = connection.groups.values().next().value;
+      if (!group) break;
+      this.removeConnectionFromGroup(connection, group);
+    }
+  }
+
+  resolveLocalConnections(
+    selector: VinextWebSocketHubTargetSelector,
+    exceptIds = new Set<string>(),
+  ): Set<VinextWebSocketConnectionImpl<TMeta>> {
+    const resolved = new Set<VinextWebSocketConnectionImpl<TMeta>>();
+    const addConnection = (id: string) => {
+      if (exceptIds.has(id)) return;
+      const connection = this.connections.get(id);
+      if (connection) resolved.add(connection);
+    };
+
+    if (selector.all) {
+      for (const id of this.connections.keys()) addConnection(id);
+    }
+    for (const id of selector.connectionIds ?? []) addConnection(id);
+    for (const userId of selector.userIds ?? []) {
+      for (const id of this.users.get(userId) ?? []) addConnection(id);
+    }
+    for (const group of selector.groups ?? []) {
+      for (const id of this.groups.get(group) ?? []) addConnection(id);
+    }
+    return resolved;
+  }
+
+  private deliverLocal(
+    selector: VinextWebSocketHubTargetSelector,
+    data: VinextWebSocketSendData,
+    exceptIds: Set<string>,
+  ): VinextWebSocketDeliveryReport {
+    const report: VinextWebSocketDeliveryReport = {
+      attempted: 0,
+      sent: 0,
+      skipped: 0,
+      failed: 0,
+      failures: [],
+      published: false,
+    };
+    for (const connection of this.resolveLocalConnections(selector, exceptIds)) {
+      report.attempted++;
+      if (connection.socket.readyState !== connection.socket.OPEN) {
+        report.skipped++;
+        continue;
+      }
+      try {
+        connection.socket.send(data);
+        report.sent++;
+      } catch (error) {
+        report.failed++;
+        report.failures.push({ connectionId: connection.id, error });
+      }
+    }
+    return report;
+  }
+
+  private removeConnection(connection: VinextWebSocketConnectionImpl<TMeta>): void {
+    if (this.connections.get(connection.id) !== connection) return;
+    this.connections.delete(connection.id);
+    if (connection.userId) this.removeIndexValue(this.users, connection.userId, connection.id);
+    this.removeConnectionFromAllGroups(connection);
+  }
+
+  private addIndexValue(index: Map<string, Set<string>>, key: string, value: string): void {
+    let values = index.get(key);
+    if (!values) {
+      values = new Set();
+      index.set(key, values);
+    }
+    values.add(value);
+  }
+
+  private removeIndexValue(index: Map<string, Set<string>>, key: string, value: string): void {
+    const values = index.get(key);
+    if (!values) return;
+    values.delete(value);
+    if (values.size === 0) index.delete(key);
+  }
+
+  private async subscribeAdapter(adapter: VinextWebSocketHubAdapter | undefined): Promise<void> {
+    if (!adapter) return;
+    try {
+      const unsubscribe = await adapter.subscribe((envelope) => this.handleEnvelope(envelope));
+      if (unsubscribe) this.unsubscribe = unsubscribe;
+    } catch (error) {
+      this.handleAdapterError(error);
+    }
+  }
+
+  private handleEnvelope(envelope: VinextWebSocketHubEnvelope): void {
+    try {
+      if (envelope.sourceId === this.id || !this.rememberEnvelope(envelope.id)) return;
+      this.deliverLocal(
+        envelope.target,
+        deserializeWebSocketData(envelope.data),
+        new Set(envelope.exceptConnectionIds),
+      );
+    } catch (error) {
+      this.handleAdapterError(error, envelope);
+    }
+  }
+
+  private rememberEnvelope(id: string): boolean {
+    if (this.seenEnvelopeIds.has(id)) return false;
+    this.seenEnvelopeIds.add(id);
+    this.seenEnvelopeOrder.push(id);
+    if (this.seenEnvelopeOrder.length > 1000) {
+      const oldId = this.seenEnvelopeOrder.shift();
+      if (oldId) this.seenEnvelopeIds.delete(oldId);
+    }
+    return true;
+  }
+
+  private handleAdapterError(error: unknown, envelope?: VinextWebSocketHubEnvelope): void {
+    if (this.options.onAdapterError) {
+      this.options.onAdapterError(error, envelope);
+      return;
+    }
+    console.error("[vinext] WebSocket hub adapter error:", error);
+  }
+}
+
+export function createWebSocketHub<TMeta = unknown>(
+  options?: CreateVinextWebSocketHubOptions,
+): VinextWebSocketHub<TMeta> {
+  return new VinextWebSocketHubImpl<TMeta>(options);
 }
 
 function extractHandler(
