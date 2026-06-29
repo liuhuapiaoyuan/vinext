@@ -8,6 +8,9 @@ export type DevServerCliOptions = {
 export function applyDevServerDefaults(server: ServerOptions, options: DevServerCliOptions): void {
   server.port = options.port ?? server.port ?? 3000;
   server.host = options.hostname ?? server.host ?? "localhost";
+  if (server.open === undefined) {
+    server.open = true;
+  }
 }
 
 export function createDevServerConfigPlugin(options: DevServerCliOptions): Plugin {

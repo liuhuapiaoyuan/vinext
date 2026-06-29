@@ -160,7 +160,42 @@ function resolveDevServerOrigin(server: ViteDevServer): string | null {
   return `http://${formattedHost}:${address.port}`;
 }
 
-function normalizeWarmupPath(basePath: string | undefined): string {
+export function normalizeWarmupPath(basePath: string | undefined): string {
   if (!basePath || basePath === "/") return "/";
   return basePath.endsWith("/") ? basePath.slice(0, -1) || "/" : basePath;
+}
+
+export type DevServerOpenPreference = boolean | string;
+
+/**
+ * Map a Vite `server.open` preference to the value temporarily applied before
+ * calling `server.openBrowser()`. When open is `true`, honor Next.js basePath.
+ */
+export function resolveDevServerOpenPreference(
+  open: DevServerOpenPreference,
+  basePath?: string,
+): DevServerOpenPreference {
+  if (typeof open === "string") return open;
+  const path = normalizeWarmupPath(basePath);
+  return path === "/" ? true : path;
+}
+
+/**
+ * Open the dev server in the system browser. Used after App Router warmup so
+ * the first navigation hits a pre-compiled server instead of a cold start.
+ */
+export function openDevServerBrowser(
+  server: ViteDevServer,
+  open: DevServerOpenPreference,
+  basePath?: string,
+): void {
+  if (!open) return;
+
+  const originalOpen = server.config.server.open;
+  try {
+    server.config.server.open = resolveDevServerOpenPreference(open, basePath);
+    server.openBrowser();
+  } finally {
+    server.config.server.open = originalOpen;
+  }
 }

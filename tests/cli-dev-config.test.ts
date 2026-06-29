@@ -12,7 +12,15 @@ describe("applyDevServerDefaults", () => {
 
     applyDevServerDefaults(server, {});
 
-    expect(server).toMatchObject({ host: "localhost", port: 3000 });
+    expect(server).toMatchObject({ host: "localhost", port: 3000, open: true });
+  });
+
+  it("preserves an explicit server.open=false", () => {
+    const server: ServerOptions = { open: false };
+
+    applyDevServerDefaults(server, {});
+
+    expect(server.open).toBe(false);
   });
 
   it("preserves host and port from the Vite config", () => {

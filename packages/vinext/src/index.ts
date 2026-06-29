@@ -40,7 +40,7 @@ import {
 
 import { installSocketErrorBackstop } from "./server/socket-error-backstop.js";
 import { shouldInvalidateAppRouteFile } from "./server/dev-route-files.js";
-import { warmupAppRouterDevServer } from "./server/app-router-dev-warmup.js";
+import { warmupAppRouterDevServer, openDevServerBrowser } from "./server/app-router-dev-warmup.js";
 import { createDirectRunner } from "./server/dev-module-runner.js";
 import { generateRscEntry } from "./entries/app-rsc-entry.js";
 import { generateSsrEntry } from "./entries/app-ssr-entry.js";
@@ -979,6 +979,8 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   // calling `realpathSync` on the (invariant) middleware path for every
   // candidate module.
   let canonicalMiddlewarePathMemo: { raw: string; canonical: string } | null = null;
+  /** When App Router dev warmup runs, Vite's immediate open is suppressed and restored after warmup. */
+  let deferredDevServerOpen: boolean | string | undefined;
   const getCanonicalMiddlewarePath = (): string | null => {
     if (!middlewarePath) return null;
     if (canonicalMiddlewarePathMemo?.raw !== middlewarePath) {
@@ -1961,6 +1963,23 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 ...(typeof config.server?.hmr === "object" ? config.server.hmr : {}),
                 overlay: false,
               };
+        const isDevServe = env?.command === "serve";
+        const resolvedDevServerOpen = isDevServe
+          ? (config.server?.open ?? true)
+          : config.server?.open;
+        const deferDevServerOpenUntilWarmup =
+          isDevServe &&
+          hasAppDir &&
+          !hasCloudflarePlugin &&
+          !hasNitroPlugin &&
+          options.devWarmup !== false &&
+          resolvedDevServerOpen !== false;
+        if (deferDevServerOpenUntilWarmup) {
+          deferredDevServerOpen = resolvedDevServerOpen;
+        } else {
+          deferredDevServerOpen = undefined;
+        }
+        const serverOpenForVite = deferDevServerOpenUntilWarmup ? false : resolvedDevServerOpen;
 
         // Override the default postcss-modules FileSystemLoader so that
         // .scss/.sass files referenced via `composes: from` are preprocessed
@@ -2160,6 +2179,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               origin: /^https?:\/\/(?:(?:[^:]+\.)?localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/,
             },
             hmr: devHmrConfig,
+            ...(isDevServe ? { open: serverOpenForVite } : {}),
           },
           // Configure SSR transform behaviour for Node targets.
           // - `external`: React packages are loaded natively by Node (CJS)
@@ -3876,13 +3896,19 @@ export const loadServerActionClient = ${
               warmupAppRouterDevServer(server, {
                 basePath: nextConfig.basePath,
                 hybridPagesDir: hasPagesDir,
-              }).catch((error) => {
-                server.config.logger.warn(
-                  `[vinext] Dev warmup failed: ${
-                    error instanceof Error ? error.message : String(error)
-                  }`,
-                );
-              });
+              })
+                .then(() => {
+                  if (deferredDevServerOpen !== undefined) {
+                    openDevServerBrowser(server, deferredDevServerOpen, nextConfig.basePath);
+                  }
+                })
+                .catch((error) => {
+                  server.config.logger.warn(
+                    `[vinext] Dev warmup failed: ${
+                      error instanceof Error ? error.message : String(error)
+                    }`,
+                  );
+                });
             };
             if (server.httpServer?.listening) runDevWarmup();
             else server.httpServer?.once("listening", runDevWarmup);

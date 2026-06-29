@@ -375,6 +375,34 @@ describe("optimizeDeps.exclude for vinext", () => {
       expect(devConfig.environments.rsc.resolve.external).not.toContain(
         "vinext/server/app-rsc-handler",
       );
+      expect(devConfig.server.open).toBe(false);
+    } finally {
+      await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }, 15000);
+
+  it("defaults server.open to true for Pages Router dev and keeps immediate Vite open", async () => {
+    const vinext = (await import("../packages/vinext/src/index.js")).default;
+    const mainPlugin = vinext().find(
+      (plugin: any) => plugin.name === "vinext:config" && typeof plugin.config === "function",
+    );
+    expect(mainPlugin).toBeDefined();
+
+    const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-pages-open-"));
+    const rootNodeModules = path.resolve(import.meta.dirname, "../node_modules");
+    await fsp.symlink(rootNodeModules, path.join(tmpDir, "node_modules"), "junction");
+    await fsp.mkdir(path.join(tmpDir, "pages"), { recursive: true });
+    await fsp.writeFile(
+      path.join(tmpDir, "pages", "index.tsx"),
+      `export default function Home() { return <h1>Home</h1>; }`,
+    );
+
+    try {
+      const devConfig = await (mainPlugin as any).config(
+        { root: tmpDir, build: {}, plugins: [] },
+        { command: "serve" },
+      );
+      expect(devConfig.server.open).toBe(true);
     } finally {
       await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     }

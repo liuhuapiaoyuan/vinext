@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   getAppRouterDevWarmupTargets,
+  openDevServerBrowser,
+  resolveDevServerOpenPreference,
   warmupAppRouterDevServer,
   warmupAppRouterVirtualEntries,
 } from "../packages/vinext/src/server/app-router-dev-warmup.js";
@@ -61,6 +63,24 @@ describe("app-router dev warmup", () => {
     const targets = getAppRouterDevWarmupTargets({ hybridPagesDir: false });
     await expect(warmupAppRouterVirtualEntries(server, targets)).resolves.toBeUndefined();
     expect(server.environments.rsc.warmupRequest).toHaveBeenCalled();
+  });
+
+  it("resolves browser open paths for basePath and custom server.open strings", () => {
+    expect(resolveDevServerOpenPreference(true)).toBe(true);
+    expect(resolveDevServerOpenPreference(true, "/docs")).toBe("/docs");
+    expect(resolveDevServerOpenPreference("/dashboard")).toBe("/dashboard");
+  });
+
+  it("opens the browser via server.openBrowser after temporarily restoring server.open", () => {
+    const openBrowser = vi.fn();
+    const server = {
+      config: { server: { open: false } },
+      openBrowser,
+    };
+
+    openDevServerBrowser(server as any, true, "/app");
+    expect(openBrowser).toHaveBeenCalledOnce();
+    expect(server.config.server.open).toBe(false);
   });
 
   it("does not follow warmup probe redirects", async () => {
