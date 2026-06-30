@@ -27,6 +27,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { normalizePathSeparators } from "../utils/path.js";
+import { isPidAlive, terminateProcessTree } from "./dev-process.js";
 
 const LOCK_DIR_RELATIVE = path.join(".vinext", "dev");
 const LOCK_FILE_NAME = "lock.json";
@@ -89,25 +90,7 @@ export function readLockfile(lockfilePath: string): DevServerInfo | undefined {
   }
 }
 
-/**
- * Returns true if a process with the given PID is running.
- *
- * Uses `process.kill(pid, 0)`, which sends a null signal — it doesn't actually
- * kill the process, it just checks if it exists. Throws `ESRCH` if the process
- * doesn't exist, or `EPERM` if it exists but we don't have permission to
- * signal it (in which case it's still running, just owned by someone else).
- */
-export function isPidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    // EPERM means the process exists but we lack permission — still alive.
-    return code === "EPERM";
-  }
-}
+export { isPidAlive } from "./dev-process.js";
 
 /**
  * Writes the lock file with the given content. Creates the parent directory
@@ -182,6 +165,12 @@ type AcquireOptions = {
    * Defaults to `true`. Set to `false` for testing.
    */
   takeOverStale?: boolean;
+  /**
+   * When the lock references a live PID in the same project directory,
+   * terminate that process tree and take over the lock. Turbo monorepo restarts
+   * often leave the previous `vinext dev` alive while browser tabs stay open.
+   */
+  terminateLiveHolder?: boolean;
   /** Register `process.on('exit', release)`. Defaults to `true`. */
   unlockOnExit?: boolean;
 };
@@ -189,6 +178,8 @@ type AcquireOptions = {
 type AcquireSuccess = {
   ok: true;
   lockfile: DevLockfile;
+  /** Set when {@link AcquireOptions.terminateLiveHolder} stopped a live server. */
+  terminatedPid?: number;
 };
 
 type AcquireFailure = {
@@ -212,19 +203,30 @@ type AcquireResult = AcquireSuccess | AcquireFailure;
  * already holds the lock.
  */
 export function tryAcquireLockfile(opts: AcquireOptions): AcquireResult {
-  const { root, info, takeOverStale = true, unlockOnExit = true } = opts;
+  const {
+    root,
+    info,
+    takeOverStale = true,
+    terminateLiveHolder = false,
+    unlockOnExit = true,
+  } = opts;
   const lockfilePath = getLockfilePath(root);
+  let terminatedPid: number | undefined;
 
   const existing = readLockfile(lockfilePath);
   if (existing) {
     const alive = isPidAlive(existing.pid);
     if (alive) {
+      if (terminateLiveHolder) {
+        terminatedPid = existing.pid;
+        terminateProcessTree(existing.pid);
+      } else {
+        return { ok: false, existing, lockfilePath };
+      }
+    } else if (!takeOverStale) {
       return { ok: false, existing, lockfilePath };
     }
-    if (!takeOverStale) {
-      return { ok: false, existing, lockfilePath };
-    }
-    // Existing entry is stale (dead PID). Fall through and overwrite.
+    // Existing entry is stale (dead PID), or was terminated above. Fall through.
   }
 
   // NB: there is a small TOCTOU window between readLockfile() above and
@@ -291,5 +293,5 @@ export function tryAcquireLockfile(opts: AcquireOptions): AcquireResult {
     },
   };
 
-  return { ok: true, lockfile };
+  return { ok: true, lockfile, terminatedPid };
 }

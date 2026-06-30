@@ -47,8 +47,17 @@ import { parseArgs } from "./cli-args.js";
 import {
   type DevLockfile,
   formatAlreadyRunningError,
+  getLockfilePath,
+  readLockfile,
   tryAcquireLockfile,
 } from "./server/dev-lockfile.js";
+import {
+  ensureDevListenPortFree,
+  isPidAlive,
+  terminateProcessTree,
+  waitUntilPidExits,
+} from "./server/dev-process.js";
+import { installDevServerShutdownHandlers } from "./server/dev-server-shutdown.js";
 import { generateRouteTypes } from "./typegen.js";
 import { normalizePathSeparators } from "./utils/path.js";
 import { createDevServerConfigPlugin, normalizeDevServerHostname } from "./cli-dev-config.js";
@@ -332,8 +341,25 @@ async function dev() {
   // post-listen update(). `startedAt` is meant to reflect when this process
   // started, not when the URL was resolved.
   const startedAt = Date.now();
+  let server: import("vite").ViteDevServer | undefined;
+  installDevServerShutdownHandlers({
+    getServer: () => server,
+    getLockfile: () => lockfile,
+  });
+
+  const root = process.cwd();
+  const priorLock =
+    process.env.VINEXT_NO_DEV_LOCK !== "1" ? readLockfile(getLockfilePath(root)) : undefined;
+
+  if (priorLock?.pid && isPidAlive(priorLock.pid)) {
+    terminateProcessTree(priorLock.pid);
+    await waitUntilPidExits(priorLock.pid, 5_000);
+  }
+  if (priorLock?.port) {
+    await ensureDevListenPortFree(priorLock.port, priorLock.hostname);
+  }
+
   if (process.env.VINEXT_NO_DEV_LOCK !== "1") {
-    const root = process.cwd();
     // Substitute "localhost" for wildcard binds so the URL is actually
     // clickable when surfaced in the lock file before server.listen() has
     // had a chance to resolve the real URL.
@@ -348,6 +374,7 @@ async function dev() {
         startedAt,
         cwd: root,
       },
+      terminateLiveHolder: true,
     });
     if (!acquired.ok) {
       console.error(
@@ -362,6 +389,15 @@ async function dev() {
       process.exit(1);
     }
     lockfile = acquired.lockfile;
+    if (acquired.terminatedPid !== undefined) {
+      await waitUntilPidExits(acquired.terminatedPid, 5_000);
+    }
+  }
+
+  const portsToFree = new Set([initialPort]);
+  if (priorLock?.port) portsToFree.add(priorLock.port);
+  for (const port of portsToFree) {
+    await ensureDevListenPortFree(port, priorLock?.hostname ?? initialHost);
   }
 
   printVinextStartupBanner({
@@ -379,7 +415,6 @@ async function dev() {
   // don't leave a misleading "server running" entry behind in the brief
   // window before the exit handler runs. The exit handler still serves as
   // a safety net for unexpected exit paths.
-  let server;
   try {
     server = await vite.createServer(config);
     const port = server.config.server.port ?? 3000;
@@ -394,6 +429,7 @@ async function dev() {
       cwd: process.cwd(),
     });
 
+    await ensureDevListenPortFree(port, host);
     await server.listen();
   } catch (err) {
     lockfile?.release();
