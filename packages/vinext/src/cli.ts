@@ -52,6 +52,7 @@ import {
 import { generateRouteTypes } from "./typegen.js";
 import { normalizePathSeparators } from "./utils/path.js";
 import { createDevServerConfigPlugin, normalizeDevServerHostname } from "./cli-dev-config.js";
+import { printVinextStartupBanner } from "./cli-banner.js";
 
 // ─── Resolve Vite from the project root ────────────────────────────────────────
 //
@@ -363,7 +364,11 @@ async function dev() {
     lockfile = acquired.lockfile;
   }
 
-  console.log(`\n  vinext dev  (Vite ${getViteVersion()})\n`);
+  printVinextStartupBanner({
+    version: VERSION,
+    command: "dev",
+    detail: `Vite ${getViteVersion()}`,
+  });
 
   const config = buildViteConfig();
   const plugins = (config.plugins ??= []) as import("vite").PluginOption[];
@@ -460,7 +465,11 @@ async function buildApp() {
   const withBuildBundlerOptions = (bundlerOptions: Record<string, unknown>) =>
     viteMajorVersion >= 8 ? { rolldownOptions: bundlerOptions } : { rollupOptions: bundlerOptions };
 
-  console.log(`\n  vinext build  (Vite ${getViteVersion()})\n`);
+  printVinextStartupBanner({
+    version: VERSION,
+    command: "build",
+    detail: `Vite ${getViteVersion()}`,
+  });
 
   const root = process.cwd();
   const isApp = hasAppDir(normalizePathSeparators(root));
@@ -702,7 +711,11 @@ async function start() {
   const port = parsed.port ?? parseInt(process.env.PORT ?? "3000", 10);
   const host = parsed.hostname ?? "0.0.0.0";
 
-  console.log(`\n  vinext start  (port ${port})\n`);
+  printVinextStartupBanner({
+    version: VERSION,
+    command: "start",
+    detail: `port ${port}`,
+  });
 
   const { startProdServer } = (await import(/* @vite-ignore */ "./server/prod-server.js")) as {
     startProdServer: (opts: { port: number; host: string; outDir: string }) => Promise<unknown>;
@@ -780,7 +793,11 @@ async function deployCommand() {
   if (parsed.help) return printHelp("deploy");
 
   await loadVite();
-  console.log(`\n  vinext deploy  (Vite ${getViteVersion()})\n`);
+  printVinextStartupBanner({
+    version: VERSION,
+    command: "deploy",
+    detail: `Vite ${getViteVersion()}`,
+  });
 
   await runDeploy({
     root: process.cwd(),
