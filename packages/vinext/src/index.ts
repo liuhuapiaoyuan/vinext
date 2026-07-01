@@ -108,6 +108,7 @@ import { emitNextClientRuntimeManifests } from "./build/next-client-runtime-mani
 import { collectInlineCssManifest, injectInlineCssManifestGlobal } from "./build/inline-css.js";
 import { validateDevRequest } from "./server/dev-origin-check.js";
 import { installDevStackSourcemapMiddleware } from "./server/dev-stack-sourcemap.js";
+import { applyDevServerRestartPolicy } from "./server/dev-server-restart.js";
 import {
   handleNodeWebSocketUpgrade,
   isViteHmrWebSocketUpgrade,
@@ -974,6 +975,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   let instrumentationPath: string | null = null;
   let instrumentationClientPath: string | null = null;
   let clientInjectModule: string | null = null;
+  let shouldApplyDevServerRestartPolicy = false;
   // Resolved in the `config` hook from the user's `build.assetsInlineLimit`
   // (default 0 = always emit files, matching Next's `asset/resource`). Read by
   // the per-environment build config and the `configEnvironment` defaults
@@ -2007,6 +2009,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 overlay: false,
               };
         const isDevServe = env?.command === "serve";
+        shouldApplyDevServerRestartPolicy = isDevServe && env?.isPreview !== true;
         const resolvedDevServerOpen = isDevServe
           ? (config.server?.open ?? true)
           : config.server?.open;
@@ -2829,6 +2832,13 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
       },
 
       async configResolved(config) {
+        if (shouldApplyDevServerRestartPolicy) {
+          applyDevServerRestartPolicy(
+            config as Parameters<typeof applyDevServerRestartPolicy>[0],
+            root,
+          );
+        }
+
         const cacheDirPrefix = getCacheDirPrefix(config.cacheDir);
         typeofWindowIdFilter.exclude = new RegExp(`^${escapeRegExp(cacheDirPrefix)}`);
 
