@@ -14,7 +14,9 @@ export const VINEXT_SHIM_OPTIMIZE_DEPS_INCLUDE = Object.freeze(["next/dynamic", 
 /**
  * Runtime deps pulled by the `next/image` shim (`@unpic/react` for remote CDN
  * transforms, `ipaddr.js` for private-IP validation). Pre-included on the
- * client so first `<Image>` render does not trigger a dep-optimizer reload.
+ * client when resolvable from the project root so first `<Image>` render does
+ * not trigger a dep-optimizer reload. Filtered like optional deps so pnpm
+ * monorepos do not warn when these are only transitive vinext dependencies.
  *
  * SSR keeps `ipaddr.js` in `optimizeDeps.exclude` — it is externalized there
  * and must not be pre-bundled into `deps_ssr/`.
@@ -225,7 +227,7 @@ export function resolveClientOptimizeDepsInclude(
 ): string[] {
   return mergeOptimizeDepsInclude(
     VINEXT_SHIM_OPTIMIZE_DEPS_INCLUDE,
-    VINEXT_IMAGE_RUNTIME_OPTIMIZE_DEPS_INCLUDE,
+    filterInstalledOptimizeDepsInclude(projectRoot, VINEXT_IMAGE_RUNTIME_OPTIMIZE_DEPS_INCLUDE),
     filterInstalledOptimizeDepsInclude(projectRoot, VINEXT_OPTIONAL_CLIENT_OPTIMIZE_DEPS_INCLUDE),
     ...extraGroups,
   );

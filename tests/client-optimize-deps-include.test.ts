@@ -76,9 +76,31 @@ describe("client optimizeDeps include", () => {
 
     expect(include).toContain("next/dynamic");
     expect(include).toContain("next/image");
-    expect(include).toContain("@unpic/react");
-    expect(include).toContain("ipaddr.js");
     expect(include).toContain("react");
     expect(new Set(include).size).toBe(include.length);
+
+    const imageRuntime = filterInstalledOptimizeDepsInclude(
+      repoRoot,
+      VINEXT_IMAGE_RUNTIME_OPTIMIZE_DEPS_INCLUDE,
+    );
+    for (const entry of imageRuntime) {
+      expect(include).toContain(entry);
+    }
+  });
+
+  it("omits next/image runtime deps when they are not installed in the project", async () => {
+    const os = await import("node:os");
+    const fsp = await import("node:fs/promises");
+
+    const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-optdeps-image-"));
+    await fsp.writeFile(path.join(tmpDir, "package.json"), JSON.stringify({ name: "fixture" }));
+
+    try {
+      const include = resolveClientOptimizeDepsInclude(tmpDir);
+      expect(include).not.toContain("ipaddr.js");
+      expect(include).not.toContain("@unpic/react");
+    } finally {
+      await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    }
   });
 });

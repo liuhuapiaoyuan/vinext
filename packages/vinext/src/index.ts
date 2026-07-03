@@ -29,6 +29,7 @@ import {
   normalizeViteResolveExtensions,
   createValidFileMatcher,
   findFileWithExts,
+  isDirectory,
 } from "./routing/file-matcher.js";
 import { createSSRHandler } from "./server/dev-server.js";
 import { handleApiRoute } from "./server/api-handler.js";
@@ -1791,10 +1792,10 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           baseDir = normalizePathSeparators(dir);
         } else {
           // Auto-detect: prefer root-level app/ and pages/, fall back to src/
-          const hasRootApp = fs.existsSync(path.posix.join(root, "app"));
-          const hasRootPages = fs.existsSync(path.posix.join(root, "pages"));
-          const hasSrcApp = fs.existsSync(path.posix.join(root, "src", "app"));
-          const hasSrcPages = fs.existsSync(path.posix.join(root, "src", "pages"));
+          const hasRootApp = isDirectory(path.posix.join(root, "app"));
+          const hasRootPages = isDirectory(path.posix.join(root, "pages"));
+          const hasSrcApp = isDirectory(path.posix.join(root, "src", "app"));
+          const hasSrcPages = isDirectory(path.posix.join(root, "src", "pages"));
 
           if (hasRootApp || hasRootPages) {
             baseDir = root;
@@ -1808,8 +1809,8 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         pagesDir = path.posix.join(baseDir, "pages");
         canonicalPagesDir = canonicalize(pagesDir);
         appDir = path.posix.join(baseDir, "app");
-        hasPagesDir = fs.existsSync(pagesDir);
-        hasAppDir = !options.disableAppRouter && fs.existsSync(appDir);
+        hasPagesDir = isDirectory(pagesDir);
+        hasAppDir = !options.disableAppRouter && isDirectory(appDir);
 
         // Load next.config.js if present (always from project root, not src/),
         // unless vinext({ nextConfig }) explicitly overrides it.
@@ -3501,6 +3502,13 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             clientEntry: string;
             ssrManifest?: Record<string, string[]>;
           } = { clientEntry: DEV_PAGES_CLIENT_ENTRY };
+          // App-only projects still import this virtual module from the RSC
+          // entry. Skip scanning pages/ when the directory is absent — upstream
+          // #2423 added unconditional pagesRouter() here, which breaks dev
+          // warmup for pure App Router apps (ENOENT on missing pages/).
+          if (!hasPagesDir) {
+            return `export default ${JSON.stringify(metadata)};`;
+          }
           const ssrManifest: Record<string, string[]> = {};
           const appFilePath = findFileWithExts(pagesDir, "_app", fileMatcher);
           const pagesRoutes = await pagesRouter(pagesDir, nextConfig?.pageExtensions, fileMatcher);

@@ -1,5 +1,6 @@
 import http from "node:http";
 import fsp from "node:fs/promises";
+import path from "node:path";
 import { type ViteDevServer } from "vite";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { APP_FIXTURE_DIR, fetchHtml, startFixtureServer } from "./helpers.js";
@@ -2285,5 +2286,35 @@ describe("App Router integration", () => {
   it("allows page requests without Origin header", async () => {
     const res = await fetch(`${baseUrl}/`);
     expect(res.status).toBe(200);
+  });
+});
+
+// Ported from upstream merge regression: f4a96c99 (#2423) scanned pages/ from
+// virtual:vinext-pages-client-assets even on App-only projects, breaking dev
+// warmup when pages/ is absent.
+describe("app-only pages-client-assets", () => {
+  const APP_WITH_SRC_DIR = path.resolve(import.meta.dirname, "./fixtures/app-with-src");
+  let server: ViteDevServer;
+
+  beforeAll(async () => {
+    ({ server } = await startFixtureServer(APP_WITH_SRC_DIR, {
+      appDir: path.join(APP_WITH_SRC_DIR, "src"),
+    }));
+  }, 60_000);
+
+  afterAll(async () => {
+    await server?.close();
+  });
+
+  it("loads pages-client-assets without scanning missing pages/", async () => {
+    const targets = getAppRouterDevWarmupTargets({ hybridPagesDir: false });
+    const rsc = await server.environments.rsc.transformRequest(targets.rsc[0]);
+    expect(rsc?.code).toBeTruthy();
+
+    const assetsTransform = await server.environments.rsc.transformRequest(
+      "\0virtual:vinext-pages-client-assets",
+    );
+    expect(assetsTransform?.code).toContain('"/@id/__x00__virtual:vinext-client-entry"');
+    expect(assetsTransform?.code).not.toContain("pagesRouter");
   });
 });

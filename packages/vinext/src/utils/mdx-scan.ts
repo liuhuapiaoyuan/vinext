@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { isDirectory } from "../routing/file-matcher.js";
 
 /** Module-level cache for hasMdxFiles — avoids re-scanning per Vite environment. */
 export const mdxScanCache = new Map<string, boolean>();
@@ -12,7 +13,7 @@ export function hasMdxFiles(root: string, appDir: string | null, pagesDir: strin
   if (mdxScanCache.has(cacheKey)) return mdxScanCache.get(cacheKey)!;
   const dirs = [appDir, pagesDir].filter(Boolean) as string[];
   for (const dir of dirs) {
-    if (fs.existsSync(dir) && scanDirForMdx(dir)) {
+    if (isDirectory(dir) && scanDirForMdx(dir)) {
       mdxScanCache.set(cacheKey, true);
       return true;
     }

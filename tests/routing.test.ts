@@ -64,6 +64,17 @@ function makeTestAppRoute(
 }
 
 describe("pagesRouter - route discovery", () => {
+  it("returns no routes when pages/ is missing", async () => {
+    const os = await import("node:os");
+    const fsp = await import("node:fs/promises");
+    const missingPagesDir = path.join(
+      await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-no-pages-")),
+      "pages",
+    );
+
+    await expect(pagesRouter(missingPagesDir)).resolves.toEqual([]);
+  });
+
   it("discovers pages from the fixture directory", async () => {
     const routes = await pagesRouter(FIXTURE_DIR);
 
