@@ -1,5 +1,12 @@
 # vinext
 
+## 0.2.831
+
+### Patch Changes
+
+- 20e1076:
+- 183e4cd: fix app-only dev warmup regression by skipping pages scan in pages-client-assets when pages/ is absent, use isDirectory for router detection, and filter next/image optimizeDeps to installed packages in monorepos
+
 ## 0.2.0
 
 Today's release includes a revamped `vinext init` command, moving the deploy command to `npx @vinext/cloudflare deploy`, more support for configuring vinext in your Vite config file, and a bunch of bug fixes.
