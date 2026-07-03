@@ -13,6 +13,10 @@ concurrency:
 
 jobs:
   deploy:
+    # This workflow deploys a fixed Cloudflare Worker using repository secrets.
+    # Forks still receive pushes to their own main branch, but they do not have
+    # the canonical repo's Cloudflare credentials.
+    if: github.repository_owner == 'cloudflare'
     name: Deploy and smoke test
     runs-on: ubuntu-latest
     env:
@@ -100,12 +104,12 @@ jobs:
         working-directory: ${{ runner.temp }}/cna-cloudflare
         run: test -f dist/server/wrangler.json
 
-      - name: Deploy generated Cloudflare build
+      - name: Deploy generated Cloudflare project
         working-directory: ${{ runner.temp }}/cna-cloudflare
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: vp exec wrangler deploy --config dist/server/wrangler.json
+        run: vp exec vinext-cloudflare deploy --skip-build
 
       - name: Smoke test generated Cloudflare deployment
         run: |

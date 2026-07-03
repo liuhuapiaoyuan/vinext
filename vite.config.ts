@@ -3,6 +3,8 @@ import { defineConfig } from "vite-plus";
 import { randomUUID } from "node:crypto";
 
 const SHIMS_SRC = path.resolve(import.meta.dirname, "packages/vinext/src/shims");
+const VINEXT_SRC = path.resolve(import.meta.dirname, "packages/vinext/src");
+const CLOUDFLARE_SRC = path.resolve(import.meta.dirname, "packages/cloudflare/src");
 const MSW_SETUP = path.resolve(import.meta.dirname, "tests/_msw/setup.ts");
 
 // Resolve own-workspace sources directly in tests so the vinext <->
@@ -14,7 +16,10 @@ const WORKSPACE_SRC_ALIAS = {
     import.meta.dirname,
     "packages/vinext/src/server/pages-client-assets.ts",
   ),
+  "vinext/internal": VINEXT_SRC,
+  "@vinext/cloudflare/internal": CLOUDFLARE_SRC,
   "@vinext/cloudflare/cache": path.resolve(import.meta.dirname, "packages/cloudflare/src/cache"),
+  "@vinext/cloudflare/images": path.resolve(import.meta.dirname, "packages/cloudflare/src/images"),
 };
 
 export default defineConfig({
@@ -158,6 +163,7 @@ export default defineConfig({
             // When adding a test that calls startFixtureServer() or createServer(),
             // move it here.
             "tests/app-router-client-preloading.test.ts",
+            "tests/app-router-deployment-id.test.ts",
             "tests/app-router-dev-server.test.ts",
             "tests/app-router-external-rewrite.test.ts",
             "tests/app-router-font-google-prod.test.ts",
@@ -216,6 +222,7 @@ export default defineConfig({
           // `setupServer` rather than reverting this exclusion.
           include: [
             "tests/app-router-client-preloading.test.ts",
+            "tests/app-router-deployment-id.test.ts",
             "tests/app-router-dev-server.test.ts",
             "tests/app-router-external-rewrite.test.ts",
             "tests/app-router-font-google-prod.test.ts",

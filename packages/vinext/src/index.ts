@@ -1,5 +1,6 @@
 import type {
   CSSModulesOptions,
+  Logger,
   Plugin,
   PluginOption,
   ResolvedConfig,
@@ -64,6 +65,7 @@ import {
   collectRouteClassificationManifest,
   type RouteClassificationManifest,
 } from "./build/route-classification-manifest.js";
+import { extractMiddlewareMatcherConfig, hasExportedName } from "./build/report.js";
 import { planRouteClassificationInjection } from "./build/route-classification-injector.js";
 import { normalizePathnameForRouteMatchStrict } from "./routing/utils.js";
 import {
@@ -79,8 +81,12 @@ import {
 import { mergeServerExternalPackages } from "./config/server-external-packages.js";
 
 import { findMiddlewareFile, isProxyFile, runMiddleware } from "./server/middleware.js";
-import { isNextDataPathname, parseNextDataPathname } from "./server/pages-data-route.js";
-import { resolvePagesI18nRequest } from "./server/pages-i18n.js";
+import {
+  isNextDataPathname,
+  normalizeNextDataPagePathname,
+  parseNextDataPathname,
+} from "./server/pages-data-route.js";
+import { resolvePagesI18nRequest, stripI18nLocaleForApiRoute } from "./server/pages-i18n.js";
 import {
   MIDDLEWARE_NEXT_HEADER,
   MIDDLEWARE_REWRITE_HEADER,
@@ -127,7 +133,11 @@ import {
   validateHybridRouteConflicts,
 } from "./server/hybrid-route-priority.js";
 import { matchesRewriteSource, proxyExternalRequest } from "./config/config-matchers.js";
-import { detectPackageManager } from "./utils/project.js";
+import {
+  detectPackageManager,
+  formatMissingCloudflarePluginError,
+  hasWranglerConfig,
+} from "./utils/project.js";
 import { isUnknownRecord as isRecord } from "./utils/record.js";
 import { VIRTUAL_MODULE_ID_RE, VIRTUAL_PREFIX } from "./utils/virtual-module.js";
 import { ASSET_PREFIX_URL_DIR, resolveAssetsDir } from "./utils/asset-prefix.js";
@@ -137,7 +147,9 @@ import { clientReferenceDedupPlugin } from "./plugins/client-reference-dedup.js"
 import { dataUrlCssPlugin } from "./plugins/css-data-url.js";
 import { createCssModuleImportCompatibilityPlugin } from "./plugins/css-module-imports.js";
 import { createRscClientReferenceLoadersPlugin } from "./plugins/rsc-client-reference-loaders.js";
+import { createRscReferenceValidationNormalizerPlugin } from "./plugins/rsc-reference-validation-normalizer.js";
 import { createInstrumentationClientTransformPlugin } from "./plugins/instrumentation-client.js";
+import { createStyledJsxPlugin } from "./plugins/styled-jsx.js";
 import {
   generateInstrumentationClientInjectModule,
   INSTRUMENTATION_CLIENT_EMPTY_MODULE,
@@ -166,8 +178,6 @@ import {
   createGoogleFontsPlugin,
   createLocalFontsPlugin,
 } from "./plugins/fonts.js";
-import { hasWranglerConfig } from "./cloudflare/project.js";
-import { formatMissingCloudflarePluginError } from "./cloudflare/deploy-config.js";
 import { computeClientRuntimeMetadata } from "./utils/client-runtime-metadata.js";
 import {
   VINEXT_CLIENT_ENTRY_MANIFEST,
@@ -183,6 +193,7 @@ import {
 import { resolvePostcssStringPlugins } from "./plugins/postcss.js";
 import {
   buildSassPreprocessorOptions,
+  createSassCssUrlAssetImporter,
   createSassTildeImporter,
   createSassAwareFileSystemLoader,
 } from "./plugins/sass.js";
@@ -236,6 +247,30 @@ import {
   getViteMajorVersion,
   serializeViteDefine,
 } from "./utils/vite-version.js";
+import {
+  normalizeVinextPrerenderConfig,
+  VINEXT_PRERENDER_CONFIG_PLUGIN_PROPERTY,
+  type VinextPrerenderConfig,
+} from "./config/prerender.js";
+
+const PAGES_CLOUDFLARE_WORKER_OPTIMIZE_DEPS_EXCLUDE = Object.freeze([
+  "vinext/server/fetch-handler",
+  "vinext/server/pages-router-entry",
+]);
+
+const PAGES_CLOUDFLARE_WORKER_OPTIMIZE_DEPS_INCLUDE = Object.freeze([
+  "react",
+  "react-dom",
+  "react-dom/server.edge",
+  "react/jsx-runtime",
+  "react/jsx-dev-runtime",
+  "use-sync-external-store/with-selector",
+]);
+
+const OPTIONAL_OPTIMIZE_DEPS_WARNING_RE =
+  /Failed to resolve dependency: .*use-sync-external-store\/with-selector.*present in .* 'optimizeDeps\.include'/;
+const VINEXT_FILTERED_OPTIMIZE_DEPS_WARN = Symbol.for("vinext.filteredOptimizeDepsWarn");
+const ANSI_ESCAPE_RE = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g");
 
 // Install the process-level peer-disconnect backstop at module load.
 // Vite plugin lifecycle hooks (config / configureServer) proved
@@ -375,6 +410,205 @@ function isVinextOgShimImporter(importer: string | undefined): boolean {
 
 function toRelativeFileEntry(root: string, absPath: string): string {
   return path.relative(root, absPath).split(path.sep).join("/");
+}
+
+const DEV_PAGES_CLIENT_ENTRY = "/@id/__x00__virtual:vinext-client-entry";
+const STYLESHEET_IMPORT_RE = /\.(?:css|scss|sass)$/i;
+const STYLESHEET_FILE_RE = /\.(?:css|scss|sass)$/i;
+const SCRIPT_IMPORT_RE = /\.(?:[cm]?[jt]sx?)$/i;
+const GLOBAL_NOT_FOUND_CSS_QUERY = "?vinext-global-not-found-css";
+
+type ResolveFromImporter = (
+  id: string,
+  importer?: string,
+  options?: { skipSelf?: boolean },
+) => Promise<{ id: string } | null | undefined>;
+
+type AstStaticDependencyDeclaration = ASTNode & {
+  type?: string;
+  importKind?: string;
+  exportKind?: string;
+  source?: { value?: unknown };
+  specifiers?: Array<{ importKind?: string; exportKind?: string }>;
+  attributes?: unknown[];
+};
+
+type MagicStringTransformResult = {
+  code: string;
+  map: ReturnType<MagicString["generateMap"]>;
+};
+
+function toMagicStringTransformResult(output: MagicString): MagicStringTransformResult {
+  return {
+    code: output.toString(),
+    map: output.generateMap({ hires: "boundary" }),
+  };
+}
+
+function parserLanguageForScript(id: string): "ts" | "tsx" {
+  const cleanId = stripViteModuleQuery(id).toLowerCase();
+  return cleanId.endsWith(".ts") || cleanId.endsWith(".mts") || cleanId.endsWith(".cts")
+    ? "ts"
+    : "tsx";
+}
+
+function isStylesheetSpecifier(specifier: string): boolean {
+  if (specifier.includes("?") || specifier.includes("#")) return false;
+  return STYLESHEET_IMPORT_RE.test(specifier.toLowerCase());
+}
+
+function isMdxModuleId(id: string): boolean {
+  return stripViteModuleQuery(id).toLowerCase().endsWith(".mdx");
+}
+
+function isolateMdxStylesheetImports(code: string): MagicStringTransformResult | null {
+  const importRe = /(^|[;\n])(\s*import\s*)(["'])([^"'\n;]+)(\3)/g;
+  let output: MagicString | null = null;
+  for (const match of code.matchAll(importRe)) {
+    const specifier = match[4];
+    if (!isStylesheetSpecifier(specifier)) continue;
+
+    const specifierStart = match.index! + match[1].length + match[2].length + match[3].length;
+    const specifierEnd = specifierStart + specifier.length;
+    output ??= new MagicString(code);
+    output.overwrite(specifierStart, specifierEnd, specifier + GLOBAL_NOT_FOUND_CSS_QUERY);
+  }
+  return output ? toMagicStringTransformResult(output) : null;
+}
+
+function isolateGlobalNotFoundStylesheetImports(
+  code: string,
+  id: string,
+): MagicStringTransformResult | null {
+  if (isMdxModuleId(id)) {
+    return isolateMdxStylesheetImports(code);
+  }
+
+  let ast: ReturnType<typeof parseAst>;
+  try {
+    ast = parseAst(code, { lang: parserLanguageForScript(id) });
+  } catch {
+    return null;
+  }
+
+  let output: MagicString | null = null;
+  for (const statement of ast.body as AstStaticDependencyDeclaration[]) {
+    if (statement.type !== "ImportDeclaration" || statement.importKind === "type") continue;
+    if (statement.specifiers && statement.specifiers.length > 0) continue;
+    if (statement.attributes && statement.attributes.length > 0) continue;
+
+    const source = statement.source;
+    const specifier = source?.value;
+    if (typeof specifier !== "string" || !isStylesheetSpecifier(specifier)) continue;
+
+    const range = source as typeof source & { start?: number; end?: number };
+    if (typeof range.start !== "number" || typeof range.end !== "number") continue;
+
+    output ??= new MagicString(code);
+    output.overwrite(
+      range.start,
+      range.end,
+      JSON.stringify(specifier + GLOBAL_NOT_FOUND_CSS_QUERY),
+    );
+  }
+
+  return output ? toMagicStringTransformResult(output) : null;
+}
+
+function isScriptModuleId(id: string): boolean {
+  return SCRIPT_IMPORT_RE.test(stripViteModuleQuery(id).toLowerCase());
+}
+
+function skipCommonjsForLocalCjs(id: string): false | undefined {
+  const cleanId = normalizePathSeparators(stripViteModuleQuery(id));
+  return /\.c[jt]s$/i.test(cleanId) && !cleanId.includes("node_modules") ? false : undefined;
+}
+
+function hasOnlyTypeSpecifiers(statement: AstStaticDependencyDeclaration): boolean {
+  return (
+    statement.specifiers !== undefined &&
+    statement.specifiers.length > 0 &&
+    statement.specifiers.every(
+      (specifier) => specifier.importKind === "type" || specifier.exportKind === "type",
+    )
+  );
+}
+
+function resolvedStylesheetToDevManifestAsset(root: string, resolvedId: string): string | null {
+  const cleanId = stripViteModuleQuery(resolvedId);
+  if (!path.isAbsolute(cleanId)) return null;
+
+  const rootForRelative = tryRealpathSync(root) ?? root;
+  const fileForRelative = tryRealpathSync(cleanId) ?? cleanId;
+  const relativePath = path.relative(rootForRelative, fileForRelative);
+  if (relativePath !== "" && !relativePath.startsWith("..") && !path.isAbsolute(relativePath)) {
+    return normalizePathSeparators(relativePath);
+  }
+
+  const normalized = normalizePathSeparators(cleanId);
+  return `@fs/${normalized.replace(/^\/+/, "")}`;
+}
+
+async function collectDevPagesAppStylesheetAssets(
+  root: string,
+  appFilePath: string,
+  resolve: ResolveFromImporter,
+): Promise<string[]> {
+  const stylesheetAssets: string[] = [];
+  const seenAssets = new Set<string>();
+  const seenModules = new Set<string>();
+
+  async function visitModule(modulePath: string): Promise<void> {
+    const cleanModulePath = stripViteModuleQuery(modulePath);
+    if (!path.isAbsolute(cleanModulePath) || !fs.existsSync(cleanModulePath)) return;
+    if (seenModules.has(cleanModulePath)) return;
+    seenModules.add(cleanModulePath);
+
+    let ast: ReturnType<typeof parseAst>;
+    try {
+      ast = parseAst(fs.readFileSync(cleanModulePath, "utf-8"), {
+        lang: parserLanguageForScript(cleanModulePath),
+      });
+    } catch {
+      return;
+    }
+
+    for (const statement of ast.body as AstStaticDependencyDeclaration[]) {
+      if (
+        statement.type !== "ImportDeclaration" &&
+        statement.type !== "ExportNamedDeclaration" &&
+        statement.type !== "ExportAllDeclaration"
+      ) {
+        continue;
+      }
+      if (statement.importKind === "type") continue;
+      if (statement.exportKind === "type") continue;
+      if (hasOnlyTypeSpecifiers(statement)) continue;
+      if (statement.attributes && statement.attributes.length > 0) continue;
+
+      const specifier = statement.source?.value;
+      if (typeof specifier !== "string") continue;
+
+      const resolved = await resolve(specifier, cleanModulePath, { skipSelf: true });
+      if (!resolved?.id) continue;
+
+      if (isStylesheetSpecifier(specifier)) {
+        const asset = resolvedStylesheetToDevManifestAsset(root, resolved.id);
+        if (!asset || seenAssets.has(asset)) continue;
+        seenAssets.add(asset);
+        stylesheetAssets.push(asset);
+        continue;
+      }
+
+      if (specifier.includes("?") || specifier.includes("#")) continue;
+      if (isScriptModuleId(resolved.id)) {
+        await visitModule(resolved.id);
+      }
+    }
+  }
+
+  await visitModule(appFilePath);
+  return stylesheetAssets;
 }
 
 const TSCONFIG_FILES = ["tsconfig.json", "jsconfig.json"];
@@ -579,6 +813,30 @@ type UserResolveConfigWithTsconfigPaths = NonNullable<UserConfig["resolve"]> & {
   tsconfigPaths?: boolean;
 };
 
+function mergeStringArrayValues(
+  value: string | readonly string[] | undefined,
+  additions: readonly string[],
+): string[] {
+  const existing = value === undefined ? [] : Array.isArray(value) ? value : [value];
+  return [...new Set([...existing, ...additions])];
+}
+
+function stripAnsi(value: string): string {
+  return value.replace(ANSI_ESCAPE_RE, "");
+}
+
+function suppressOptionalOptimizeDepsWarnings(logger: Logger): void {
+  const marker = logger as Logger & { [VINEXT_FILTERED_OPTIMIZE_DEPS_WARN]?: true };
+  if (marker[VINEXT_FILTERED_OPTIMIZE_DEPS_WARN]) return;
+
+  const warn = logger.warn.bind(logger);
+  logger.warn = (msg, options) => {
+    if (OPTIONAL_OPTIMIZE_DEPS_WARNING_RE.test(stripAnsi(msg))) return;
+    warn(msg, options);
+  };
+  marker[VINEXT_FILTERED_OPTIMIZE_DEPS_WARN] = true;
+}
+
 // Cache materialized tsconfig/jsconfig aliases so Vite's glob and dynamic-import
 // transforms can see them via resolve.alias without re-reading config files per env.
 const _tsconfigAliasCache = new Map<string, Record<string, string>>();
@@ -601,6 +859,8 @@ function resolveTsconfigAliases(projectRoot: string): Record<string, string> {
 }
 
 // Virtual module IDs for Pages Router production build
+const VIRTUAL_WORKER_ENTRY = "virtual:vinext-worker-entry";
+const RESOLVED_WORKER_ENTRY = VIRTUAL_PREFIX + VIRTUAL_WORKER_ENTRY;
 const VIRTUAL_SERVER_ENTRY = "virtual:vinext-server-entry";
 const RESOLVED_SERVER_ENTRY = VIRTUAL_PREFIX + VIRTUAL_SERVER_ENTRY;
 const VIRTUAL_CLIENT_ENTRY = "virtual:vinext-client-entry";
@@ -891,6 +1151,26 @@ export type VinextOptions = {
    */
   precompress?: boolean;
   /**
+   * Pre-render routes after `vinext build` without passing
+   * `--prerender-all`.
+   *
+   * Use `true` as shorthand for `{ routes: "*" }`. The object form is
+   * available so future releases can support narrower route selections, but
+   * currently only `"*"` is supported.
+   *
+   * The `vinext build --prerender-all` and `vinext deploy --prerender-all`
+   * flags still work and take priority when present.
+   *
+   * @example
+   * vinext({ prerender: true })
+   *
+   * @example
+   * vinext({ prerender: { routes: "*" } })
+   *
+   * @default undefined
+   */
+  prerender?: VinextPrerenderConfig;
+  /**
    * Configure cache handlers declaratively, so you don't need a custom worker
    * entry that calls `setDataCacheHandler()` / `setCdnCacheAdapter()`. Each slot
    * is a `{ adapter, options }` descriptor pointing at an adapter module whose
@@ -962,6 +1242,7 @@ type NitroSetupContext = {
 };
 
 export default function vinext(options: VinextOptions = {}): PluginOption[] {
+  const prerenderConfig = normalizeVinextPrerenderConfig(options.prerender);
   const viteMajorVersion = getViteMajorVersion();
   let root: string;
   let pagesDir: string;
@@ -976,6 +1257,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   let instrumentationClientPath: string | null = null;
   let clientInjectModule: string | null = null;
   let shouldApplyDevServerRestartPolicy = false;
+  let globalNotFoundCssIsolationPath: string | null = null;
   // Resolved in the `config` hook from the user's `build.assetsInlineLimit`
   // (default 0 = always emit files, matching Next's `asset/resource`). Read by
   // the per-environment build config and the `configEnvironment` defaults
@@ -985,6 +1267,8 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   let hasCloudflarePlugin = false;
   let warnedInlineNextConfigOverride = false;
   let hasNitroPlugin = false;
+  let isServeCommand = false;
+  let pagesOptimizeEntries: string[] = [];
   const pagesClientAssetsOutputDirs = new Set<string>();
   let pagesClientAssetsModule: string | null = null;
   let rscCompatibilityId: string | undefined;
@@ -1101,6 +1385,9 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
     return _generateClientEntry(pagesDir, nextConfig, fileMatcher, {
       appPrefetchRoutes,
       instrumentationClientPath,
+      middlewareMatcher: middlewarePath
+        ? extractMiddlewareMatcherConfig(middlewarePath)
+        : undefined,
       reactPreamble: options.react !== false,
     });
   }
@@ -1290,6 +1577,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
     // that use @/*, #/*, or baseUrl imports work out of the box.
     // Vite 8+ supports this natively via resolve.tsconfigPaths.
     ...(viteMajorVersion >= 8 ? [] : [loadVite7TsconfigPathsPlugin(earlyBaseDir)]),
+    createStyledJsxPlugin(earlyBaseDir),
     // React Fast Refresh + JSX transform for client components.
     reactPluginPromise,
     // Next.js ignores requests without any statically known path component
@@ -1297,7 +1585,42 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
     createIgnoreDynamicRequestsPlugin(() => nextConfig?.turbopackTranspilePackages ?? []),
     // Transform CJS require()/module.exports to ESM before other plugins
     // analyze imports (RSC directive scanning, shim resolution, etc.)
-    commonjs(),
+    //
+    // Skip project-local `.cjs`/`.cts` files. `vinext init` renames CJS config
+    // files to `.cjs` (e.g. `tailwind.config.js` → `tailwind.config.cjs`) when
+    // it adds `"type": "module"`, and app code imports them extensionlessly
+    // (`import cfg from "../tailwind.config"`). If `vite-plugin-commonjs`
+    // rewrites their `module.exports` to ESM `export {}`, rolldown still infers
+    // `moduleType: "cjs"` from the `.cjs`/`.cts` extension and re-parses the
+    // rewritten output as CommonJS, failing with "Cannot use export statement
+    // outside a module". Returning `false` makes vite-plugin-commonjs skip these
+    // project-local files so rolldown's own CJS interop bundles them instead.
+    // For everything else we return `undefined` to preserve the plugin's
+    // defaults — including its existing skip of node_modules `.cjs` files.
+    commonjs({
+      filter: skipCommonjsForLocalCjs,
+    }),
+    {
+      name: "vinext:global-not-found-css-isolation",
+      apply: "build",
+      enforce: "pre",
+      transform: {
+        filter: {
+          id: /(?:^|[/\\])global-not-found(?:\.[^./?\\]+)+(?:\?.*)?$/,
+          code: /\.(?:css|scss|sass)['"]/,
+        },
+        handler(code: string, id: string) {
+          const cleanId = normalizePathSeparators(stripViteModuleQuery(id));
+          if (
+            !globalNotFoundCssIsolationPath ||
+            canonicalize(cleanId) !== canonicalize(globalNotFoundCssIsolationPath)
+          ) {
+            return null;
+          }
+          return isolateGlobalNotFoundStylesheetImports(code, cleanId);
+        },
+      },
+    },
     // Enable JSX in plain .js files. Next.js allows JSX in .js files
     // (Babel/SWC handle it transparently), but Vite 8's built-in `vite:oxc`
     // plugin excludes .js files by default (`exclude: /\.js$/`) AND infers
@@ -1413,8 +1736,15 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
     {
       name: "vinext:config",
       enforce: "pre",
+      // Expose normalized prerender config to build/deploy metadata loaders that
+      // inspect the Vite plugin array after a fresh config load.
+      ...({ [VINEXT_PRERENDER_CONFIG_PLUGIN_PROPERTY]: prerenderConfig } as Record<
+        string,
+        unknown
+      >),
 
       async config(config, env) {
+        isServeCommand = env.command === "serve";
         root = normalizePathSeparators(config.root ?? process.cwd());
         const userResolve = config.resolve as UserResolveConfigWithTsconfigPaths | undefined;
         const shouldEnableNativeTsconfigPaths =
@@ -1552,6 +1882,10 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               : createRscCompatibilityId(nextConfig);
         }
         fileMatcher = createValidFileMatcher(nextConfig.pageExtensions);
+        globalNotFoundCssIsolationPath =
+          env?.command === "build" && nextConfig.globalNotFound
+            ? findFileWithExts(appDir, "global-not-found", fileMatcher)
+            : null;
         instrumentationPath = findInstrumentationFile(root, fileMatcher);
         instrumentationClientPath = findInstrumentationClientFile(root, fileMatcher);
         const middlewareConventionDir =
@@ -2381,10 +2715,26 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               // which is appended at the end of `importers[]` by the vite:css
               // plugin (vite/src/node/plugins/css.ts makeScssWorker).
               const tildeImporter = createSassTildeImporter(root);
+              const cssUrlAssetImporter =
+                env.command === "build" ? createSassCssUrlAssetImporter() : null;
+              const userAdditionalData = sassPreprocessorOptions?.additionalData;
 
               // Base options shared by both .scss and .sass preprocessors.
               const baseOpts: SassPreprocessorOptions = {
                 ...sassPreprocessorOptions,
+                ...(cssUrlAssetImporter
+                  ? {
+                      additionalData: async (source: string, filename: string) => {
+                        const withUserData =
+                          typeof userAdditionalData === "function"
+                            ? await userAdditionalData(source, filename)
+                            : typeof userAdditionalData === "string"
+                              ? `${userAdditionalData}${source}`
+                              : source;
+                        return cssUrlAssetImporter.rewriteImports(withUserData, filename);
+                      },
+                    }
+                  : {}),
                 // Merge user-supplied importers (from sassOptions) with the
                 // tilde importer. Tilde goes first so it gets first crack at
                 // ~ prefixed URLs; other importers follow; Vite's own internal
@@ -2398,6 +2748,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 // explicit cast to typecheck in both situations.
                 importers: [
                   tildeImporter,
+                  ...(cssUrlAssetImporter ? [cssUrlAssetImporter] : []),
                   ...((sassPreprocessorOptions?.importers as unknown[]) ?? []),
                 ] as SassPreprocessorOptions["importers"],
               };
@@ -2483,7 +2834,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             plugins: [depOptimizeAliasPlugin],
           },
         };
-        const pagesOptimizeEntries = !hasAppDir
+        pagesOptimizeEntries = !hasAppDir
           ? [
               ...(hasPagesDir
                 ? [toRelativeFileEntry(root, pagesDir) + "/**/*.{tsx,ts,jsx,js}"]
@@ -2709,6 +3060,10 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                     "react/jsx-dev-runtime",
                   ]),
                 ),
+                // The client scanner also crawls app/ source files, so it
+                // needs the same JSX-in-`.js` handling (moduleTypes/loader) as
+                // the server optimizers. See getDepOptimizeNodeEnvOptions.
+                ...depOptimizeNodeEnvOptions,
               },
               build: {
                 // Production App Router rendering needs Vite's client manifest
@@ -2737,7 +3092,10 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           viteConfig.environments = {
             client: {
               consumer: "client",
-              optimizeDeps: pagesClientOptimizeDeps,
+              optimizeDeps: {
+                ...pagesClientOptimizeDeps,
+                ...depOptimizeNodeEnvOptions,
+              },
               build: {
                 manifest: true,
                 ssrManifest: true,
@@ -2762,7 +3120,10 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           viteConfig.environments = {
             client: {
               consumer: "client",
-              optimizeDeps: pagesClientOptimizeDeps,
+              optimizeDeps: {
+                ...pagesClientOptimizeDeps,
+                ...depOptimizeNodeEnvOptions,
+              },
               build: {
                 outDir: "dist/client",
                 manifest: true,
@@ -2820,8 +3181,39 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
       },
 
       configEnvironment(name, config) {
+        if (
+          isServeCommand &&
+          hasCloudflarePlugin &&
+          hasPagesDir &&
+          !hasAppDir &&
+          name !== "client"
+        ) {
+          // The Cloudflare plugin owns the Worker dev environment. Seed it
+          // with Pages Router server entries so Vite does not discover vinext's
+          // Worker entry and React's CJS edge renderer on the first request,
+          // trigger a full reload, and execute raw CJS in the Worker module
+          // runner.
+          config.optimizeDeps ??= {};
+          config.optimizeDeps.entries = mergeStringArrayValues(
+            config.optimizeDeps.entries,
+            pagesOptimizeEntries,
+          );
+          config.optimizeDeps.include = mergeStringArrayValues(
+            config.optimizeDeps.include,
+            PAGES_CLOUDFLARE_WORKER_OPTIMIZE_DEPS_INCLUDE,
+          );
+          config.optimizeDeps.exclude = mergeOptimizeDepsExclude(
+            config.optimizeDeps.exclude ?? [],
+            VINEXT_OPTIMIZE_DEPS_EXCLUDE,
+            PAGES_CLOUDFLARE_WORKER_OPTIMIZE_DEPS_EXCLUDE,
+          );
+        }
+
         const configuredExtensions =
           name === "client" ? nextConfig.resolveExtensions : nextConfig.serverResolveExtensions;
+        // Explicit resolver extensions replace vinext's defaults, matching
+        // Next.js/Turbopack semantics; callers who override them must include
+        // `.cjs`/`.cts` if they need extensionless imports of CJS config files.
         const extensions =
           configuredExtensions === null
             ? buildViteResolveExtensions(nextConfig.pageExtensions, config.resolve?.extensions)
@@ -2841,6 +3233,9 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
 
         const cacheDirPrefix = getCacheDirPrefix(config.cacheDir);
         typeofWindowIdFilter.exclude = new RegExp(`^${escapeRegExp(cacheDirPrefix)}`);
+        if (isServeCommand && hasCloudflarePlugin && hasPagesDir && !hasAppDir) {
+          suppressOptionalOptimizeDepsWarnings(config.logger);
+        }
 
         // Provide the resolved config to the Sass-aware CSS Modules Loader so
         // it can call Vite's `preprocessCSS` when processing SCSS files
@@ -2973,7 +3368,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
       },
 
       resolveId: {
-        // Hook filter: only invoke JS for handled Next/Vinext compatibility modules.
+        // Hook filter: only invoke JS for handled compatibility modules.
         // Matches "next/navigation", "next/router.js", "virtual:vinext-rsc-entry",
         // direct @vercel/og imports in metadata routes, and \0-prefixed
         // re-imports from @vitejs/plugin-rsc.
@@ -3015,6 +3410,12 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               _shimsDir,
               stripJsExtension(stripViteModuleQuery(cleanId.slice(vinextShimPrefix.length))),
             );
+          }
+
+          // Router-selected Cloudflare Worker entry facade
+          if (cleanId === VIRTUAL_WORKER_ENTRY) return RESOLVED_WORKER_ENTRY;
+          if (cleanId.endsWith("/" + VIRTUAL_WORKER_ENTRY)) {
+            return RESOLVED_WORKER_ENTRY;
           }
 
           // Pages Router virtual modules
@@ -3082,6 +3483,12 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
       },
 
       async load(id) {
+        if (id === RESOLVED_WORKER_ENTRY) {
+          const entry = hasAppDir
+            ? "vinext/server/app-router-entry"
+            : "vinext/server/pages-router-entry";
+          return `export { default } from ${JSON.stringify(entry)};`;
+        }
         // Pages Router virtual modules
         if (id === RESOLVED_SERVER_ENTRY) {
           return await generateServerEntry();
@@ -3090,7 +3497,29 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           return await generateClientEntry();
         }
         if (id === RESOLVED_PAGES_CLIENT_ASSETS) {
-          return "export default { clientEntry: '/@id/__x00__virtual:vinext-client-entry' };";
+          const metadata: {
+            clientEntry: string;
+            ssrManifest?: Record<string, string[]>;
+          } = { clientEntry: DEV_PAGES_CLIENT_ENTRY };
+          const ssrManifest: Record<string, string[]> = {};
+          const appFilePath = findFileWithExts(pagesDir, "_app", fileMatcher);
+          const pagesRoutes = await pagesRouter(pagesDir, nextConfig?.pageExtensions, fileMatcher);
+          const moduleFilePaths = [
+            ...(appFilePath ? [appFilePath] : []),
+            ...pagesRoutes.map((route) => route.filePath),
+          ];
+          for (const moduleFilePath of moduleFilePaths) {
+            const stylesheetAssets = await collectDevPagesAppStylesheetAssets(
+              root,
+              moduleFilePath,
+              this.resolve.bind(this),
+            );
+            if (stylesheetAssets.length > 0) {
+              ssrManifest[normalizePathSeparators(moduleFilePath)] = stylesheetAssets;
+            }
+          }
+          if (Object.keys(ssrManifest).length > 0) metadata.ssrManifest = ssrManifest;
+          return `export default ${JSON.stringify(metadata)};`;
         }
         // App Router virtual modules
         if (id === RESOLVED_RSC_ENTRY && hasAppDir) {
@@ -3141,6 +3570,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               globalNotFound: nextConfig?.globalNotFound,
               cacheComponents: nextConfig?.cacheComponents,
               webSocketAllowedOrigins: options.webSocket?.allowedOrigins,
+              prefetchInlining: nextConfig?.prefetchInlining,
               hasServerActions,
               i18n: nextConfig?.i18n,
               imageConfig: {
@@ -3587,7 +4017,45 @@ export const loadServerActionClient = ${
       // sending full-reload ensures changes are always reflected in
       // the browser.
       hotUpdate(options: { file: string; server: ViteDevServer; modules: unknown[] }) {
-        if (!hasPagesDir || hasAppDir) return;
+        if (!hasPagesDir) return;
+        const isPagesAppFile = (filePath: string): boolean => {
+          const relativePath = normalizePathSeparators(path.relative(pagesDir, filePath));
+          return (
+            !relativePath.includes("/") &&
+            relativePath.startsWith("_app.") &&
+            fileMatcher.extensionRegex.test(filePath)
+          );
+        };
+        const isPotentialPagesAssetGraphScript = (filePath: string): boolean => {
+          const cleanPath = stripViteModuleQuery(filePath);
+          if (!path.isAbsolute(cleanPath)) return false;
+          if (!isScriptModuleId(cleanPath) || cleanPath.endsWith(".d.ts")) return false;
+          const relativeRootPath = normalizePathSeparators(path.relative(root, cleanPath));
+          if (relativeRootPath.startsWith("..") || path.isAbsolute(relativeRootPath)) return false;
+          if (
+            relativeRootPath.includes("/node_modules/") ||
+            relativeRootPath.startsWith("node_modules/")
+          ) {
+            return false;
+          }
+          const relativeAppPath = normalizePathSeparators(path.relative(appDir, cleanPath));
+          return relativeAppPath.startsWith("..") || path.isAbsolute(relativeAppPath);
+        };
+        const pagesAppChanged = isPagesAppFile(options.file);
+        const pagesAssetGraphScriptChanged = isPotentialPagesAssetGraphScript(options.file);
+        const pagesAssetGraphChanged =
+          pagesAppChanged || STYLESHEET_FILE_RE.test(options.file) || pagesAssetGraphScriptChanged;
+        if (pagesAssetGraphChanged) {
+          for (const env of Object.values(options.server.environments)) {
+            const mod = env.moduleGraph.getModuleById(RESOLVED_PAGES_CLIENT_ASSETS);
+            if (mod) env.moduleGraph.invalidateModule(mod);
+          }
+        }
+        if (pagesAppChanged || (!hasAppDir && pagesAssetGraphScriptChanged)) {
+          options.server.ws.send({ type: "full-reload" });
+          return [];
+        }
+        if (hasAppDir) return;
         if (options.file.startsWith(pagesDir) && fileMatcher.extensionRegex.test(options.file)) {
           options.server.environments.client.hot.send({ type: "full-reload" });
           return [];
@@ -3720,6 +4188,15 @@ export const loadServerActionClient = ${
           pagesRunner?.clearCache();
         }
 
+        function invalidatePagesClientAssetsModule(reloadDocument = false) {
+          for (const env of Object.values(server.environments)) {
+            const mod = env.moduleGraph.getModuleById(RESOLVED_PAGES_CLIENT_ASSETS);
+            if (mod) env.moduleGraph.invalidateModule(mod);
+          }
+          pagesRunner?.clearCache();
+          if (reloadDocument) server.ws.send({ type: "full-reload" });
+        }
+
         function invalidateAppRoutingModules() {
           invalidateAppRouteCache();
           invalidateMetadataFileCache();
@@ -3775,6 +4252,31 @@ export const loadServerActionClient = ${
 
         let appRouteTypeGeneration: Promise<void> | null = null;
         let appRouteTypeGenerationPending = false;
+
+        function isPagesAppFile(filePath: string): boolean {
+          const relativePath = normalizePathSeparators(path.relative(pagesDir, filePath));
+          return (
+            !relativePath.includes("/") &&
+            relativePath.startsWith("_app.") &&
+            fileMatcher.extensionRegex.test(filePath)
+          );
+        }
+
+        function isPotentialPagesAssetGraphScript(filePath: string): boolean {
+          const cleanPath = stripViteModuleQuery(filePath);
+          if (!path.isAbsolute(cleanPath)) return false;
+          if (!isScriptModuleId(cleanPath) || cleanPath.endsWith(".d.ts")) return false;
+          const relativeRootPath = normalizePathSeparators(path.relative(root, cleanPath));
+          if (relativeRootPath.startsWith("..") || path.isAbsolute(relativeRootPath)) return false;
+          if (
+            relativeRootPath.includes("/node_modules/") ||
+            relativeRootPath.startsWith("node_modules/")
+          ) {
+            return false;
+          }
+          const relativeAppPath = normalizePathSeparators(path.relative(appDir, cleanPath));
+          return relativeAppPath.startsWith("..") || path.isAbsolute(relativeAppPath);
+        }
 
         function warnRouteTypeGenerationFailure(error: unknown) {
           server.config.logger.warn(
@@ -3846,6 +4348,16 @@ export const loadServerActionClient = ${
 
         server.watcher.on("add", (filePath: string) => {
           let routeChanged = false;
+          const pagesAppChanged = isPagesAppFile(filePath);
+          const pagesAssetGraphScriptChanged = isPotentialPagesAssetGraphScript(filePath);
+          if (
+            hasPagesDir &&
+            (pagesAppChanged || STYLESHEET_FILE_RE.test(filePath) || pagesAssetGraphScriptChanged)
+          ) {
+            invalidatePagesClientAssetsModule(
+              pagesAppChanged || (!hasAppDir && pagesAssetGraphScriptChanged),
+            );
+          }
           if (hasPagesDir && filePath.startsWith(pagesDir) && pageExtensions.test(filePath)) {
             invalidateRouteCache(pagesDir);
             routeChanged = true;
@@ -3861,8 +4373,30 @@ export const loadServerActionClient = ${
             revalidateHybridRoutes();
           }
         });
+        server.watcher.on("change", (filePath: string) => {
+          const pagesAppChanged = isPagesAppFile(filePath);
+          const pagesAssetGraphScriptChanged = isPotentialPagesAssetGraphScript(filePath);
+          if (
+            hasPagesDir &&
+            (pagesAppChanged || STYLESHEET_FILE_RE.test(filePath) || pagesAssetGraphScriptChanged)
+          ) {
+            invalidatePagesClientAssetsModule(
+              pagesAppChanged || (!hasAppDir && pagesAssetGraphScriptChanged),
+            );
+          }
+        });
         server.watcher.on("unlink", (filePath: string) => {
           let routeChanged = false;
+          const pagesAppChanged = isPagesAppFile(filePath);
+          const pagesAssetGraphScriptChanged = isPotentialPagesAssetGraphScript(filePath);
+          if (
+            hasPagesDir &&
+            (pagesAppChanged || STYLESHEET_FILE_RE.test(filePath) || pagesAssetGraphScriptChanged)
+          ) {
+            invalidatePagesClientAssetsModule(
+              pagesAppChanged || (!hasAppDir && pagesAssetGraphScriptChanged),
+            );
+          }
           if (hasPagesDir && filePath.startsWith(pagesDir) && pageExtensions.test(filePath)) {
             invalidateRouteCache(pagesDir);
             routeChanged = true;
@@ -4080,11 +4614,16 @@ export const loadServerActionClient = ${
                 res.end("Forbidden");
                 return;
               }
+              const requestHost =
+                (Array.isArray(req.headers.host) ? req.headers.host[0] : req.headers.host) ||
+                "localhost";
+              const requestOrigin = `http://${requestHost}`;
+              const getUrlHostname = (requestUrl: string) => new URL(requestUrl).hostname;
 
               // ── Image optimization passthrough (dev mode) ─────────────
               // In dev, redirect to the original asset URL so Vite serves it.
               if (isImageOptimizationPath(url.split("?")[0]!)) {
-                const imageRequestUrl = new URL(url, `http://${req.headers.host || "localhost"}`);
+                const imageRequestUrl = new URL(url, requestOrigin);
                 const allowedWidths = [
                   ...(nextConfig.images?.deviceSizes ?? DEFAULT_DEVICE_SIZES),
                   ...(nextConfig.images?.imageSizes ?? DEFAULT_IMAGE_SIZES),
@@ -4145,6 +4684,8 @@ export const loadServerActionClient = ${
                 const qs = url.includes("?") ? url.slice(url.indexOf("?")) : "";
                 url = pathname + qs;
               }
+
+              const capturedMiddlewarePath = middlewarePath;
 
               // Strip basePath prefix from URL for route matching.
               // All internal routing uses basePath-free paths.
@@ -4210,8 +4751,12 @@ export const loadServerActionClient = ${
                 if (dataMatch) {
                   isDataReq = true;
                   const qs = url.includes("?") ? url.slice(url.indexOf("?")) : "";
-                  url = dataMatch.pagePathname + qs;
-                  pathname = dataMatch.pagePathname;
+                  const pagePathname = normalizeNextDataPagePathname(
+                    dataMatch.pagePathname,
+                    capturedMiddlewarePath !== null && nextConfig?.trailingSlash === true,
+                  );
+                  url = pagePathname + qs;
+                  pathname = pagePathname;
                   // Rewrite req.url so downstream middleware sees the page
                   // path, not the raw _next/data URL.
                   req.url = url;
@@ -4233,9 +4778,10 @@ export const loadServerActionClient = ${
                 }
               }
 
-              // Skip requests for files with extensions (static assets) after
-              // trailing-slash canonicalization so file-looking dynamic routes
-              // like /catch-all/hello.world/ still get the Next.js redirect.
+              // Skip file-looking requests after trailing-slash canonicalization,
+              // except rewrites and Pages routes that should stay in the pipeline.
+              // This still lets dynamic routes like /catch-all/hello.world/ receive
+              // the same Next.js redirects and route matching as extensionless URLs.
               const filePathMatchesRewrite = [
                 ...(nextConfig?.rewrites.beforeFiles ?? []),
                 ...(nextConfig?.rewrites.afterFiles ?? []),
@@ -4246,11 +4792,32 @@ export const loadServerActionClient = ${
                   hadBasePath: true,
                 }),
               );
-              if (
-                pathname.includes(".") &&
-                !pathname.endsWith(".html") &&
-                !filePathMatchesRewrite
-              ) {
+              const isFilePathRequest = pathname.includes(".") && !pathname.endsWith(".html");
+              let filePathMatchesPagesRoute = false;
+              const requestHostname = getUrlHostname(requestOrigin);
+              if (isFilePathRequest && !filePathMatchesRewrite) {
+                const [pageRoutes, apiRoutes] = await Promise.all([
+                  pagesRouter(pagesDir, nextConfig?.pageExtensions, fileMatcher),
+                  apiRouter(pagesDir, nextConfig?.pageExtensions, fileMatcher),
+                ]);
+                // Page matching follows matchPageRoute's full i18n resolution. API matching
+                // mirrors the shared Pages pipeline lookup, which only strips a locale prefix.
+                const pageRouteUrl = nextConfig?.i18n
+                  ? resolvePagesI18nRequest(
+                      pathname,
+                      nextConfig.i18n,
+                      req.headers,
+                      requestHostname,
+                      bp,
+                      nextConfig.trailingSlash ?? false,
+                    ).url
+                  : pathname;
+                const apiRouteUrl = stripI18nLocaleForApiRoute(pathname, nextConfig?.i18n ?? null);
+                filePathMatchesPagesRoute =
+                  matchRoute(pageRouteUrl, pageRoutes) !== null ||
+                  matchRoute(apiRouteUrl, apiRoutes) !== null;
+              }
+              if (isFilePathRequest && !filePathMatchesRewrite && !filePathMatchesPagesRoute) {
                 return next();
               }
 
@@ -4285,8 +4852,6 @@ export const loadServerActionClient = ${
                 delete req.headers[header];
               }
 
-              const requestOrigin = `http://${req.headers.host || "localhost"}`;
-
               // Build a Web Request for the pipeline (no body — middleware and
               // SSR read req directly). The pipeline only needs the body when
               // proxying external rewrites; that case is handled via
@@ -4310,7 +4875,6 @@ export const loadServerActionClient = ${
               // returns a MiddlewareResult. Side-effects needed by App Router
               // hybrid mode (VINEXT_MW_CTX_HEADER) are applied here as a
               // side effect so the RSC entry sees them before rendering.
-              const capturedMiddlewarePath = middlewarePath;
               const devRunMiddlewareAdapter: PagesPipelineDeps["runMiddleware"] =
                 capturedMiddlewarePath
                   ? async (_request, _ctx, opts) => {
@@ -4325,7 +4889,7 @@ export const loadServerActionClient = ${
                         : "";
                       const mwProto =
                         rawProto === "https" || rawProto === "http" ? rawProto : "http";
-                      const mwOrigin = `${mwProto}://${req.headers.host || "localhost"}`;
+                      const mwOrigin = `${mwProto}://${requestHost}`;
                       const middlewareRequest = new Request(new URL(url, mwOrigin), {
                         method: req.method,
                         headers: nodeRequestHeaders,
@@ -4373,6 +4937,27 @@ export const loadServerActionClient = ${
                 nextConfig?.pageExtensions,
                 fileMatcher,
               );
+              const devPageRouteDataKinds = new Map<string, "static" | "server" | "none">();
+              const classifyDevPageRoute = (
+                route: (typeof devPageRoutes)[number],
+              ): "static" | "server" | "none" => {
+                const cached = devPageRouteDataKinds.get(route.filePath);
+                if (cached) return cached;
+
+                let dataKind: "static" | "server" | "none" = "none";
+                try {
+                  const source = fs.readFileSync(route.filePath, "utf8");
+                  dataKind = hasExportedName(source, "getStaticProps")
+                    ? "static"
+                    : hasExportedName(source, "getServerSideProps")
+                      ? "server"
+                      : "none";
+                } catch {
+                  // Dev can race with an editor deleting/renaming a page file.
+                }
+                devPageRouteDataKinds.set(route.filePath, dataKind);
+                return dataKind;
+              };
 
               const pipelineDeps: PagesPipelineDeps = {
                 basePath: bp,
@@ -4398,14 +4983,20 @@ export const loadServerActionClient = ${
                         resolvedPathname,
                         nextConfig.i18n,
                         request.headers,
-                        new URL(request.url).hostname,
+                        getUrlHostname(request.url),
                         bp,
                         nextConfig.trailingSlash ?? false,
                       ).url
                     : resolvedPathname;
                   const m = matchRoute(routeUrl, devPageRoutes);
                   return m
-                    ? { route: { isDynamic: m.route.isDynamic, pattern: m.route.pattern } }
+                    ? {
+                        route: {
+                          dataKind: classifyDevPageRoute(m.route),
+                          isDynamic: m.route.isDynamic,
+                          pattern: m.route.pattern,
+                        },
+                      }
                     : null;
                 },
                 // Dev adapter: forward body from the Node req when proxying
@@ -4587,6 +5178,7 @@ export const loadServerActionClient = ${
                         (nextConfig?.rewrites.fallback.length ?? 0) > 0,
                       nextConfig?.clientTraceMetadata,
                       nextConfig?.htmlLimitedBots,
+                      nextConfig?.reactStrictMode === true,
                     ),
                   };
                 }
@@ -5884,6 +6476,7 @@ export const loadServerActionClient = ${
   // Append auto-injected RSC plugins if applicable
   if (rscPluginPromise) {
     plugins.push(rscPluginPromise);
+    plugins.push(createRscReferenceValidationNormalizerPlugin());
     plugins.push(createRscClientReferenceLoadersPlugin());
   }
 

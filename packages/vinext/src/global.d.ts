@@ -20,6 +20,7 @@ import type { Root } from "react-dom/client";
 import type { OnRequestErrorHandler } from "./server/instrumentation";
 import type { InitialDevServerErrorPayload } from "./server/dev-initial-server-error";
 import type { CachedRscResponse, PrefetchCacheEntry } from "vinext/shims/navigation";
+import type { NextRedirect, NextRewrite } from "./config/next-config";
 
 // `window.next` is declared inline in `./client/window-next.ts` (mirroring
 // Next.js's own pattern in `packages/next/src/client/next.ts`), not here, so
@@ -40,6 +41,17 @@ declare global {
      * navigation.
      */
     __VINEXT_ROOT__: Root | undefined;
+
+    /**
+     * Whether `reactStrictMode: true` is set in next.config for the Pages
+     * Router. Set by the generated client entry and the dev hydration script
+     * before `hydrateRoot()`. Read by `wrapWithRouterContext` in
+     * `shims/router.ts` so the StrictMode wrap is applied on the initial
+     * hydration AND every client-side navigation render — mirroring Next.js's
+     * `process.env.__NEXT_STRICT_MODE` branch in `client/index.tsx`, which runs
+     * for both the initial hydrate and subsequent `reactRoot.render()` calls.
+     */
+    __VINEXT_REACT_STRICT_MODE__: boolean | undefined;
 
     /**
      * High-resolution timestamp recorded after client hydration is usable.
@@ -95,6 +107,32 @@ declare global {
      * incoming URL pathname to a registered loader.
      */
     __VINEXT_PAGE_PATTERNS__: string[] | undefined;
+
+    /** Pages Router patterns whose modules export `getStaticProps`. */
+    __VINEXT_PAGES_SSG_PATTERNS__: string[] | undefined;
+
+    /** Pages Router patterns whose modules export `getServerSideProps`. */
+    __VINEXT_PAGES_SSP_PATTERNS__: string[] | undefined;
+
+    /** Resolved client-safe Pages Router redirects from next.config.js. */
+    __VINEXT_CLIENT_REDIRECTS__: NextRedirect[] | undefined;
+
+    /** Resolved client-safe rewrites from next.config.js. */
+    __VINEXT_CLIENT_REWRITES__:
+      | {
+          beforeFiles: NextRewrite[];
+          afterFiles: NextRewrite[];
+          fallback: NextRewrite[];
+        }
+      | undefined;
+
+    /**
+     * Static `middleware/proxy` matcher config embedded for client-side Pages
+     * Router middleware-effect probes. `undefined` means "match all", matching
+     * Next.js's default when middleware has no matcher or the config was too
+     * dynamic to statically serialize.
+     */
+    __VINEXT_MIDDLEWARE_MATCHER__: unknown;
 
     /**
      * Pages Router `_app` loader. Dynamic `import()` thunk for the user's
@@ -168,12 +206,13 @@ declare global {
 
     // ── Next.js conventional globals ────────────────────────────────────────
     //
-    // `__NEXT_DATA__` is already declared by `next/dist/client/index.d.ts` as
-    // `NEXT_DATA` from `next/dist/shared/lib/utils`. We intentionally do NOT
-    // re-declare it here to avoid type conflicts. vinext-specific extensions
-    // (__vinext) are accessed via the `VinextNextData` type in
-    // `client/vinext-next-data.ts`.
-    //
+    // `next/dist/client/index.d.ts` also declares `__NEXT_DATA__` when `next`
+    // types are in scope. Declare it here with the vinext shim type so
+    // package-local typechecking works without pulling in all of `next`.
+    // vinext-specific extensions (__vinext) are accessed via `VinextNextData`
+    // in `client/vinext-next-data.ts`.
+    __NEXT_DATA__?: import("./shims/internal/utils").NEXT_DATA;
+
     // `window.next` is declared in `./client/window-next.ts` so its type
     // (`WindowNext`) lives next to the installer that owns the runtime shape.
   }

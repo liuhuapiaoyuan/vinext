@@ -1482,6 +1482,7 @@ export async function handleServerActionRscRequest<
     const match = options.matchRoute(options.cleanPathname);
     let element: TElement;
     let errorPattern = match ? match.route.pattern : options.cleanPathname;
+    const actionRerenderIsRscRequest = true;
     if (match) {
       const { route: actionRoute, params: actionParams } = match;
       const actionRerenderTarget = await resolveAppPageActionRerenderTarget({
@@ -1491,7 +1492,7 @@ export async function handleServerActionRscRequest<
         findIntercept: options.findIntercept,
         getRouteParamNames: options.getRouteParamNames,
         getSourceRoute: options.getSourceRoute,
-        isRscRequest: options.isRscRequest,
+        isRscRequest: actionRerenderIsRscRequest,
         toInterceptOpts: options.toInterceptOpts,
       });
 
@@ -1536,7 +1537,7 @@ export async function handleServerActionRscRequest<
         options.buildPageElement({
           cleanPathname: options.cleanPathname,
           interceptOpts: actionRerenderTarget.interceptOpts,
-          isRscRequest: options.isRscRequest,
+          isRscRequest: actionRerenderIsRscRequest,
           mountedSlotsHeader: options.mountedSlotsHeader,
           params: actionRerenderTarget.params,
           request: options.request,

@@ -31,17 +31,6 @@ import {
 
 export type { HybridClientOwner } from "./hybrid-client-route-owner-direct.js";
 
-declare global {
-  // oxlint-disable-next-line typescript-eslint/consistent-type-definitions
-  interface Window {
-    __VINEXT_CLIENT_REWRITES__?: {
-      afterFiles: NextRewrite[];
-      beforeFiles: NextRewrite[];
-      fallback: NextRewrite[];
-    };
-  }
-}
-
 function resolveClientRewrite(
   href: string,
   basePath: string,
@@ -78,6 +67,59 @@ function resolveClientRewrite(
   }
 
   return matched ? { href: currentHref, kind: "rewrite" } : null;
+}
+
+export function resolveHybridClientRewriteHref(href: string, basePath: string): string | null {
+  if (typeof window === "undefined") return null;
+
+  const rewrites = window.__VINEXT_CLIENT_REWRITES__;
+  if (!rewrites) return null;
+
+  let currentHref = href;
+  let didRewrite = false;
+
+  const beforeFilesRewrite = resolveClientRewrite(
+    currentHref,
+    basePath,
+    rewrites.beforeFiles,
+    true,
+  );
+  if (beforeFilesRewrite?.kind === "document") return null;
+  if (beforeFilesRewrite?.kind === "rewrite") {
+    currentHref = beforeFilesRewrite.href;
+    didRewrite = true;
+  }
+
+  let matches = matchDirectHybridClientRoutes(currentHref, basePath);
+
+  if (
+    (matches.appMatch === null || matches.appMatch.isDynamic) &&
+    (matches.pagesMatch === null || matches.pagesMatch.isDynamic)
+  ) {
+    for (const rewrite of rewrites.afterFiles) {
+      const afterFilesRewrite = resolveClientRewrite(currentHref, basePath, [rewrite]);
+      if (afterFilesRewrite?.kind === "document") return didRewrite ? currentHref : null;
+      if (afterFilesRewrite?.kind !== "rewrite") continue;
+      currentHref = afterFilesRewrite.href;
+      didRewrite = true;
+      matches = matchDirectHybridClientRoutes(currentHref, basePath);
+      if (matches.appMatch || matches.pagesMatch) break;
+    }
+  }
+
+  if (matches.appMatch === null && matches.pagesMatch === null) {
+    for (const rewrite of rewrites.fallback) {
+      const fallbackRewrite = resolveClientRewrite(currentHref, basePath, [rewrite]);
+      if (fallbackRewrite?.kind === "document") return didRewrite ? currentHref : null;
+      if (fallbackRewrite?.kind !== "rewrite") continue;
+      currentHref = fallbackRewrite.href;
+      didRewrite = true;
+      matches = matchDirectHybridClientRoutes(currentHref, basePath);
+      if (matches.appMatch || matches.pagesMatch) break;
+    }
+  }
+
+  return didRewrite ? currentHref : null;
 }
 
 /**

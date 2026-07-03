@@ -226,6 +226,7 @@ export async function buildPageElements<
   const hasPageModule = !!pageModule;
   const renderIdentity = createAppPageRenderIdentity({
     displayPathname,
+    matchedRoutePathname: routePath,
     targetMatchedPathname: routePath,
     interceptionContext: opts?.interceptionContext ?? null,
     interceptSourceMatchedUrl: opts?.interceptSourceMatchedUrl ?? null,

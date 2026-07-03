@@ -1105,9 +1105,9 @@ function validatePageRouteConflicts(routes: readonly AppRoute[], appDir: string)
 }
 
 function formatAppFilePath(filePath: string, appDir: string): string {
-  const relativePath = path.relative(appDir, filePath).replace(/\\/g, "/");
+  const relativePath = normalizePathSeparators(path.relative(appDir, filePath));
   const parsedPath = path.parse(relativePath);
-  const withoutExtension = path.join(parsedPath.dir, parsedPath.name).replace(/\\/g, "/");
+  const withoutExtension = normalizePathSeparators(path.join(parsedPath.dir, parsedPath.name));
   return withoutExtension.startsWith("/") ? withoutExtension : `/${withoutExtension}`;
 }
 
@@ -2280,9 +2280,7 @@ function findSlotRootPage(slotDir: string, matcher: ValidFileMatcher): string | 
  * default component, intercepting route, or nested page-backed sub-route.
  *
  * `dir` and `appDir` must be forward-slash. The slot directory is built from
- * `dir` with `path.posix.join`, and the owner segments and slot key come from
- * `path.posix.relative(appDir, …)`, which only yields a forward-slash relative
- * path when both operands already are.
+ * `dir` with `path.posix.join`.
  */
 function discoverParallelSlots(
   dir: string,
@@ -2318,16 +2316,16 @@ function discoverParallelSlots(
     // `@slot/other/page.tsx` when the owner has no children page of its own.
     if (!pagePath && !defaultPath && interceptingRoutes.length === 0 && !hasNestedPages) continue;
 
-    const ownerSegments = path.posix
+    const ownerSegments = path
       .relative(appDir, dir)
-      .split("/")
+      .split(path.sep)
       .filter((segment) => segment.length > 0);
     const ownerTreePath = createAppRouteGraphTreePath(ownerSegments, ownerSegments.length);
 
     const configLayoutPaths = findSlotConfigLayoutPaths(slotDir, pagePath, matcher);
     slots.push({
       id: createAppRouteGraphSlotId(slotName, ownerTreePath),
-      key: `${slotName}@${path.posix.relative(appDir, slotDir)}`,
+      key: `${slotName}@${normalizePathSeparators(path.relative(appDir, slotDir))}`,
       name: slotName,
       ownerDir: slotDir,
       ownerTreePath,
@@ -2379,8 +2377,7 @@ function isInterceptionMarkerDir(name: string): boolean {
  * They intercept navigation to another route and render within the slot instead.
  *
  * `slotDir`, `routeDir`, and `appDir` must be forward-slash. They are passed
- * down to `path.posix.join` and `path.posix.relative` when building the
- * intercept page paths and target patterns.
+ * down to `path.posix.join` when building the intercept page paths.
  *
  * @param slotDir - The parallel slot directory (e.g. app/feed/@modal)
  * @param routeDir - The directory of the route that owns this slot (e.g. app/feed)
@@ -2410,6 +2407,10 @@ function discoverInterceptingRoutes(
  * Sibling intercepts use the same conventions and target-computation logic as
  * slot intercepts, but their intercepting page replaces the full page response
  * (not a slot) during soft navigation.
+ *
+ * `appDir` and each route's `pagePath` / `routePath` must be forward-slash. The
+ * owner directories are derived from `pagePath` / `routePath` and matched
+ * against `appDir`-relative paths built with `path.posix.*`.
  */
 function discoverSiblingInterceptingRoutes(
   routes: AppRouteGraphRoute[],
@@ -2424,8 +2425,7 @@ function discoverSiblingInterceptingRoutes(
   for (const route of routes) {
     const filePath = route.pagePath ?? route.routePath;
     if (!filePath) continue;
-    // Keys are forward-slash — findOwnerRouteForDir compares in that space.
-    const routeDir = normalizePathSeparators(path.dirname(filePath));
+    const routeDir = path.posix.dirname(filePath);
     if (!routesByDir.has(routeDir)) {
       routesByDir.set(routeDir, route);
     }
@@ -2445,7 +2445,7 @@ function discoverSiblingInterceptingRoutes(
       // Skip @slot subtrees — their markers are handled by the slot path
       if (entry.name.startsWith("@")) continue;
 
-      const childDir = path.join(dir, entry.name);
+      const childDir = path.posix.join(dir, entry.name);
       const marker = matchInterceptConvention(entry.name);
 
       if (marker) {
@@ -2549,8 +2549,7 @@ export function findOwnerRouteForDir(
  * intercepting route directories.
  *
  * `currentDir`, `routeDir`, and `appDir` must be forward-slash. `currentDir`
- * descends with `path.posix.join` and all three reach the `path.posix.join` /
- * `path.posix.relative` calls that build the intercept page paths and patterns.
+ * descends with `path.posix.join` when building the intercept page paths.
  */
 function scanForInterceptingPages(
   currentDir: string,
@@ -2614,6 +2613,12 @@ function matchInterceptConvention(name: string): { prefix: string; convention: s
 /**
  * Collect page.tsx files inside an intercepting route directory tree
  * and compute their target URL patterns.
+ *
+ * `currentDir`, `interceptRoot`, `routeDir`, `appDir`, and `interceptParentDir`
+ * must all be forward-slash. `currentDir` descends with `path.posix.join` and
+ * its `findFile` results become the stored layout/page paths. The others are
+ * relativized against `appDir` (and each other) to derive the intercept page
+ * segments and URL patterns.
  */
 function collectInterceptingPages(
   currentDir: string,
@@ -2655,9 +2660,7 @@ function collectInterceptingPages(
       results.push({
         branchSegments: [
           interceptSegment,
-          ...normalizePathSeparators(path.relative(interceptRoot, path.dirname(page)))
-            .split("/")
-            .filter(Boolean),
+          ...path.relative(interceptRoot, path.dirname(page)).split(path.sep).filter(Boolean),
         ],
         convention,
         layoutPaths: [...layoutPaths],
@@ -2684,7 +2687,7 @@ function collectInterceptingPages(
     // Skip private folders (prefixed with _)
     if (entry.name.startsWith("_")) continue;
     collectInterceptingPages(
-      path.join(currentDir, entry.name),
+      path.posix.join(currentDir, entry.name),
       interceptRoot,
       convention,
       interceptSegment,
