@@ -30,8 +30,42 @@ pnpm run build                                   # Build the vinext package (via
 
 # 版本发布流程
 
+**发布 npm 包时，必须使用 Changesets，禁止绕过。**
+
+### 唯一允许的发布命令
+
 ```bash
 vp exec changeset publish
+```
+
+这是仓库唯一的正式发布入口（与 `.github/workflows/release.yml` 中 `changesets/action` 的 `publish:` 一致）。`vp exec` 会调用仓库内 pin 住的 `@changesets/cli`，不要用 `npx changeset` 或全局 CLI 替代。
+
+### 禁止的做法（Agent 不得执行）
+
+- **禁止** `npm publish`、`pnpm publish`、`pnpm -C packages/vinext publish` 等直接发布
+- **禁止** 手改 `packages/vinext/package.json` 的 `version` 后直接发布
+- **禁止** 只跑 `vp pack` / `vp run vinext#build` 然后把 `dist/` 当发布物上传
+- **禁止** 在用户要求「发布版本」时自行发明发布流程；必须走 Changesets
+
+手改版本号不会消费 `.changeset/`、不会更新 CHANGELOG、也不会与 git tag 对齐，会导致 registry 与仓库状态不一致。
+
+### 正确流程（fork / 本地 maintainer 发布）
+
+本 fork 的 `@qzsy/vinext` 不在 Cloudflare 上游 CI 的 release job 范围内（`release.yml` 仅 `github.repository_owner == 'cloudflare'` 时运行），**本地 maintainer 发布时必须仍走 Changesets**：
+
+1. 确保 `main` 上待发布的变更已有 changeset（通常由 Conventional Commit + CI 的 `scripts/create-changeset.mts` 生成；特殊重分类见下方 SHA-named changeset 规则）
+2. 若 Version PR 尚未合并、或本地需要先 bump：运行 `node scripts/version.mts`（等价于 CI 的 `version:` 步骤，会执行 `changeset version` 并重写 CHANGELOG）
+3. 提交 version bump + CHANGELOG 变更并 push
+4. 发布：**仅**运行 `vp exec changeset publish`
+5. 将 publish 产生的 git tag / 版本 commit push 到 remote（若 publish 未自动 push）
+
+用户说「帮我 publish / 发布版本」时，按以上步骤执行；**不要**跳过 changeset 直接用 npm。
+
+### 版本发布流程（Quick Reference）
+
+```bash
+node scripts/version.mts          # 消费 changesets，bump 版本 + 更新 CHANGELOG（发布前）
+vp exec changeset publish         # 发布到 npm（唯一允许的 publish 命令）
 ```
 
 ### Project Structure
@@ -338,6 +372,8 @@ If a Node built-in does the job, use it. Only reach for a dependency when the bu
 - **Branch protection is enabled on main.** Required checks: Check, Vitest, Playwright E2E. Pushing directly to main bypasses these protections and can introduce regressions.
 
 - **NEVER use `gh pr merge --admin`.** The `--admin` flag bypasses branch protection checks entirely. If merge is blocked, investigate why — don't force it through. A blocked merge usually means a required check failed or is still running.
+
+- **NEVER publish npm packages outside Changesets.** The only allowed publish command is `vp exec changeset publish`. Do not run `npm publish`, `pnpm publish`, or hand-bump `package.json` version and publish directly. See [版本发布流程](#版本发布流程) above.
 
 - **NEVER create changesets manually.** Changesets are generated automatically from Conventional Commits during CI by `scripts/create-changeset.mts` (see `.github/workflows/release.yml`). Do not run `pnpm changeset` or hand-author `.changeset/*.md` files. Instead, write a well-formed Conventional Commit message (e.g. `fix(build): ...`, `feat(router): ...`) and let CI produce the changeset.
 
