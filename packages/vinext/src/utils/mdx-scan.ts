@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import path from "node:path";
+import path from "pathslash";
 import { isDirectory } from "../routing/file-matcher.js";
 
 /** Module-level cache for hasMdxFiles — avoids re-scanning per Vite environment. */

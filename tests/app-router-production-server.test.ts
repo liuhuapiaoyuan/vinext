@@ -3,7 +3,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { createBuilder } from "vite";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
 import vinext from "../packages/vinext/src/index.js";
 import {
   getPagesClientAssets,
@@ -1808,9 +1808,9 @@ describe("App Router Production server (startProdServer)", () => {
 describe("App Router production server entry module identity", () => {
   // Regression test for cloudflare/vinext#1923.
   //
-  // Chunks emitted by default Vite builds — Rollup on Vite 7 and Rolldown on
-  // Vite 8 — import the server entry back by its bare path: modules shared
-  // between the entry's static graph (middleware, instrumentation) and lazy
+  // Chunks emitted by default Vite/Rolldown builds import the server entry
+  // back by its bare path: modules shared between the entry's static graph
+  // (middleware, instrumentation) and lazy
   // route chunks are hoisted into the entry chunk, and the lazy chunks then
   // import them via "../../index.js" (e.g. a plain `vite@8.0.16` SSR build
   // of an entry-shared module emits `import { t as shared } from

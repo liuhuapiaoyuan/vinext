@@ -4,20 +4,22 @@
  * Loads the Next.js config file (if present) and extracts supported options.
  * Unsupported options are logged as warnings.
  */
-import path from "node:path";
+import path, { toSlash } from "pathslash";
 import { createRequire } from "node:module";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
+import type { PluginOption } from "vite";
 import commonjs from "vite-plugin-commonjs";
 import { PHASE_DEVELOPMENT_SERVER } from "vinext/shims/constants";
 import { normalizePageExtensions } from "../routing/file-matcher.js";
 import { getHtmlLimitedBotRegex } from "../utils/html-limited-bots.js";
+import { flattenPluginOptions } from "../utils/plugin-options.js";
 import { isUnknownRecord } from "../utils/record.js";
 import { applyLocaleToRoutes, isExternalUrl } from "./config-matchers.js";
 import { loadTsconfigResolutionForRoot } from "./tsconfig-paths.js";
-import { getViteMajorVersion } from "../utils/vite-version.js";
 import { loadCommonJsModule, shouldRetryAsCommonJs } from "../utils/commonjs-loader.js";
+export const VINEXT_NEXT_CONFIG_PLUGIN_PROPERTY = "__vinextNextConfig";
 
 /**
  * Parse a body size limit value (string or number) into bytes.
@@ -353,6 +355,24 @@ type NextConfigFactory = (
 ) => NextConfig | Promise<NextConfig>;
 
 export type NextConfigInput = NextConfig | NextConfigFactory;
+
+type VinextNextConfigPlugin = {
+  [VINEXT_NEXT_CONFIG_PLUGIN_PROPERTY]?: NextConfigInput | null;
+};
+
+export async function findVinextNextConfigInPlugins(
+  plugins: PluginOption[] | undefined,
+): Promise<NextConfigInput | null> {
+  const flattened = await flattenPluginOptions(plugins);
+
+  for (const plugin of flattened) {
+    if (!isUnknownRecord(plugin)) continue;
+    const nextConfig = (plugin as VinextNextConfigPlugin)[VINEXT_NEXT_CONFIG_PLUGIN_PROPERTY];
+    if (nextConfig) return nextConfig;
+  }
+
+  return null;
+}
 
 /**
  * Resolved configuration with all async values awaited.
@@ -716,10 +736,12 @@ async function unwrapConfig(
 /**
  * Resolve a path through filesystem symlinks, falling back to the original
  * path when the file does not exist (e.g. virtual ids, query-suffixed ids).
+ * Output is forward-slashed so it compares consistently with pathslash
+ * results (fs.realpathSync returns backslashes on Windows).
  */
 function safeRealpath(p: string): string {
   try {
-    return fs.realpathSync(p);
+    return toSlash(fs.realpathSync(p));
   } catch {
     return p;
   }
@@ -972,16 +994,14 @@ export async function loadNextConfig(
   const tsconfigBaseUrl = isTypeScriptConfig ? tsconfigResolution.baseUrl : null;
 
   // Vite 8 (Rolldown) resolves tsconfig `baseUrl` bare imports natively via
-  // `resolve.tsconfigPaths` (oxc-resolver). Vite 7 has no equivalent option,
-  // so baseUrl-based imports in `next.config.ts` are a documented Vite 7/8
-  // capability gap (see docs). `paths` aliases still work on both via
-  // `resolve.alias`. Mirrors the Vite-major gate used in index.ts.
+  // `resolve.tsconfigPaths` (oxc-resolver). `paths` aliases are materialized
+  // into `resolve.alias` so import.meta.glob and dynamic imports can see them.
   //
   // Note: installed packages stay externalized (so CJS config plugins like
   // `@next/mdx` that call `require`/`require.resolve` at runtime keep working).
   // baseUrl resolves bare imports that have no installed package of the same
   // name; it does not shadow an installed package with a baseUrl-local file.
-  const useNativeTsconfigPaths = !!tsconfigBaseUrl && getViteMajorVersion() >= 8;
+  const useNativeTsconfigPaths = !!tsconfigBaseUrl;
 
   // Symlink-resolved config path, used by the `commonjs()` filter below to
   // exclude the config file itself. macOS uses /private/var symlinks, so
@@ -1002,9 +1022,7 @@ export async function loadNextConfig(
         // handling: it follows `extends` and resolves baseUrl-local bare imports
         // via per-importer tsconfig discovery. Installed packages stay
         // externalized, so a baseUrl-local file does not shadow a package of the
-        // same name. Vite 7 has no native equivalent, so baseUrl bare imports in
-        // next.config.ts are unsupported there (documented gap); `resolve.alias`
-        // still covers `paths` aliases on both.
+        // same name.
         ...(useNativeTsconfigPaths ? { tsconfigPaths: true } : {}),
         // Include `.cjs` and `.cts` so `vite-plugin-commonjs` recognises
         // those extensions (the plugin keys off `config.resolve.extensions`,
@@ -1202,10 +1220,12 @@ export function createRscCompatibilityId(
  * @returns A filesystem path suitable for path operations
  */
 function resolveCacheHandlerPathToFilesystem(filePath: string): string {
+  // toSlash: fileURLToPath and user-supplied require.resolve() results are
+  // backslash-separated on Windows; normalize into slash space.
   if (filePath.startsWith("file://")) {
-    return fileURLToPath(filePath);
+    return toSlash(fileURLToPath(filePath));
   }
-  return filePath;
+  return toSlash(filePath);
 }
 
 /**
@@ -1403,7 +1423,7 @@ function normalizePrefetchInliningConfig(value: unknown): PrefetchInliningConfig
  */
 export async function resolveNextConfig(
   config: NextConfig | null,
-  root: string = process.cwd(),
+  root: string = toSlash(process.cwd()),
   options: { dev?: boolean } = {},
 ): Promise<ResolvedNextConfig> {
   if (!config) {
@@ -2117,7 +2137,7 @@ function invokeLoaderSideEffects(rules: any[], root: string): void {
  */
 export async function extractMdxOptions(
   config: NextConfig,
-  root: string = process.cwd(),
+  root: string = toSlash(process.cwd()),
 ): Promise<MdxOptions | null> {
   return (await probeWebpackConfig(config, root, false)).mdx;
 }

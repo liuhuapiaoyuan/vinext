@@ -1,6 +1,5 @@
-import path from "node:path";
+import path, { toSlash } from "pathslash";
 import { findNextConfigPath } from "../config/next-config.js";
-import { normalizePathSeparators } from "../utils/path.js";
 
 type DevServerRestartPolicyConfig = {
   configFile: string | false;
@@ -23,12 +22,12 @@ export function getDevServerRestartWatchPaths(
   const paths: string[] = [];
 
   if (config.configFile) {
-    paths.push(normalizePathSeparators(path.resolve(config.configFile)));
+    paths.push(toSlash(path.resolve(config.configFile)));
   }
 
-  const nextConfigPath = findNextConfigPath(normalizePathSeparators(root));
+  const nextConfigPath = findNextConfigPath(toSlash(root));
   if (nextConfigPath) {
-    paths.push(normalizePathSeparators(path.resolve(nextConfigPath)));
+    paths.push(toSlash(path.resolve(nextConfigPath)));
   }
 
   return paths;

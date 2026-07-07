@@ -1,5 +1,33 @@
 # @vinext/cloudflare
 
+## 1.0.0-beta.0
+
+### Features
+
+- **Init:** mark CDN warmup flag experimental (#2533)
+- **Cloudflare:** warm prerendered paths before deploy (#2481)
+- **Cloudflare:** populate kv cache from prerendered routes (#2509)
+
+### Bug Fixes
+
+- **Cloudflare:** stream deploy logs (#2528)
+
+### Contributors
+
+- @james-elicx
+
+## 0.2.1
+
+### Bug Fixes
+
+- **Cloudflare:** respect TPR cache opt-outs (#2493)
+- **App Router:** align app static ISR lifecycle (#2472)
+- **Cloudflare:** allow pages deploy without custom worker (#2429)
+
+### Contributors
+
+- @james-elicx
+
 ## 0.2.0
 
 ### Features

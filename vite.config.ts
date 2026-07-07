@@ -97,6 +97,25 @@ export default defineConfig({
           "import/no-self-import": "error",
           "unicorn/throw-new-error": "error",
           "unicorn/error-message": "error",
+          // Source path handling goes through pathslash so every join/resolve/
+          // relative emits canonical forward-slash output on Windows. Files
+          // that genuinely work in native-separator space (build/standalone.ts)
+          // disable this inline with a reason.
+          "no-restricted-imports": [
+            "error",
+            {
+              paths: [
+                {
+                  name: "node:path",
+                  message: 'Import path from "pathslash" instead (canonical forward-slash output).',
+                },
+                {
+                  name: "path",
+                  message: 'Import path from "pathslash" instead (canonical forward-slash output).',
+                },
+              ],
+            },
+          ],
         },
       },
       {
@@ -183,6 +202,7 @@ export default defineConfig({
             "tests/app-router-worker-entry.test.ts",
             "tests/api-handler.test.ts",
             "tests/cjs.test.ts",
+            "tests/client-global-define.test.ts",
             "tests/ecosystem.test.ts",
             "tests/entry-templates.test.ts",
             "tests/features.test.ts",
@@ -242,6 +262,7 @@ export default defineConfig({
             "tests/app-router-worker-entry.test.ts",
             "tests/api-handler.test.ts",
             "tests/cjs.test.ts",
+            "tests/client-global-define.test.ts",
             "tests/ecosystem.test.ts",
             "tests/entry-templates.test.ts",
             "tests/favicon-short-circuit.test.ts",
