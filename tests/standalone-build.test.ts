@@ -2,7 +2,10 @@ import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { emitStandaloneOutput } from "../packages/vinext/src/build/standalone.js";
+import {
+  copyExternalPackagesWithRuntimeDeps,
+  emitStandaloneOutput,
+} from "../packages/vinext/src/build/standalone.js";
 
 let tmpDir: string;
 
@@ -510,5 +513,60 @@ describe("emitStandaloneOutput", () => {
     expect(
       fs.lstatSync(path.join(appRoot, "dist/standalone/node_modules/dep-link")).isSymbolicLink(),
     ).toBe(false);
+  });
+});
+
+describe("copyExternalPackagesWithRuntimeDeps", () => {
+  it("copies whole packages with transitive deps and skips unresolvable initials", () => {
+    const appRoot = path.join(tmpDir, "app");
+    fs.mkdirSync(appRoot, { recursive: true });
+    writeFile(appRoot, "package.json", JSON.stringify({ name: "app" }));
+    writePackage(appRoot, "dep-a", { "dep-b": "1.0.0" });
+    writePackage(appRoot, "dep-b");
+
+    const targetNodeModulesDir = path.join(tmpDir, "out", "server", "node_modules");
+    const skipped: string[] = [];
+    const result = copyExternalPackagesWithRuntimeDeps({
+      root: appRoot,
+      targetNodeModulesDir,
+      packages: ["dep-a", "ghost-pkg"],
+      onSkippedPackage: (name) => skipped.push(name),
+    });
+
+    expect(result.copiedPackages.sort()).toEqual(["dep-a", "dep-b"]);
+    expect(result.skippedPackages).toEqual(["ghost-pkg"]);
+    expect(skipped).toEqual(["ghost-pkg"]);
+    expect(fs.existsSync(path.join(targetNodeModulesDir, "dep-a", "index.js"))).toBe(true);
+    expect(fs.existsSync(path.join(targetNodeModulesDir, "dep-b", "index.js"))).toBe(true);
+    expect(fs.existsSync(path.join(targetNodeModulesDir, "ghost-pkg"))).toBe(false);
+  });
+
+  it("overlays existing partial copies with the full package tree", () => {
+    const appRoot = path.join(tmpDir, "app");
+    fs.mkdirSync(appRoot, { recursive: true });
+    writeFile(appRoot, "package.json", JSON.stringify({ name: "app" }));
+    writePackage(appRoot, "dep-a");
+    writeFile(appRoot, "node_modules/dep-a/extra/data.json", "{}\n");
+
+    // Simulate an nft partial trace: package.json exists in the target but
+    // the main file is missing (the exact failure mode seen with
+    // @opentelemetry/* packages in Nitro's .output).
+    const targetNodeModulesDir = path.join(tmpDir, "out", "server", "node_modules");
+    writeFile(
+      path.join(targetNodeModulesDir, "dep-a"),
+      "package.json",
+      JSON.stringify({ name: "dep-a", version: "1.0.0", main: "index.js" }),
+    );
+
+    copyExternalPackagesWithRuntimeDeps({
+      root: appRoot,
+      targetNodeModulesDir,
+      packages: ["dep-a"],
+    });
+
+    expect(fs.existsSync(path.join(targetNodeModulesDir, "dep-a", "index.js"))).toBe(true);
+    expect(fs.existsSync(path.join(targetNodeModulesDir, "dep-a", "extra", "data.json"))).toBe(
+      true,
+    );
   });
 });

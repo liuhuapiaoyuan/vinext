@@ -17,11 +17,17 @@ const tempDirs: string[] = [];
 type NitroSetupTarget = {
   options: {
     dev?: boolean;
+    preset?: string;
     routeRules?: Record<string, NitroRouteRuleConfig>;
     traceDeps?: string[];
+    output?: { serverDir?: string };
+  };
+  hooks?: {
+    hook: (name: string, fn: (...args: unknown[]) => void | Promise<void>) => unknown;
   };
   logger?: {
     warn?: (message: string) => void;
+    info?: (message: string) => void;
   };
 };
 
@@ -112,10 +118,10 @@ function createPagesProject(): string {
   return root;
 }
 
-async function initializeNitroSetupPlugin(
+async function initializeNitroPlugins(
   root: string,
   userConfig: Record<string, unknown> = {},
-): Promise<NitroSetupPlugin> {
+): Promise<{ plugins: ReturnType<typeof vinext>; nitroPlugin: NitroSetupPlugin }> {
   const plugins = vinext({ appDir: root, rsc: false }) as ReturnType<typeof vinext>;
   const configPlugin = findNamedPlugin(plugins, "vinext:config") as Plugin & {
     config?: (
@@ -139,6 +145,14 @@ async function initializeNitroSetupPlugin(
     throw new Error("vinext:nitro-route-rules plugin not found");
   }
 
+  return { plugins, nitroPlugin };
+}
+
+async function initializeNitroSetupPlugin(
+  root: string,
+  userConfig: Record<string, unknown> = {},
+): Promise<NitroSetupPlugin> {
+  const { nitroPlugin } = await initializeNitroPlugins(root, userConfig);
   return nitroPlugin;
 }
 
@@ -315,6 +329,98 @@ describe("vinext Nitro setup integration", () => {
     expect(nitro.options.traceDeps).toContain("@resvg/resvg-js");
     expect(nitro.options.traceDeps).toContain("yoga-wasm-web");
     expect(new Set(nitro.options.traceDeps).size).toBe(nitro.options.traceDeps?.length);
+  });
+
+  it("copies bundler externals into Nitro's server dir on the compiled hook", async () => {
+    const root = createAppProject();
+    writeProjectFile(
+      root,
+      "node_modules/dep-a/package.json",
+      JSON.stringify({
+        name: "dep-a",
+        version: "1.0.0",
+        main: "index.js",
+        dependencies: { "dep-b": "1.0.0" },
+      }),
+    );
+    writeProjectFile(root, "node_modules/dep-a/index.js", "module.exports = {};\n");
+    writeProjectFile(
+      root,
+      "node_modules/dep-b/package.json",
+      JSON.stringify({ name: "dep-b", version: "1.0.0", main: "index.js" }),
+    );
+    writeProjectFile(root, "node_modules/dep-b/index.js", "module.exports = {};\n");
+
+    const { plugins, nitroPlugin } = await initializeNitroPlugins(root);
+
+    // Simulate the RSC service build leaving dep-a (and an uninstalled
+    // package) external — this is what populates the shared collector.
+    const manifestPlugin = findNamedPlugin(
+      plugins,
+      "vinext:server-externals-manifest",
+    ) as Plugin & {
+      writeBundle?: { handler: (...args: unknown[]) => void };
+    };
+    if (!manifestPlugin?.writeBundle?.handler) {
+      throw new Error("vinext:server-externals-manifest plugin not found");
+    }
+    const serviceDir = path.join(root, "node_modules", ".nitro", "vite", "services", "rsc");
+    fs.mkdirSync(serviceDir, { recursive: true });
+    manifestPlugin.writeBundle.handler.call(
+      { environment: { name: "rsc" } },
+      { dir: serviceDir },
+      {
+        "index.js": {
+          type: "chunk",
+          imports: ["dep-a", "ghost-pkg"],
+          dynamicImports: [],
+        },
+      },
+    );
+
+    const registered: Array<[string, (...args: unknown[]) => void | Promise<void>]> = [];
+    const warn = vi.fn();
+    const serverDir = path.join(root, ".output", "server");
+    const nitro: NitroSetupTarget = {
+      options: { dev: false, routeRules: {}, output: { serverDir } },
+      hooks: {
+        hook: (name, fn) => {
+          registered.push([name, fn]);
+        },
+      },
+      logger: { warn, info: vi.fn() },
+    };
+
+    await nitroPlugin.nitro!.setup!(nitro);
+
+    const compiledHooks = registered.filter(([name]) => name === "compiled");
+    expect(compiledHooks).toHaveLength(1);
+    await compiledHooks[0]![1]();
+
+    // Whole packages plus transitive runtime deps land in .output/server/node_modules.
+    expect(fs.existsSync(path.join(serverDir, "node_modules", "dep-a", "index.js"))).toBe(true);
+    expect(fs.existsSync(path.join(serverDir, "node_modules", "dep-a", "package.json"))).toBe(true);
+    expect(fs.existsSync(path.join(serverDir, "node_modules", "dep-b", "index.js"))).toBe(true);
+    // Unresolvable manifest entries are skipped with a warning, not a crash.
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("ghost-pkg"));
+  });
+
+  it("does not register the compiled copy hook in Nitro dev", async () => {
+    const root = createAppProject();
+    const nitroPlugin = await initializeNitroSetupPlugin(root);
+    const registered: string[] = [];
+    const nitro: NitroSetupTarget = {
+      options: { dev: true, routeRules: {} },
+      hooks: {
+        hook: (name) => {
+          registered.push(name);
+        },
+      },
+    };
+
+    await nitroPlugin.nitro!.setup!(nitro);
+
+    expect(registered).toEqual([]);
   });
 
   it("propagates user vite ssr.external entries to Nitro traceDeps as package names", async () => {

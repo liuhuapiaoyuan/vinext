@@ -1328,11 +1328,19 @@ export type VinextOptions = {
 type NitroSetupContext = {
   options: {
     dev?: boolean;
+    preset?: string;
     routeRules?: Record<string, NitroRouteRuleConfig>;
     traceDeps?: string[];
+    output?: {
+      serverDir?: string;
+    };
+  };
+  hooks?: {
+    hook: (name: string, fn: (...args: unknown[]) => void | Promise<void>) => unknown;
   };
   logger?: {
     warn?: (message: string) => void;
+    info?: (message: string) => void;
   };
 };
 
@@ -1363,6 +1371,10 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   let warnedInlineNextConfigOverride = false;
   let hasNitroPlugin = false;
   let nitroTraceDepsFromExternals: string[] = [];
+  // Package names the RSC/SSR bundler left external, collected in-process by
+  // vinext:server-externals-manifest during the build. Consumed by the Nitro
+  // `compiled` hook to copy whole packages into .output/server/node_modules.
+  const nitroServerExternalPackages = new Set<string>();
   let isServeCommand = false;
   let pagesOptimizeEntries: string[] = [];
   const pagesClientAssetsOutputDirs = new Set<string>();
@@ -6173,8 +6185,11 @@ export const loadServerActionClient = ${
     // Collect SSR/RSC bundle externals and write dist/server/vinext-externals.json.
     // Used by emitStandaloneOutput to determine which packages to copy into
     // standalone/node_modules/ — uses the bundler's own import graph instead of
-    // fragile regex scanning of emitted files.
-    createServerExternalsManifestPlugin(),
+    // fragile regex scanning of emitted files. The callback feeds the same
+    // list to the Nitro `compiled` hook (see vinext:nitro-route-rules below).
+    createServerExternalsManifestPlugin({
+      onExternalPackage: (packageName) => nitroServerExternalPackages.add(packageName),
+    }),
     // Write image config JSON for the App Router production server.
     // The App Router RSC entry doesn't export vinextConfig (that's a Pages
     // Router pattern), so we write a separate JSON file at build time that
@@ -6277,6 +6292,43 @@ export const loadServerActionClient = ${
           }
 
           if (nitro.options.dev) return;
+
+          // After the Nitro build finishes (including its own nf3 trace step),
+          // copy every package the RSC/SSR bundler left external — whole
+          // directories plus transitive runtime deps — into
+          // .output/server/node_modules. Nitro's nft-based tracing copies
+          // individual statically-detected files, which silently breaks
+          // packages using dynamic requires or fs-loaded assets (symptom:
+          // package.json present in .output but its main file missing). The
+          // whole-package copy overlays those partial copies and makes
+          // `.output` genuinely self-contained, matching the guarantee of
+          // vinext's standalone output. Skipped for the prerender preset,
+          // which runs on the builder machine where node_modules exists.
+          if (nitro.options.preset !== "nitro-prerender") {
+            nitro.hooks?.hook("compiled", async () => {
+              const serverDir = nitro.options.output?.serverDir;
+              if (!serverDir) return;
+              const packages = [...nitroServerExternalPackages].filter((name) => name !== "vinext");
+              if (packages.length === 0) return;
+
+              const warn = nitro.logger?.warn ?? console.warn;
+              const info = nitro.logger?.info ?? console.log;
+              const { copyExternalPackagesWithRuntimeDeps } = await import("./build/standalone.js");
+              const { copiedPackages } = copyExternalPackagesWithRuntimeDeps({
+                root,
+                targetNodeModulesDir: path.join(serverDir, "node_modules"),
+                packages,
+                onSkippedPackage: (packageName) =>
+                  warn(
+                    `[vinext] Could not resolve external package "${packageName}" from ${root}; ` +
+                      `it will be missing from .output/server/node_modules.`,
+                  ),
+              });
+              info(
+                `[vinext] Copied ${copiedPackages.length} external package(s) into .output/server/node_modules.`,
+              );
+            });
+          }
 
           const { collectNitroRouteRules, mergeNitroRouteRules } =
             await import("./build/nitro-route-rules.js");

@@ -190,6 +190,57 @@ function copyPackageAndRuntimeDeps(
   return [...copied];
 }
 
+type CopyExternalPackagesOptions = {
+  /** App root used to resolve packages (walks up node_modules like Node does). */
+  root: string;
+  /** Target node_modules directory (created if missing). */
+  targetNodeModulesDir: string;
+  /** Package names to copy (with their transitive runtime deps). */
+  packages: readonly string[];
+  /** Called for each initial package that cannot be resolved from root. */
+  onSkippedPackage?: (packageName: string) => void;
+};
+
+/**
+ * Copy whole packages (plus their transitive runtime dependencies) into a
+ * target node_modules directory.
+ *
+ * Used by the Nitro integration to make `.output/server/node_modules`
+ * complete: Nitro/nf3's nft-based tracing copies individual FILES detected by
+ * static analysis, which silently produces broken packages for anything using
+ * dynamic requires, fs-loaded assets, or lazily resolved subpaths (symptom: a
+ * package.json exists in the output but its `main` file does not). Copying
+ * the full package directory tree sidesteps that entire failure class — the
+ * same guarantee vinext's own standalone output provides.
+ *
+ * Unresolvable initial packages are skipped (reported via `onSkippedPackage`)
+ * rather than failing the build: the manifest can contain packages referenced
+ * only behind guarded dynamic imports. Unresolvable *transitive* non-optional
+ * dependencies still throw — those indicate a broken install.
+ */
+export function copyExternalPackagesWithRuntimeDeps(options: CopyExternalPackagesOptions): {
+  copiedPackages: string[];
+  skippedPackages: string[];
+} {
+  const root = path.resolve(options.root);
+  const rootResolver = createRequire(path.join(root, "package.json"));
+
+  const resolvable: string[] = [];
+  const skippedPackages: string[] = [];
+  for (const packageName of options.packages) {
+    if (resolvePackageJsonPath(packageName, rootResolver)) {
+      resolvable.push(packageName);
+    } else {
+      skippedPackages.push(packageName);
+      options.onSkippedPackage?.(packageName);
+    }
+  }
+
+  fs.mkdirSync(options.targetNodeModulesDir, { recursive: true });
+  const copiedPackages = copyPackageAndRuntimeDeps(root, options.targetNodeModulesDir, resolvable);
+  return { copiedPackages, skippedPackages };
+}
+
 function writeStandaloneServerEntry(filePath: string): void {
   // Uses import.meta.dirname (Node >= 21.2, vinext requires >= 22) so the
   // entry point is pure ESM — no need for CJS require() or __dirname.

@@ -72,8 +72,19 @@ export function packageNameFromSpecifier(specifier: string): string | null {
  *
  * `emitStandaloneOutput` reads this file and uses it as the seed list for the
  * BFS `node_modules/` copy, replacing the old regex-scan approach.
+ *
+ * The optional `onExternalPackage` callback fires for every collected package
+ * name. Nitro builds use it to gather the same authoritative externals list
+ * in-process (the manifest file lands under Nitro's service build dir, not
+ * dist/server, so the callback avoids path discovery entirely).
  */
-export function createServerExternalsManifestPlugin(): Plugin {
+export function createServerExternalsManifestPlugin(
+  pluginOptions: { onExternalPackage?: (packageName: string) => void } = {},
+): Plugin {
+  // Destructured at factory scope: the writeBundle handler's own first
+  // parameter is also named `options` (rollup output options) and would
+  // shadow the factory parameter inside the handler.
+  const { onExternalPackage } = pluginOptions;
   // Accumulate external specifiers across all server environments (rsc + ssr).
   // Both environments run writeBundle; we merge their results so Pages Router
   // builds (ssr only) and App Router builds (rsc + ssr) both produce a
@@ -130,7 +141,10 @@ export function createServerExternalsManifestPlugin(): Plugin {
               continue;
             }
             const pkg = packageNameFromSpecifier(specifier);
-            if (pkg) externals.add(pkg);
+            if (pkg) {
+              externals.add(pkg);
+              onExternalPackage?.(pkg);
+            }
           }
         }
 
