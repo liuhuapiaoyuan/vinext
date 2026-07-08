@@ -175,7 +175,10 @@ import {
   SSR_EXTERNAL_REACT_ENTRIES,
   VINEXT_OPTIMIZE_DEPS_EXCLUDE,
 } from "./plugins/rsc-client-shim-excludes.js";
-import { createServerExternalsManifestPlugin } from "./plugins/server-externals-manifest.js";
+import {
+  createServerExternalsManifestPlugin,
+  packageNameFromSpecifier,
+} from "./plugins/server-externals-manifest.js";
 import {
   VIRTUAL_GOOGLE_FONTS,
   RESOLVED_VIRTUAL_GOOGLE_FONTS,
@@ -1359,7 +1362,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   let hasCloudflarePlugin = false;
   let warnedInlineNextConfigOverride = false;
   let hasNitroPlugin = false;
-  let nitroTraceDepsFromServerExternals: string[] = [];
+  let nitroTraceDepsFromExternals: string[] = [];
   let isServeCommand = false;
   let pagesOptimizeEntries: string[] = [];
   const pagesClientAssetsOutputDirs = new Set<string>();
@@ -2493,7 +2496,28 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           nextConfig?.serverExternalPackages,
           serverTranspilePackages,
         );
-        nitroTraceDepsFromServerExternals = nextServerExternal;
+        // Nitro's dependency tracer (nitro:externals → resolveTraceDeps) only
+        // copies `nitro.options.traceDeps` plus its built-in native package
+        // lists into `.output/server/node_modules`. Every package vinext
+        // leaves external in a Nitro service build must therefore be listed
+        // here, or `.output` will not be self-contained: serverExternalPackages,
+        // user-configured `ssr.external` entries, and the native/wasm OG-image
+        // deps the RSC environment externalizes below. Subpath specifiers
+        // (e.g. "pkg/sub") are reduced to package names because Nitro matches
+        // traceDeps against resolved node_modules paths.
+        nitroTraceDepsFromExternals = [
+          ...new Set(
+            [
+              ...nextServerExternal,
+              ...(Array.isArray(config.ssr?.external) ? config.ssr.external : []),
+              "satori",
+              "@resvg/resvg-js",
+              "yoga-wasm-web",
+            ]
+              .map((specifier) => packageNameFromSpecifier(specifier))
+              .filter((name): name is string => name !== null),
+          ),
+        ];
         // Detect if this is a multi-environment build (App Router or Cloudflare).
         // In multi-env builds, manualChunks must only be set per-environment
         // (on the client env), not globally — otherwise it leaks into RSC/SSR
@@ -2748,6 +2772,16 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           // RSC/SSR service deps (e.g. instrumentation.ts → OpenTelemetry) into
           // the service output instead of leaving absolute node_modules imports
           // that Nitro's dependency tracer may not copy to `.output/server/`.
+          // On Nitro, the React runtime (and pure-JS helpers like ipaddr.js)
+          // must be bundled too: Nitro's tracer only copies traceDeps plus its
+          // native builtin lists into `.output/server/node_modules`, so leaving
+          // framework packages external produces a non-self-contained `.output`
+          // that crashes ".output-only" deployments (e.g. Docker) with
+          // missing react-dom. This matches the Cloudflare model (bundle
+          // everything) and Next.js itself (vendored React in the server
+          // build). Packages that genuinely cannot be bundled
+          // (serverExternalPackages, user ssr.external) stay external and are
+          // propagated to nitro.options.traceDeps (see nitroTraceDepsFromExternals).
           // Also skip `noExternal: true` when the user opted into
           // `ssr.external: true` — they've explicitly asked for everything
           // external, and forcing `noExternal: true` here leaks down into
@@ -2764,10 +2798,9 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               : {
                   ssr: {
                     external: [
-                      "react",
-                      "react-dom",
-                      "react-dom/server",
-                      "ipaddr.js",
+                      ...(hasNitroPlugin
+                        ? []
+                        : ["react", "react-dom", "react-dom/server", "ipaddr.js"]),
                       ...(Array.isArray(config.ssr?.external) ? config.ssr.external : []),
                       ...nextServerExternal,
                     ],
@@ -3157,7 +3190,9 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                           ? true
                           : [
                               ...userSsrExternal,
-                              "ipaddr.js",
+                              // Bundle ipaddr.js on Nitro — it's pure JS and
+                              // Nitro's tracer would not copy it to .output.
+                              ...(hasNitroPlugin ? [] : ["ipaddr.js"]),
                               // Node can load the SSR React runtime natively.
                               // Keeping it out of Vite's transform graph avoids
                               // reparsing the large Flight client decoder.
@@ -3328,10 +3363,12 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             ssr: {
               resolve: {
                 external: [
-                  "react",
-                  "react-dom",
-                  "react-dom/server",
-                  "ipaddr.js",
+                  // On Nitro, bundle the React runtime and ipaddr.js instead —
+                  // Nitro's tracer only copies traceDeps + native builtins to
+                  // .output/server/node_modules (see the top-level ssr config).
+                  ...(hasNitroPlugin
+                    ? []
+                    : ["react", "react-dom", "react-dom/server", "ipaddr.js"]),
                   ...nextServerExternal,
                 ],
                 noExternal: true as const,
@@ -6233,12 +6270,9 @@ export const loadServerActionClient = ${
           if (!nextConfig) return;
           if (!hasAppDir && !hasPagesDir) return;
 
-          if (nitroTraceDepsFromServerExternals.length > 0) {
+          if (nitroTraceDepsFromExternals.length > 0) {
             nitro.options.traceDeps = [
-              ...new Set([
-                ...(nitro.options.traceDeps ?? []),
-                ...nitroTraceDepsFromServerExternals,
-              ]),
+              ...new Set([...(nitro.options.traceDeps ?? []), ...nitroTraceDepsFromExternals]),
             ];
           }
 

@@ -530,6 +530,25 @@ describe("optimizeDeps.exclude for vinext", () => {
       expect(result.environments.rsc.resolve?.noExternal).toBe(true);
       expect(result.environments.ssr.resolve?.noExternal).toBe(true);
       expect(result.ssr?.noExternal).toBe(true);
+
+      // The React runtime and ipaddr.js must be bundled into the Nitro
+      // service output: Nitro's tracer only copies traceDeps + native
+      // builtins to .output/server/node_modules, so leaving them external
+      // breaks ".output-only" deployments (missing react-dom in Docker).
+      const topLevelExternal = result.ssr?.external ?? [];
+      const ssrEnvExternal = result.environments.ssr.resolve?.external ?? [];
+      for (const entry of ["react", "react-dom", "react-dom/server", "ipaddr.js"]) {
+        expect(topLevelExternal, `nitro ssr external should NOT contain ${entry}`).not.toContain(
+          entry,
+        );
+        expect(ssrEnvExternal, `nitro ssr env external should NOT contain ${entry}`).not.toContain(
+          entry,
+        );
+      }
+      // serverExternalPackages stay external (they are propagated to Nitro
+      // traceDeps for tracing into .output).
+      expect(topLevelExternal).toContain("sharp");
+      expect(ssrEnvExternal).toContain("sharp");
     } finally {
       await fixture.cleanup();
     }

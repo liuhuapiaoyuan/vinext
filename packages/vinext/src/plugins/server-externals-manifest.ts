@@ -17,8 +17,11 @@ const BUILTIN_MODULES = new Set(
  *  - Absolute paths ("/abs/path")
  *  - Node built-ins ("node:fs")
  *  - Package self-references ("#imports")
+ *
+ * Exported for reuse by the Nitro traceDeps propagation in index.ts, which
+ * needs package names (not subpath specifiers) for Nitro's include regex.
  */
-function packageNameFromSpecifier(specifier: string): string | null {
+export function packageNameFromSpecifier(specifier: string): string | null {
   if (
     !specifier ||
     specifier.startsWith(".") ||

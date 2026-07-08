@@ -112,7 +112,10 @@ function createPagesProject(): string {
   return root;
 }
 
-async function initializeNitroSetupPlugin(root: string): Promise<NitroSetupPlugin> {
+async function initializeNitroSetupPlugin(
+  root: string,
+  userConfig: Record<string, unknown> = {},
+): Promise<NitroSetupPlugin> {
   const plugins = vinext({ appDir: root, rsc: false }) as ReturnType<typeof vinext>;
   const configPlugin = findNamedPlugin(plugins, "vinext:config") as Plugin & {
     config?: (
@@ -126,7 +129,10 @@ async function initializeNitroSetupPlugin(root: string): Promise<NitroSetupPlugi
 
   // Passing empty plugins array means hasNitroPlugin=false in the closure,
   // but the nitro.setup hook doesn't gate on hasNitroPlugin (Nitro calls it directly).
-  await configPlugin.config({ root, plugins: [] }, { command: "build", mode: "production" });
+  await configPlugin.config(
+    { root, plugins: [], ...userConfig },
+    { command: "build", mode: "production" },
+  );
 
   const nitroPlugin = findNamedPlugin(plugins, "vinext:nitro-route-rules") as NitroSetupPlugin;
   if (!nitroPlugin?.nitro?.setup) {
@@ -303,7 +309,34 @@ describe("vinext Nitro setup integration", () => {
     expect(nitro.options.traceDeps).toContain("mongodb");
     expect(nitro.options.traceDeps).toContain("custom-apm");
     expect(nitro.options.traceDeps).toContain("@scope/traced");
+    // Native/wasm OG-image deps stay external in the RSC environment and
+    // must be traced into .output when used.
+    expect(nitro.options.traceDeps).toContain("satori");
+    expect(nitro.options.traceDeps).toContain("@resvg/resvg-js");
+    expect(nitro.options.traceDeps).toContain("yoga-wasm-web");
     expect(new Set(nitro.options.traceDeps).size).toBe(nitro.options.traceDeps?.length);
+  });
+
+  it("propagates user vite ssr.external entries to Nitro traceDeps as package names", async () => {
+    const root = createAppProject();
+    const nitroPlugin = await initializeNitroSetupPlugin(root, {
+      ssr: { external: ["custom-native", "@scope/pkg/subpath", "lodash/merge"] },
+    });
+    const nitro: NitroSetupTarget = {
+      options: {
+        dev: false,
+        routeRules: {},
+      },
+    };
+
+    await nitroPlugin.nitro!.setup!(nitro);
+
+    expect(nitro.options.traceDeps).toContain("custom-native");
+    // Subpath specifiers are reduced to package names — Nitro matches
+    // traceDeps against resolved node_modules paths.
+    expect(nitro.options.traceDeps).toContain("@scope/pkg");
+    expect(nitro.options.traceDeps).toContain("lodash");
+    expect(nitro.options.traceDeps).not.toContain("lodash/merge");
   });
 
   it("merges generated route rules into Nitro before build", async () => {
