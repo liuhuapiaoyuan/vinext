@@ -516,6 +516,25 @@ describe("optimizeDeps.exclude for vinext", () => {
     }
   }, 15000);
 
+  it("bundles server deps for Nitro RSC/SSR service builds", async () => {
+    const fixture = await setupAppRouterConfigTest("vinext-nitro-noexternal-");
+
+    try {
+      const result = await fixture.config(
+        {
+          plugins: [{ name: "nitro" }],
+        },
+        "build",
+      );
+
+      expect(result.environments.rsc.resolve?.noExternal).toBe(true);
+      expect(result.environments.ssr.resolve?.noExternal).toBe(true);
+      expect(result.ssr?.noExternal).toBe(true);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 15000);
+
   it("preserves user SSR externals while externalizing React in Node dev", async () => {
     const fixture = await setupAppRouterConfigTest("vinext-optdeps-react-array-");
 

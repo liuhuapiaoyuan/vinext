@@ -2743,7 +2743,11 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           //   node_modules don't hit Node's native ESM loader.
           //   Any user-provided `ssr.noExternal` is intentionally superseded
           //   by this setting; only `ssr.external` entries escape Vite's transform.
-          // Skip when targeting bundled runtimes (Cloudflare/Nitro bundle everything).
+          // Skip when targeting Cloudflare Workers — the worker bundler owns the
+          // full server graph. Nitro runs on Node and still needs Vite to bundle
+          // RSC/SSR service deps (e.g. instrumentation.ts → OpenTelemetry) into
+          // the service output instead of leaving absolute node_modules imports
+          // that Nitro's dependency tracer may not copy to `.output/server/`.
           // Also skip `noExternal: true` when the user opted into
           // `ssr.external: true` — they've explicitly asked for everything
           // external, and forcing `noExternal: true` here leaks down into
@@ -2753,7 +2757,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           // the duplicate-React crashes documented in #1103.
           // This also resolves extensionless-import issues in packages like
           // `validator` (see #189) by routing them through Vite's resolver.
-          ...(hasCloudflarePlugin || hasNitroPlugin
+          ...(hasCloudflarePlugin
             ? {}
             : config.ssr?.external === true
               ? { ssr: { external: true as const } }
@@ -3086,7 +3090,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           viteConfig.environments = {
             rsc: {
               ...appRouterDevConfigFor("rsc"),
-              ...(hasCloudflarePlugin || hasNitroPlugin
+              ...(hasCloudflarePlugin
                 ? {}
                 : {
                     resolve: {
@@ -3095,7 +3099,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                       // ESM module evaluator (which can't handle native addons).
                       // Note: Do NOT externalize react/react-dom here — they must
                       // be bundled with the "react-server" condition for RSC.
-                      // Skip when targeting bundled runtimes (Cloudflare/Nitro).
+                      // Skip only for Cloudflare Workers — Nitro still bundles here.
                       external:
                         userSsrExternal === true
                           ? true
@@ -3144,7 +3148,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             },
             ssr: {
               ...appRouterDevConfigFor("ssr"),
-              ...(hasCloudflarePlugin || hasNitroPlugin
+              ...(hasCloudflarePlugin
                 ? {}
                 : {
                     resolve: {
