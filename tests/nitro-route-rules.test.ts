@@ -405,6 +405,198 @@ describe("vinext Nitro setup integration", () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("ghost-pkg"));
   });
 
+  it("copies serverExternalPackages even when writeBundle only sees absolute paths", async () => {
+    // Regression: Nitro/nf3 leaves a partial @opentelemetry tree (package.json
+    // + build/esm only). The compiled hook must overlay the full package from
+    // the app's node_modules using serverExternalPackages / traceDeps, even if
+    // chunk.imports were rewritten to absolute paths that the collector used
+    // to ignore.
+    const root = createAppProject();
+    writeProjectFile(
+      root,
+      "next.config.mjs",
+      `export default { serverExternalPackages: ["@scope/otel-exporter"] };\n`,
+    );
+    writeProjectFile(
+      root,
+      "node_modules/@scope/otel-exporter/package.json",
+      JSON.stringify({
+        name: "@scope/otel-exporter",
+        version: "1.0.0",
+        main: "build/src/index.js",
+        module: "build/esm/index.js",
+      }),
+    );
+    writeProjectFile(
+      root,
+      "node_modules/@scope/otel-exporter/build/src/index.js",
+      "module.exports = {};\n",
+    );
+    writeProjectFile(root, "node_modules/@scope/otel-exporter/build/esm/index.js", "export {};\n");
+
+    const { plugins, nitroPlugin } = await initializeNitroPlugins(root);
+
+    const manifestPlugin = findNamedPlugin(
+      plugins,
+      "vinext:server-externals-manifest",
+    ) as Plugin & {
+      writeBundle?: { handler: (...args: unknown[]) => void };
+    };
+    if (!manifestPlugin?.writeBundle?.handler) {
+      throw new Error("vinext:server-externals-manifest plugin not found");
+    }
+    const serviceDir = path.join(root, "node_modules", ".nitro", "vite", "services", "rsc");
+    fs.mkdirSync(serviceDir, { recursive: true });
+    // Absolute path form — previously dropped by packageNameFromSpecifier.
+    const absImport = path.join(
+      root,
+      "node_modules",
+      "@scope",
+      "otel-exporter",
+      "build",
+      "src",
+      "index.js",
+    );
+    manifestPlugin.writeBundle.handler.call(
+      { environment: { name: "rsc" } },
+      { dir: serviceDir },
+      {
+        "index.js": {
+          type: "chunk",
+          imports: [absImport],
+          dynamicImports: [],
+        },
+      },
+    );
+
+    // Simulate nf3's partial copy: package.json + esm only (main file missing).
+    const serverDir = path.join(root, ".output", "server");
+    const partialPkg = path.join(serverDir, "node_modules", "@scope", "otel-exporter");
+    writeProjectFile(
+      partialPkg,
+      "package.json",
+      JSON.stringify({
+        name: "@scope/otel-exporter",
+        version: "1.0.0",
+        main: "build/src/index.js",
+        module: "build/esm/index.js",
+      }),
+    );
+    writeProjectFile(partialPkg, "build/esm/index.js", "export {};\n");
+
+    const registered: Array<[string, (...args: unknown[]) => void | Promise<void>]> = [];
+    const nitro: NitroSetupTarget = {
+      options: { dev: false, routeRules: {}, output: { serverDir } },
+      hooks: {
+        hook: (name, fn) => {
+          registered.push([name, fn]);
+        },
+      },
+      logger: { warn: vi.fn(), info: vi.fn() },
+    };
+
+    await nitroPlugin.nitro!.setup!(nitro);
+    const compiledHooks = registered.filter(([name]) => name === "compiled");
+    expect(compiledHooks).toHaveLength(1);
+    await compiledHooks[0]![1]();
+
+    expect(fs.existsSync(path.join(partialPkg, "build", "src", "index.js"))).toBe(true);
+    expect(fs.existsSync(path.join(partialPkg, "build", "esm", "index.js"))).toBe(true);
+  });
+
+  it("copies user serverExternalPackages when writeBundle collector is empty", async () => {
+    const root = createAppProject();
+    writeProjectFile(
+      root,
+      "next.config.mjs",
+      `export default { serverExternalPackages: ["custom-otel"] };\n`,
+    );
+    writeProjectFile(
+      root,
+      "node_modules/custom-otel/package.json",
+      JSON.stringify({ name: "custom-otel", version: "1.0.0", main: "index.js" }),
+    );
+    writeProjectFile(root, "node_modules/custom-otel/index.js", "module.exports = {};\n");
+
+    const nitroPlugin = await initializeNitroSetupPlugin(root);
+    const registered: Array<[string, (...args: unknown[]) => void | Promise<void>]> = [];
+    const serverDir = path.join(root, ".output", "server");
+    const nitro: NitroSetupTarget = {
+      options: { dev: false, routeRules: {}, output: { serverDir } },
+      hooks: {
+        hook: (name, fn) => {
+          registered.push([name, fn]);
+        },
+      },
+      logger: { warn: vi.fn(), info: vi.fn() },
+    };
+
+    await nitroPlugin.nitro!.setup!(nitro);
+    // No writeBundle simulation — collector stays empty; user-declared
+    // serverExternalPackages must still drive the whole-package copy.
+    const compiledHooks = registered.filter(([name]) => name === "compiled");
+    expect(compiledHooks).toHaveLength(1);
+    await compiledHooks[0]![1]();
+
+    expect(fs.existsSync(path.join(serverDir, "node_modules", "custom-otel", "index.js"))).toBe(
+      true,
+    );
+  });
+
+  it("heals nf3 partial packages already present in .output without user seeds", async () => {
+    // Even if the bundler collector and next.config seeds miss a package,
+    // anything nf3 already dropped into .output/server/node_modules must be
+    // replaced with a full tree from the app install (OTel main-file gap).
+    const root = createAppProject();
+    writeProjectFile(
+      root,
+      "node_modules/@scope/partial-otel/package.json",
+      JSON.stringify({
+        name: "@scope/partial-otel",
+        version: "1.0.0",
+        main: "build/src/index.js",
+        module: "build/esm/index.js",
+      }),
+    );
+    writeProjectFile(
+      root,
+      "node_modules/@scope/partial-otel/build/src/index.js",
+      "module.exports = {};\n",
+    );
+    writeProjectFile(root, "node_modules/@scope/partial-otel/build/esm/index.js", "export {};\n");
+
+    const nitroPlugin = await initializeNitroSetupPlugin(root);
+    const serverDir = path.join(root, ".output", "server");
+    const partialPkg = path.join(serverDir, "node_modules", "@scope", "partial-otel");
+    writeProjectFile(
+      partialPkg,
+      "package.json",
+      JSON.stringify({
+        name: "@scope/partial-otel",
+        version: "1.0.0",
+        main: "build/src/index.js",
+        module: "build/esm/index.js",
+      }),
+    );
+    writeProjectFile(partialPkg, "build/esm/index.js", "export {};\n");
+
+    const registered: Array<[string, (...args: unknown[]) => void | Promise<void>]> = [];
+    const nitro: NitroSetupTarget = {
+      options: { dev: false, routeRules: {}, output: { serverDir } },
+      hooks: {
+        hook: (name, fn) => {
+          registered.push([name, fn]);
+        },
+      },
+      logger: { warn: vi.fn(), info: vi.fn() },
+    };
+
+    await nitroPlugin.nitro!.setup!(nitro);
+    await registered.filter(([name]) => name === "compiled")[0]![1]();
+
+    expect(fs.existsSync(path.join(partialPkg, "build", "src", "index.js"))).toBe(true);
+  });
+
   it("does not register the compiled copy hook in Nitro dev", async () => {
     const root = createAppProject();
     const nitroPlugin = await initializeNitroSetupPlugin(root);

@@ -569,4 +569,15 @@ describe("copyExternalPackagesWithRuntimeDeps", () => {
       true,
     );
   });
+
+  it("lists installed package names including scoped packages", async () => {
+    const { listInstalledPackageNames } =
+      await import("../packages/vinext/src/build/standalone.js");
+    const nm = path.join(tmpDir, "nm");
+    writeFile(nm, "dep-a/package.json", JSON.stringify({ name: "dep-a" }));
+    writeFile(nm, "@scope/pkg/package.json", JSON.stringify({ name: "@scope/pkg" }));
+    writeFile(nm, ".nf3/ignored/package.json", JSON.stringify({ name: "ignored" }));
+
+    expect(listInstalledPackageNames(nm).sort()).toEqual(["@scope/pkg", "dep-a"]);
+  });
 });

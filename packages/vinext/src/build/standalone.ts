@@ -157,6 +157,10 @@ function copyPackageAndRuntimeDeps(
     const packageRoot = path.dirname(realPackageJsonPath);
     const packageTarget = path.join(targetNodeModulesDir, entry.packageName);
     fs.mkdirSync(path.dirname(packageTarget), { recursive: true });
+    // Replace nf3 junctions/symlinks/partial trees with a real directory copy.
+    // Writing through a junction would mutate `.nf3/...` instead of producing
+    // a self-contained package under node_modules/<name>.
+    fs.rmSync(packageTarget, { recursive: true, force: true });
     fs.cpSync(packageRoot, packageTarget, {
       recursive: true,
       dereference: true,
@@ -200,6 +204,49 @@ type CopyExternalPackagesOptions = {
   /** Called for each initial package that cannot be resolved from root. */
   onSkippedPackage?: (packageName: string) => void;
 };
+
+/**
+ * List top-level package names already present under a node_modules directory
+ * (including scoped packages). Skips hidden dirs such as `.nf3` / `.bin`.
+ *
+ * Used by the Nitro `compiled` hook to discover packages that nf3 already
+ * traced into `.output/server/node_modules` — those trees are often incomplete
+ * (package.json present, `main` file missing) and must be overlaid with a
+ * whole-package copy from the app install.
+ */
+export function listInstalledPackageNames(nodeModulesDir: string): string[] {
+  if (!fs.existsSync(nodeModulesDir)) {
+    return [];
+  }
+
+  const names: string[] = [];
+  for (const entry of fs.readdirSync(nodeModulesDir, { withFileTypes: true })) {
+    if (entry.name.startsWith(".")) continue;
+    if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+
+    if (entry.name.startsWith("@")) {
+      const scopeDir = path.join(nodeModulesDir, entry.name);
+      let scopedEntries: fs.Dirent[];
+      try {
+        scopedEntries = fs.readdirSync(scopeDir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const pkg of scopedEntries) {
+        if (!pkg.isDirectory() && !pkg.isSymbolicLink()) continue;
+        if (fs.existsSync(path.join(scopeDir, pkg.name, "package.json"))) {
+          names.push(`${entry.name}/${pkg.name}`);
+        }
+      }
+      continue;
+    }
+
+    if (fs.existsSync(path.join(nodeModulesDir, entry.name, "package.json"))) {
+      names.push(entry.name);
+    }
+  }
+  return names;
+}
 
 /**
  * Copy whole packages (plus their transitive runtime dependencies) into a

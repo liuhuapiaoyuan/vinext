@@ -1371,6 +1371,11 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   let warnedInlineNextConfigOverride = false;
   let hasNitroPlugin = false;
   let nitroTraceDepsFromExternals: string[] = [];
+  // User-declared / framework-required externals that must be whole-copied into
+  // Nitro `.output` (NOT the full Next.js default serverExternalPackages list —
+  // that would bloat every Docker image with unused natives). Combined with the
+  // bundler collector and a post-nf3 scan of `.output/server/node_modules`.
+  let nitroWholePackageCopySeeds: string[] = [];
   // Package names the RSC/SSR bundler left external, collected in-process by
   // vinext:server-externals-manifest during the build. Consumed by the Nitro
   // `compiled` hook to copy whole packages into .output/server/node_modules.
@@ -2517,14 +2522,30 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         // deps the RSC environment externalizes below. Subpath specifiers
         // (e.g. "pkg/sub") are reduced to package names because Nitro matches
         // traceDeps against resolved node_modules paths.
+        const userSsrExternalSpecifiers = Array.isArray(config.ssr?.external)
+          ? config.ssr.external
+          : [];
+        const ogImageExternals = ["satori", "@resvg/resvg-js", "yoga-wasm-web"] as const;
         nitroTraceDepsFromExternals = [
           ...new Set(
+            [...nextServerExternal, ...userSsrExternalSpecifiers, ...ogImageExternals]
+              .map((specifier) => packageNameFromSpecifier(specifier))
+              .filter((name): name is string => name !== null),
+          ),
+        ];
+        // Whole-package copy seeds: only packages the app actually opted into
+        // (next.config serverExternalPackages + vite ssr.external) plus the
+        // OG-image natives vinext itself externalizes. The Next.js default
+        // serverExternalPackages list stays in traceDeps for Nitro's nft pass,
+        // but must NOT all be force-copied — most are unused and would inflate
+        // `.output`. Incomplete nf3 trees are healed separately by scanning
+        // whatever already landed in `.output/server/node_modules`.
+        nitroWholePackageCopySeeds = [
+          ...new Set(
             [
-              ...nextServerExternal,
-              ...(Array.isArray(config.ssr?.external) ? config.ssr.external : []),
-              "satori",
-              "@resvg/resvg-js",
-              "yoga-wasm-web",
+              ...(nextConfig?.serverExternalPackages ?? []),
+              ...userSsrExternalSpecifiers,
+              ...ogImageExternals,
             ]
               .map((specifier) => packageNameFromSpecifier(specifier))
               .filter((name): name is string => name !== null),
@@ -6308,15 +6329,30 @@ export const loadServerActionClient = ${
             nitro.hooks?.hook("compiled", async () => {
               const serverDir = nitro.options.output?.serverDir;
               if (!serverDir) return;
-              const packages = [...nitroServerExternalPackages].filter((name) => name !== "vinext");
+
+              const targetNodeModulesDir = path.join(serverDir, "node_modules");
+              const { copyExternalPackagesWithRuntimeDeps, listInstalledPackageNames } =
+                await import("./build/standalone.js");
+
+              // Three sources, unioned:
+              // 1. Bundler import graph (bare or absolute node_modules paths)
+              // 2. User-declared externals (next.config + vite ssr.external + OG)
+              // 3. Packages nf3 already placed in .output — heal partial trees
+              //    (the @opentelemetry/* "package.json without main" failure)
+              const packages = [
+                ...new Set([
+                  ...nitroServerExternalPackages,
+                  ...nitroWholePackageCopySeeds,
+                  ...listInstalledPackageNames(targetNodeModulesDir),
+                ]),
+              ].filter((name) => name !== "vinext");
               if (packages.length === 0) return;
 
               const warn = nitro.logger?.warn ?? console.warn;
               const info = nitro.logger?.info ?? console.log;
-              const { copyExternalPackagesWithRuntimeDeps } = await import("./build/standalone.js");
               const { copiedPackages } = copyExternalPackagesWithRuntimeDeps({
                 root,
-                targetNodeModulesDir: path.join(serverDir, "node_modules"),
+                targetNodeModulesDir,
                 packages,
                 onSkippedPackage: (packageName) =>
                   warn(

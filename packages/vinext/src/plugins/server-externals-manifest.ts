@@ -10,30 +10,87 @@ const BUILTIN_MODULES = new Set(
 );
 
 /**
- * Extract the npm package name from a bare module specifier.
+ * Extract an npm package name from an absolute filesystem path that contains
+ * a `node_modules` segment (POSIX or Windows). Returns null when the path is
+ * not a node_modules package path.
+ */
+export function packageNameFromNodeModulesPath(filePath: string): string | null {
+  const normalized = filePath.replaceAll("\\", "/");
+  const marker = "/node_modules/";
+  const idx = normalized.lastIndexOf(marker);
+  if (idx === -1) return null;
+
+  const after = normalized.slice(idx + marker.length);
+  if (!after || after.startsWith(".")) return null;
+
+  if (after.startsWith("@")) {
+    const parts = after.split("/");
+    if (parts.length >= 2 && parts[0] && parts[1]) {
+      return `${parts[0]}/${parts[1]}`;
+    }
+    return null;
+  }
+
+  const packageName = after.split("/")[0] || null;
+  if (!packageName || BUILTIN_MODULES.has(packageName)) {
+    return null;
+  }
+  return packageName;
+}
+
+/**
+ * Extract the npm package name from a module specifier.
  *
  * Returns null for:
  *  - Relative imports ("./foo", "../bar")
- *  - Absolute paths ("/abs/path")
  *  - Node built-ins ("node:fs")
  *  - Package self-references ("#imports")
+ *  - Non-package schemes ("virtual:...")
+ *
+ * Absolute / `file:` paths through `node_modules` are recovered to a package
+ * name (needed when Nitro rewrites externals to resolved filesystem paths).
  *
  * Exported for reuse by the Nitro traceDeps propagation in index.ts, which
  * needs package names (not subpath specifiers) for Nitro's include regex.
  */
 export function packageNameFromSpecifier(specifier: string): string | null {
-  if (
-    !specifier ||
-    specifier.startsWith(".") ||
-    specifier.startsWith("/") ||
-    specifier.startsWith("\\") ||
-    specifier.startsWith("#")
-  ) {
+  if (!specifier || specifier.startsWith("#")) {
     return null;
   }
 
+  // Relative imports stay in the bundle graph — never npm packages.
+  if (specifier.startsWith(".")) {
+    return null;
+  }
+
+  // Absolute / Windows paths (and file: URLs) may be externalized by Nitro's
+  // service build as resolved node_modules paths. Recover the package name so
+  // the compiled-hook whole-package copy still runs.
+  if (
+    specifier.startsWith("/") ||
+    specifier.startsWith("\\") ||
+    /^[a-zA-Z]:[\\/]/.test(specifier) ||
+    specifier.startsWith("file:")
+  ) {
+    let pathPart = specifier;
+    if (specifier.startsWith("file://")) {
+      try {
+        pathPart = decodeURIComponent(new URL(specifier).pathname);
+        // On Windows, URL.pathname is "/C:/..." — strip the leading slash.
+        if (/^\/[a-zA-Z]:\//.test(pathPart)) {
+          pathPart = pathPart.slice(1);
+        }
+      } catch {
+        return null;
+      }
+    } else if (specifier.startsWith("file:")) {
+      pathPart = specifier.slice("file:".length);
+    }
+    return packageNameFromNodeModulesPath(pathPart);
+  }
+
   // External specifiers can include non-package schemes such as
-  // "virtual:vite-rsc" or "file:...". Those are never npm packages.
+  // "virtual:vite-rsc". Those are never npm packages.
   if (/^[a-zA-Z][a-zA-Z\d+.-]*:/.test(specifier)) {
     return null;
   }
