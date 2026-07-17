@@ -85,6 +85,7 @@ import {
   type PendingBrowserRouterState,
 } from "./app-browser-navigation-controller.js";
 import { AppBrowserMpaNavigationScheduler } from "./app-browser-mpa-navigation.js";
+import { createRscHmrAbortTracker, isBenignRscHmrAbortError } from "./app-browser-hmr-abort.js";
 import {
   resolveManifestNavigationInterceptionContext,
   resolveMiddlewareRewriteNavigationInterceptionContext,
@@ -334,6 +335,13 @@ const DEFAULT_GLOBAL_ERROR_COMPONENT = DefaultGlobalError as React.ComponentType
   reset: () => void;
 }>;
 let latestRscHmrUpdateId = 0;
+// Abort the in-flight RSC HMR fetch when a newer edit arrives. Rapid saves
+// (agent-dev workflow: long SSE open + editing CSS/TSX) used to stack stale
+// `/_rsc` requests on top of EventSource/stream connections and starve the
+// browser's per-host HTTP/1.1 pool — the page looked "dead" while the server
+// was still healthy. Superseded HMR fetches must die immediately; agent
+// streams are intentionally left alone.
+const rscHmrAbortTracker = createRscHmrAbortTracker();
 // Single-slot latch tracking the navId of the most recent synchronous
 // popstate snapshot restore. activeNavigationId is strictly monotonic, so
 // shouldSkipScrollRestore can only match the most-recently restored
@@ -2361,8 +2369,8 @@ function bootstrapHydration(
   });
 
   if (import.meta.env.DEV && import.meta.hot) {
-    const applyRscHmrUpdate = async (updateId: number): Promise<void> => {
-      if (updateId !== latestRscHmrUpdateId) return;
+    const applyRscHmrUpdate = async (updateId: number, signal: AbortSignal): Promise<void> => {
+      if (updateId !== latestRscHmrUpdateId || signal.aborted) return;
 
       // Root layout errors can leave the browser on a document-level error
       // shell. A normal RSC tree replacement can't reliably reconstruct the
@@ -2398,7 +2406,7 @@ function bootstrapHydration(
       // Skip silently when the tree is not currently mounted; the next
       // HMR push or full reload will reconcile.
       await waitForBrowserRouterStateReady();
-      if (updateId !== latestRscHmrUpdateId) return;
+      if (updateId !== latestRscHmrUpdateId || signal.aborted) return;
       if (!browserNavigationController.hasBrowserRouterState()) {
         return;
       }
@@ -2429,7 +2437,7 @@ function bootstrapHydration(
                 window.location.pathname + window.location.search,
                 hmrHeaders,
               ),
-              { headers: hmrHeaders },
+              { headers: hmrHeaders, signal },
             ),
           ),
         ),
@@ -2437,18 +2445,25 @@ function bootstrapHydration(
       );
     };
 
-    const handleRscUpdate = async (updateId: number): Promise<void> => {
+    const handleRscUpdate = async (updateId: number, signal: AbortSignal): Promise<void> => {
       try {
         await waitForRscHmrSettle();
-        await applyRscHmrUpdate(updateId);
+        if (updateId !== latestRscHmrUpdateId || signal.aborted) return;
+        await applyRscHmrUpdate(updateId, signal);
       } catch (error) {
+        if (signal.aborted || isBenignRscHmrAbortError(error)) return;
         console.error("[vinext] RSC HMR error:", error);
+      } finally {
+        rscHmrAbortTracker.clearIfCurrent(signal);
       }
     };
 
     import.meta.hot.on("rsc:update", () => {
       const updateId = ++latestRscHmrUpdateId;
-      void handleRscUpdate(updateId);
+      // Drop the previous HMR `/_rsc` fetch immediately so rapid saves do not
+      // accumulate pending document/RSC requests alongside long agent streams.
+      const signal = rscHmrAbortTracker.begin();
+      void handleRscUpdate(updateId, signal);
     });
   }
 }
