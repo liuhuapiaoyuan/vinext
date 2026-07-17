@@ -1011,6 +1011,64 @@ describe("bufferRequestBodyForHeaderClone", () => {
     const buffered = await bufferRequestBodyForHeaderClone(original);
     expect(buffered).toBe(original);
   });
+
+  it("falls back to the raw Node stream when Web clone throws (chunked POST)", async () => {
+    const rawRequest = {
+      async *[Symbol.asyncIterator]() {
+        yield new TextEncoder().encode('{"stream":true}');
+      },
+    };
+    const original = new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "",
+    });
+    Object.defineProperty(original, "_request", {
+      value: rawRequest,
+      enumerable: true,
+      configurable: true,
+    });
+    Object.defineProperty(original, "clone", {
+      configurable: true,
+      value() {
+        throw new TypeError("Response body object should not be disturbed or locked");
+      },
+    });
+
+    const buffered = await bufferRequestBodyForHeaderClone(original);
+
+    expect(buffered).not.toBe(original);
+    expect(await buffered.text()).toBe('{"stream":true}');
+  });
+
+  it("materializes from raw Node stream when the body getter throws", async () => {
+    const rawRequest = {
+      async *[Symbol.asyncIterator]() {
+        yield new TextEncoder().encode('{"via":"node"}');
+      },
+    };
+    const original = new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "ignored",
+    });
+    Object.defineProperty(original, "body", {
+      configurable: true,
+      get() {
+        throw new TypeError("Response body object should not be disturbed or locked");
+      },
+    });
+    Object.defineProperty(original, "_request", {
+      value: rawRequest,
+      enumerable: true,
+      configurable: true,
+    });
+
+    const buffered = await bufferRequestBodyForHeaderClone(original);
+
+    expect(buffered).not.toBe(original);
+    expect(await buffered.text()).toBe('{"via":"node"}');
+  });
 });
 
 // ── cloneRequestWithHeaders ──────────────────────────────────────────────
@@ -1116,6 +1174,27 @@ describe("cloneRequestWithHeaders", () => {
     expect(cloned.body).toBeNull();
     expect(cloned.headers.get("accept")).toBe("text/html");
   });
+
+  it("does not throw when bodyUsed getter throws (srvx locked body)", async () => {
+    const payload = '{"ok":true}';
+    const original = new Request("http://localhost/api/chat", {
+      method: "POST",
+      body: payload,
+    });
+    Object.defineProperty(original, "bodyUsed", {
+      configurable: true,
+      get() {
+        throw new TypeError("Response body object should not be disturbed or locked");
+      },
+    });
+
+    let cloned: Request;
+    expect(() => {
+      cloned = cloneRequestWithHeaders(original, new Headers({ "x-filtered": "1" }));
+    }).not.toThrow();
+    expect(cloned!.headers.get("x-filtered")).toBe("1");
+    await expect(cloned!.text()).resolves.toBe(payload);
+  });
 });
 
 // ── cloneRequestWithUrl ──────────────────────────────────────────────────
@@ -1180,5 +1259,76 @@ describe("cloneRequestWithUrl", () => {
     const original = new Request("http://localhost/path?_rsc=abc", { redirect: "manual" });
     const cloned = cloneRequestWithUrl(original, "http://localhost/path");
     expect(cloned.redirect).toBe("manual");
+  });
+
+  // Regression: srvx's bodyUsed getter reconstructs an undici Request and can
+  // throw "Response body object should not be disturbed or locked". That used
+  // to escape cloneRequestWithUrl and stall the App Router pipeline for POST
+  // (LLM/SSE) traffic — appearing as a hung Vite dev server.
+  it("does not throw when bodyUsed getter throws (srvx locked body)", async () => {
+    const payload = JSON.stringify({ messages: [{ role: "user", content: "hi" }] });
+    const original = new Request("http://localhost/api/chat?_rsc=abc", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: payload,
+    });
+    Object.defineProperty(original, "bodyUsed", {
+      configurable: true,
+      get() {
+        throw new TypeError("Response body object should not be disturbed or locked");
+      },
+    });
+
+    let cloned: Request;
+    expect(() => {
+      cloned = cloneRequestWithUrl(original, "http://localhost/api/chat");
+    }).not.toThrow();
+    expect(cloned!.url).toBe("http://localhost/api/chat");
+    expect(cloned!.method).toBe("POST");
+    await expect(cloned!.text()).resolves.toBe(payload);
+  });
+
+  it("does not throw when bodyUsed throws and clone also fails", async () => {
+    const original = new Request("http://localhost/api/chat", {
+      method: "POST",
+      body: "keep-me",
+    });
+    Object.defineProperty(original, "bodyUsed", {
+      configurable: true,
+      get() {
+        throw new TypeError("Response body object should not be disturbed or locked");
+      },
+    });
+    Object.defineProperty(original, "clone", {
+      configurable: true,
+      value() {
+        throw new TypeError("Response body object should not be disturbed or locked");
+      },
+    });
+
+    let cloned: Request;
+    expect(() => {
+      cloned = cloneRequestWithUrl(original, "http://localhost/api/chat");
+    }).not.toThrow();
+    // Must not steal the source stream when tee fails — callers still read it.
+    await expect(original.text()).resolves.toBe("keep-me");
+    expect(cloned!.body).toBeNull();
+  });
+
+  it("keeps the source body readable across URL then header clones", async () => {
+    const payload = JSON.stringify({ messages: [] });
+    const original = new Request("http://localhost/api/chat?_rsc=abc", {
+      method: "POST",
+      body: payload,
+    });
+    const withoutRsc = cloneRequestWithUrl(original, "http://localhost/api/chat");
+    const filtered = cloneRequestWithHeaders(
+      withoutRsc,
+      new Headers({ "content-type": "application/json" }),
+    );
+
+    await expect(withoutRsc.clone().text()).resolves.toBe(payload);
+    await expect(filtered.text()).resolves.toBe(payload);
+    await expect(original.text()).resolves.toBe(payload);
   });
 });

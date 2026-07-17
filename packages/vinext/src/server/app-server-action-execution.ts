@@ -590,18 +590,25 @@ export async function readActionBodyWithLimit(request: Request, maxBytes: number
   }
 
   const contentLength = Number(request.headers.get("content-length") ?? "0");
-  if (request.body && !request.bodyUsed) {
-    const body = await readStreamAsTextWithLimit(request.body, maxBytes, () => {
+  let webBody: ReadableStream<Uint8Array> | null = null;
+  try {
+    webBody = request.body && !request.bodyUsed ? request.body : null;
+  } catch {
+    // srvx bodyUsed/body may throw on a locked Node stream.
+    webBody = null;
+  }
+  if (webBody) {
+    const body = await readStreamAsTextWithLimit(webBody, maxBytes, () => {
       throw new Error("Request body too large");
     });
     if (body.length > 0 || contentLength === 0) return body;
   }
 
-  if (contentLength > 0) {
-    const rawBody = await readRawNodeRequestBytes(request, maxBytes);
-    if (rawBody !== null && rawBody.byteLength > 0) {
-      return new TextDecoder().decode(rawBody);
-    }
+  // Always try the raw Node fallback when the Web body was unavailable —
+  // chunked POSTs may omit content-length.
+  const rawBody = await readRawNodeRequestBytes(request, maxBytes);
+  if (rawBody !== null && rawBody.byteLength > 0) {
+    return new TextDecoder().decode(rawBody);
   }
 
   return "";

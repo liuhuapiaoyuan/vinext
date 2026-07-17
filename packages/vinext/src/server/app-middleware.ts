@@ -79,8 +79,9 @@ function requestWithoutFlightHeaders(request: Request): Request {
   }
 
   if (!hasFlightHeader) return request;
-  const source = request.body ? request.clone() : request;
-  return cloneRequestWithHeaders(source, headers);
+  // Do not pre-clone: `cloneRequestWithHeaders` already branches the body, and
+  // a pre-clone can lock srvx streams so the follow-up clone throws.
+  return cloneRequestWithHeaders(request, headers);
 }
 
 function appendForwardedHeader(headers: Headers, value: unknown): void {

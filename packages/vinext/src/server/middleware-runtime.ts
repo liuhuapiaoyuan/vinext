@@ -16,7 +16,7 @@ import {
 } from "./headers.js";
 import { MatcherConfig, matchesMiddleware } from "./middleware-matcher.js";
 import { shouldKeepMiddlewareHeader } from "../utils/middleware-request-headers.js";
-import { processMiddlewareHeaders } from "./request-pipeline.js";
+import { processMiddlewareHeaders, cloneRequestWithUrl } from "./request-pipeline.js";
 import { badRequestResponse, internalServerErrorResponse } from "./http-error-responses.js";
 import {
   addBasePathToPathname,
@@ -222,6 +222,26 @@ function resolveMiddlewarePathname(request: Request): string | Response {
   }
 }
 
+function tryCloneRequestForMiddleware(request: Request): Request {
+  try {
+    let body: ReadableStream<Uint8Array> | null;
+    try {
+      body = request.body;
+    } catch {
+      return request;
+    }
+    if (!body) return request;
+    try {
+      if (request.bodyUsed) return request;
+    } catch {
+      // srvx may throw on bodyUsed when the Node stream is locked.
+    }
+    return request.clone();
+  } catch {
+    return request;
+  }
+}
+
 function createNextRequest(
   request: Request,
   normalizedPathname: string,
@@ -232,8 +252,9 @@ function createNextRequest(
 ): NextRequest {
   const url = new URL(request.url);
   // Middleware gets an isolated body branch; downstream routing keeps owning
-  // the original request body.
-  let mwRequest = request.body && !request.bodyUsed ? request.clone() : request;
+  // the original request body. Never read bodyUsed unsafely — on srvx that
+  // getter can throw and stall the whole App Router pipeline (POST/SSE).
+  let mwRequest = tryCloneRequestForMiddleware(request);
   // NextURL._stripBasePath only recognises basePath when the URL's pathname
   // actually starts with the basePath prefix. normalizedPathname may already
   // be basePath-stripped (App Router passes cleanPathname, the dev server
@@ -251,7 +272,7 @@ function createNextRequest(
   if (mwPathname !== url.pathname) {
     const mwUrl = new URL(url);
     mwUrl.pathname = mwPathname;
-    mwRequest = new Request(mwUrl, mwRequest);
+    mwRequest = cloneRequestWithUrl(mwRequest, mwUrl.toString());
   }
 
   const hasNextConfig = basePath || i18nConfig || trailingSlash;

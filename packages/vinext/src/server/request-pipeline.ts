@@ -677,6 +677,89 @@ export async function readRawNodeRequestBytes(
 const METHODS_THAT_MAY_HAVE_BODY = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 /**
+ * Read `request.body` without throwing. srvx adapters can throw while
+ * materializing the Web body from a locked Node stream.
+ */
+function peekRequestBody(request: Request): ReadableStream<Uint8Array> | null {
+  try {
+    return request.body;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Branch a request body for `new Request(url, init)` without touching
+ * `bodyUsed` unsafely.
+ *
+ * Dev App Router traffic arrives as srvx Requests. Their `bodyUsed` getter
+ * lazily builds an undici Request via `_request`; if the Node stream is
+ * already locked/disturbed (common with POST + SSE chat after an earlier
+ * clone), that getter throws:
+ *   TypeError: Response body object should not be disturbed or locked
+ * Previously that exception escaped `cloneRequestWithUrl` /
+ * `cloneRequestWithHeaders` and could stall the whole Vite RSC pipeline.
+ *
+ * Important: never return the original `request.body` stream. Passing it to
+ * `new Request` locks/steals it from the source, and callers (e.g.
+ * `createAppRscHandler`) still need that source for a later header clone.
+ * Only a teed body from `request.clone()` is safe to attach.
+ */
+function getRequestBodyForClone(request: Request): {
+  body: BodyInit | undefined;
+  duplex: boolean;
+} {
+  const bodyStream = peekRequestBody(request);
+  if (!bodyStream) {
+    return { body: undefined, duplex: false };
+  }
+
+  try {
+    if (request.bodyUsed) {
+      return { body: undefined, duplex: false };
+    }
+  } catch {
+    // srvx may throw on bodyUsed; continue and try clone().
+  }
+
+  try {
+    const cloned = request.clone();
+    const clonedBody = peekRequestBody(cloned);
+    if (clonedBody) {
+      return { body: clonedBody, duplex: true };
+    }
+  } catch {
+    // Cannot tee — omit body rather than stealing the source stream.
+  }
+
+  return { body: undefined, duplex: false };
+}
+
+function buildClonedRequestInit(
+  request: Request,
+  overrides: { headers?: Headers; body: BodyInit | undefined; duplex: boolean },
+): RequestInitWithCf {
+  const init: RequestInitWithCf = {
+    method: request.method,
+    headers: overrides.headers ?? request.headers,
+    body: overrides.body,
+    redirect: request.redirect,
+    signal: request.signal,
+    integrity: request.integrity,
+    cache: request.cache,
+    mode: request.mode,
+    credentials: request.credentials,
+    referrer: request.referrer,
+    referrerPolicy: request.referrerPolicy,
+  };
+  if (overrides.duplex) {
+    // @ts-expect-error — duplex needed for streaming request bodies
+    init.duplex = "half";
+  }
+  return init;
+}
+
+/**
  * Materialize the request body before header/url cloning.
  *
  * `cloneRequestWithHeaders` / `cloneRequestWithUrl` can lose a streaming body
@@ -691,20 +774,52 @@ export async function bufferRequestBodyForHeaderClone(request: Request): Promise
   if (!METHODS_THAT_MAY_HAVE_BODY.has(request.method.toUpperCase())) {
     return request;
   }
-  if (request.body === null) {
-    return request;
-  }
   const contentType = request.headers.get("content-type") ?? "";
   if (contentType.startsWith("multipart/form-data")) {
     return request;
   }
+
+  const contentLength = Number(request.headers.get("content-length") ?? "0");
+  const peekedBody = peekRequestBody(request);
+  const hasRawNodeBody = getRawNodeRequest(request) !== undefined;
+  // srvx can throw from the body getter even when a Node body exists. Still
+  // attempt materialization when content-length or `_request` says there is one.
+  if (peekedBody === null && contentLength <= 0 && !hasRawNodeBody) {
+    return request;
+  }
+
   try {
-    const contentLength = Number(request.headers.get("content-length") ?? "0");
-    const rawBytes = contentLength > 0 ? await readRawNodeRequestBytes(request) : null;
-    const bytes =
-      rawBytes && rawBytes.byteLength > 0
-        ? rawBytes
-        : new Uint8Array(await request.clone().arrayBuffer());
+    let bytes: Uint8Array | null = null;
+    let consumedRawNode = false;
+
+    // Prefer the raw Node stream when available — srvx's Web body may already
+    // be locked by the adapter. Track consumption so we do not iterate twice.
+    if (contentLength > 0 || (peekedBody === null && hasRawNodeBody)) {
+      const rawBytes = await readRawNodeRequestBytes(request);
+      consumedRawNode = hasRawNodeBody;
+      if (rawBytes && rawBytes.byteLength > 0) {
+        bytes = rawBytes;
+      }
+    }
+
+    if (!bytes) {
+      try {
+        bytes = new Uint8Array(await request.clone().arrayBuffer());
+      } catch {
+        // clone() failed (locked srvx/undici body). Fall back to the raw Node
+        // stream only if we have not already consumed it above.
+        if (!consumedRawNode) {
+          const rawBytes = await readRawNodeRequestBytes(request);
+          if (rawBytes && rawBytes.byteLength > 0) {
+            bytes = rawBytes;
+          }
+        }
+        if (!bytes) {
+          return request;
+        }
+      }
+    }
+
     if (bytes.byteLength === 0 && contentLength > 0) {
       return request;
     }
@@ -746,29 +861,11 @@ export async function bufferRequestBodyForHeaderClone(request: Request): Promise
 export function cloneRequestWithHeaders(request: Request, headers: Headers): Request {
   let cloned: Request;
   try {
-    if (request.body) throw new Error("clone with body may drop stream");
+    if (peekRequestBody(request)) throw new Error("clone with body may drop stream");
     cloned = new Request(request, { headers });
   } catch {
-    const hasReadableBody = Boolean(request.body && !request.bodyUsed);
-    const bodySource = hasReadableBody ? request.clone() : request;
-    const init: RequestInitWithCf = {
-      method: request.method,
-      headers,
-      body: hasReadableBody ? (bodySource.body ?? undefined) : undefined,
-      redirect: request.redirect,
-      signal: request.signal,
-      integrity: request.integrity,
-      cache: request.cache,
-      mode: request.mode,
-      credentials: request.credentials,
-      referrer: request.referrer,
-      referrerPolicy: request.referrerPolicy,
-    };
-    if (hasReadableBody) {
-      // @ts-expect-error — duplex needed for streaming request bodies
-      init.duplex = "half";
-    }
-    cloned = new Request(request.url, init);
+    const { body, duplex } = getRequestBodyForClone(request);
+    cloned = new Request(request.url, buildClonedRequestInit(request, { headers, body, duplex }));
   }
   copyPrivateRequestMetadata(request, cloned);
   return cloned;
@@ -789,29 +886,11 @@ export function cloneRequestWithHeaders(request: Request, headers: Headers): Req
 export function cloneRequestWithUrl(request: Request, url: string): Request {
   let cloned: Request;
   try {
-    if (request.body) throw new Error("clone with body may drop stream");
+    if (peekRequestBody(request)) throw new Error("clone with body may drop stream");
     cloned = new Request(url, request);
   } catch {
-    const hasReadableBody = Boolean(request.body && !request.bodyUsed);
-    const bodySource = hasReadableBody ? request.clone() : request;
-    const init: RequestInitWithCf = {
-      method: request.method,
-      headers: request.headers,
-      body: hasReadableBody ? (bodySource.body ?? undefined) : undefined,
-      redirect: request.redirect,
-      signal: request.signal,
-      integrity: request.integrity,
-      cache: request.cache,
-      mode: request.mode,
-      credentials: request.credentials,
-      referrer: request.referrer,
-      referrerPolicy: request.referrerPolicy,
-    };
-    if (hasReadableBody) {
-      // @ts-expect-error — duplex needed for streaming request bodies
-      init.duplex = "half";
-    }
-    cloned = new Request(url, init);
+    const { body, duplex } = getRequestBodyForClone(request);
+    cloned = new Request(url, buildClonedRequestInit(request, { body, duplex }));
   }
   copyPrivateRequestMetadata(request, cloned);
   return cloned;

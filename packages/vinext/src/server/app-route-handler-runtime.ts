@@ -8,6 +8,7 @@ import {
 } from "vinext/shims/server";
 import { buildRequestHeadersFromMiddlewareResponse } from "../utils/middleware-request-headers.js";
 import { addBasePathToPathname } from "../utils/base-path.js";
+import { cloneRequestWithHeaders, cloneRequestWithUrl } from "./request-pipeline.js";
 
 const ROUTE_HANDLER_HTTP_METHODS = [
   "GET",
@@ -133,28 +134,9 @@ function buildNextConfig(options: TrackedAppRouteRequestOptions): {
 }
 
 function rebuildRequestWithHeaders(input: Request, headers: Headers): Request {
-  const method = input.method;
-  const hasBody = method !== "GET" && method !== "HEAD";
-  const init: RequestInit & { duplex?: "half" } = {
-    method,
-    headers,
-    cache: input.cache,
-    credentials: input.credentials,
-    integrity: input.integrity,
-    keepalive: input.keepalive,
-    mode: input.mode,
-    redirect: input.redirect,
-    referrer: input.referrer,
-    referrerPolicy: input.referrerPolicy,
-    signal: input.signal,
-  };
-
-  if (hasBody && input.body) {
-    init.body = input.body;
-    init.duplex = "half";
-  }
-
-  return new Request(input.url, init);
+  // Delegate to the shared helper so bodied requests get `duplex: "half"` and
+  // srvx's throwing `bodyUsed` getter is handled without stealing `input.body`.
+  return cloneRequestWithHeaders(input, headers);
 }
 
 function cleanStaticUrl(url: string): string {
@@ -301,9 +283,9 @@ export function createTrackedAppRouteRequest(
       const prefixedPathname = addBasePathToPathname(inputUrl.pathname, options.basePath);
       if (prefixedPathname !== inputUrl.pathname) {
         inputUrl.pathname = prefixedPathname;
-        // Branch the body so the caller-owned request stays readable.
-        const bodySource = rawInput.body && !rawInput.bodyUsed ? rawInput.clone() : rawInput;
-        input = new Request(inputUrl, bodySource);
+        // Branch via cloneRequestWithUrl so the caller-owned request stays
+        // readable and Node/undici gets `duplex: "half"` for streaming bodies.
+        input = cloneRequestWithUrl(rawInput, inputUrl.toString());
       }
     }
     const requestHeaders = options.middlewareHeaders

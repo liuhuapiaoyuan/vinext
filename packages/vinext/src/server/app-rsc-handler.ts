@@ -469,12 +469,12 @@ function requestWithoutRscCacheBustingSearchParam(request: Request): Request {
   if (!hasRscCacheBustingSearchParam(url)) return request;
 
   stripRscCacheBustingSearchParam(url);
-  // Clone when a body is present so the original request stays usable, then
-  // reconstruct via `cloneRequestWithUrl` rather than a bare `new Request` so
-  // the Workers `cf` metadata is preserved (user middleware reads it directly)
-  // and `duplex: "half"` is set for streaming bodies.
-  const source = request.body ? request.clone() : request;
-  return cloneRequestWithUrl(source, url.toString());
+  // Use `cloneRequestWithUrl` (not a bare `new Request` or a pre-clone) so
+  // Workers `cf` metadata is preserved, `duplex: "half"` is set for streaming
+  // bodies, and srvx's throwing `bodyUsed` getter is handled safely. A pre-clone
+  // here previously locked the body and made the subsequent clone throw,
+  // stalling the whole App Router pipeline for POST/SSE traffic.
+  return cloneRequestWithUrl(request, url.toString());
 }
 
 function requestWithoutRscSuffix(request: Request): Request {
@@ -483,8 +483,7 @@ function requestWithoutRscSuffix(request: Request): Request {
   if (pathname === url.pathname) return request;
 
   url.pathname = pathname;
-  const source = request.body ? request.clone() : request;
-  return cloneRequestWithUrl(source, url.toString());
+  return cloneRequestWithUrl(request, url.toString());
 }
 
 async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
@@ -1283,8 +1282,16 @@ export function createAppRscHandler<TRoute extends AppRscHandlerRoute>(
     if (pagesDataInScope) {
       pagesDataUrl.pathname = stripBasePath(pagesDataUrl.pathname, options.basePath);
     }
+    // Avoid an unnecessary URL clone when basePath stripping was a no-op —
+    // every clone touches body probing and is a footgun on srvx POST/SSE.
+    const pagesDataUrlUnchanged = (() => {
+      const current = new URL(rawRequest.url);
+      return pagesDataUrl.pathname === current.pathname && pagesDataUrl.search === current.search;
+    })();
     const pagesDataCandidate = pagesDataInScope
-      ? cloneRequestWithUrl(rawRequest, pagesDataUrl.toString())
+      ? pagesDataUrlUnchanged
+        ? rawRequest
+        : cloneRequestWithUrl(rawRequest, pagesDataUrl.toString())
       : null;
     const pagesDataNormalization =
       options.renderPagesFallback && pagesDataCandidate
