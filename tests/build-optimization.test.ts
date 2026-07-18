@@ -438,6 +438,7 @@ describe("optimizeDeps.exclude for vinext", () => {
     await fsp.writeFile(path.join(root, "next.config.mjs"), `export default {};`);
 
     return {
+      root,
       config(userConfig: Record<string, unknown> = {}, command: "serve" | "build" = "serve") {
         return (mainPlugin as any).config(
           { root, build: {}, plugins: [], ...userConfig },
@@ -552,6 +553,42 @@ describe("optimizeDeps.exclude for vinext", () => {
       // traceDeps for tracing into .output).
       expect(topLevelExternal).toContain("sharp");
       expect(ssrEnvExternal).toContain("sharp");
+
+      // Also land on rolldownOptions.external so Rolldown does not throw
+      // UNRESOLVED_IMPORT for bare OTel/transitive imports under Nitro
+      // (resolve.external alone is insufficient for that path).
+      const rscRolldownExternal = result.environments.rsc.build?.rolldownOptions?.external;
+      const ssrRolldownExternal = result.environments.ssr.build?.rolldownOptions?.external;
+      expect(rscRolldownExternal).toEqual(expect.arrayContaining(["sharp"]));
+      expect(ssrRolldownExternal).toEqual(expect.arrayContaining(["sharp"]));
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 15000);
+
+  it("puts next.config serverExternalPackages on RSC rolldownOptions.external", async () => {
+    // Regression: better-auth → @opentelemetry/semantic-conventions bare import
+    // fails Rolldown under Nitro/bun unless the package is on rolldownOptions.external.
+    const fixture = await setupAppRouterConfigTest("vinext-rolldown-otel-external-");
+    await fsp.writeFile(
+      path.join(fixture.root, "next.config.mjs"),
+      `export default { serverExternalPackages: ["@opentelemetry/semantic-conventions"] };\n`,
+    );
+
+    try {
+      const result = await fixture.config(
+        {
+          plugins: [{ name: "nitro" }],
+        },
+        "build",
+      );
+
+      const rscResolveExternal = result.environments.rsc.resolve?.external ?? [];
+      const rscRolldownExternal = result.environments.rsc.build?.rolldownOptions?.external;
+      expect(rscResolveExternal).toContain("@opentelemetry/semantic-conventions");
+      expect(rscRolldownExternal).toEqual(
+        expect.arrayContaining(["@opentelemetry/semantic-conventions"]),
+      );
     } finally {
       await fixture.cleanup();
     }

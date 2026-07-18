@@ -1420,6 +1420,12 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   // that would bloat every Docker image with unused natives). Combined with the
   // bundler collector and a post-nf3 scan of `.output/server/node_modules`.
   let nitroWholePackageCopySeeds: string[] = [];
+  // SSR/RSC bundler externals (next.config serverExternalPackages + user
+  // ssr.external + Next defaults). Kept for a post-Nitro configEnvironment
+  // pass that also writes them to `build.rolldownOptions.external` — Vite's
+  // `resolve.external` alone is not enough when Rolldown hits a bare import
+  // it cannot resolve (bun/Docker + transitive OTel deps).
+  let serverBuildExternals: string[] | true = [];
   // Package names the RSC/SSR bundler left external, collected in-process by
   // vinext:server-externals-manifest during the build. Consumed by the Nitro
   // `compiled` hook to copy whole packages into .output/server/node_modules.
@@ -3106,8 +3112,19 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           : config.ssr?.external === true
             ? true
             : nextServerExternal;
+        serverBuildExternals = userSsrExternal;
         const externalizeSsrReactInDev =
           env.command === "serve" && !hasCloudflarePlugin && !hasNitroPlugin;
+        // Rolldown-native external list (string[] only — Rolldown's ExternalOption
+        // does not accept `true`). Vite also honors `resolve.external` via
+        // shouldExternalize, but that path still node-resolves the package for
+        // some importers — and Nitro's service env only puts `/^nitro/` in
+        // rollupOptions.external. Declaring these on rolldownOptions.external
+        // matches Vite's own UNRESOLVED_IMPORT guidance and keeps bare imports
+        // like `@opentelemetry/semantic-conventions` (pulled in by better-auth)
+        // from failing the RSC service build when the package is only transitive.
+        const serverRolldownExternal: string[] | undefined =
+          userSsrExternal === true || hasCloudflarePlugin ? undefined : userSsrExternal;
 
         // Capture top-level optimizeDeps populated by earlier plugins
         // (e.g. @lingui/vite-plugin) so we merge rather than overwrite.
@@ -3272,6 +3289,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                   // the route-miss 404 document resolves the cascade to the
                   // layout's rules instead of global-not-found's (issue #1549).
                   output: createRscFrameworkChunkOutputConfig(),
+                  ...(serverRolldownExternal ? { external: serverRolldownExternal } : {}),
                 }),
               },
             },
@@ -3338,6 +3356,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 outDir: options.ssrOutDir ?? "dist/server/ssr",
                 ...withBuildBundlerOptions({
                   input: { index: VIRTUAL_APP_SSR_ENTRY },
+                  ...(serverRolldownExternal ? { external: serverRolldownExternal } : {}),
                 }),
               },
             },
@@ -3486,6 +3505,19 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                   output: {
                     entryFileNames: "entry.js",
                   },
+                  ...(hasCloudflarePlugin
+                    ? {}
+                    : {
+                        external: hasNitroPlugin
+                          ? nextServerExternal
+                          : [
+                              "react",
+                              "react-dom",
+                              "react-dom/server",
+                              "ipaddr.js",
+                              ...nextServerExternal,
+                            ],
+                      }),
                 }),
               },
             },
@@ -6366,6 +6398,34 @@ export const loadServerActionClient = ${
     createServerExternalsManifestPlugin({
       onExternalPackage: (packageName) => nitroServerExternalPackages.add(packageName),
     }),
+    // Nitro's configEnvironment auto-wraps rsc/ssr as services and only puts
+    // `/^nitro/` in rollupOptions.external. Vite mergeConfig concatenates
+    // arrays, but Rolldown still emits UNRESOLVED_IMPORT for bare packages that
+    // never made it onto rolldownOptions.external (seen with
+    // `@opentelemetry/semantic-conventions` from better-auth under bun/Docker).
+    // Re-assert both resolve.external and rolldownOptions.external after Nitro.
+    {
+      name: "vinext:nitro-rolldown-server-externals",
+      enforce: "post",
+      apply: "build",
+      configEnvironment(name) {
+        if (!hasNitroPlugin || hasCloudflarePlugin) return null;
+        if (name !== "rsc" && name !== "ssr") return null;
+        if (serverBuildExternals === true) {
+          // Rolldown has no `external: true`; keep Vite resolve.external only.
+          return { resolve: { external: true as const } };
+        }
+        if (!Array.isArray(serverBuildExternals) || serverBuildExternals.length === 0) {
+          return null;
+        }
+        return {
+          resolve: { external: serverBuildExternals },
+          build: {
+            ...withBuildBundlerOptions({ external: serverBuildExternals }),
+          },
+        };
+      },
+    },
     // Write image config JSON for the App Router production server.
     // The App Router RSC entry doesn't export vinextConfig (that's a Pages
     // Router pattern), so we write a separate JSON file at build time that
