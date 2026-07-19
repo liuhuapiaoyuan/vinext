@@ -20,6 +20,10 @@ type NitroSetupTarget = {
     preset?: string;
     routeRules?: Record<string, NitroRouteRuleConfig>;
     traceDeps?: string[];
+    rolldownConfig?: {
+      external?: string | RegExp | Array<string | RegExp>;
+      [key: string]: unknown;
+    };
     output?: { serverDir?: string };
   };
   hooks?: {
@@ -329,6 +333,33 @@ describe("vinext Nitro setup integration", () => {
     expect(nitro.options.traceDeps).toContain("@resvg/resvg-js");
     expect(nitro.options.traceDeps).toContain("yoga-wasm-web");
     expect(new Set(nitro.options.traceDeps).size).toBe(nitro.options.traceDeps?.length);
+  });
+
+  it("propagates serverExternalPackages to Nitro rolldownConfig.external", async () => {
+    // Regression: Rolldown UNRESOLVED_IMPORT for bare OTel imports during the
+    // Nitro bundler pass — environments.nitro reads rolldownConfig.external,
+    // not Vite resolve.external.
+    const root = createAppProject();
+    writeProjectFile(
+      root,
+      "next.config.mjs",
+      `export default { serverExternalPackages: ["@opentelemetry/semantic-conventions"] };\n`,
+    );
+    const nitroPlugin = await initializeNitroSetupPlugin(root);
+    const nitro: NitroSetupTarget = {
+      options: {
+        dev: false,
+        routeRules: {},
+        rolldownConfig: { external: [/^nitro(\/|$)/] },
+      },
+    };
+
+    await nitroPlugin.nitro!.setup!(nitro);
+
+    const external = nitro.options.rolldownConfig?.external;
+    expect(external).toEqual(
+      expect.arrayContaining(["@opentelemetry/semantic-conventions", /^nitro(\/|$)/]),
+    );
   });
 
   it("copies bundler externals into Nitro's server dir on the compiled hook", async () => {

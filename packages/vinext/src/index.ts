@@ -188,6 +188,7 @@ import {
   createServerExternalsManifestPlugin,
   packageNameFromSpecifier,
 } from "./plugins/server-externals-manifest.js";
+import { createForceServerExternalsPlugin } from "./plugins/force-server-externals.js";
 // Keep this source-relative: resolving through vinext's package export can read
 // a stale built copy while developing or testing the source tree.
 // oxlint-disable-next-line vinext-local/prefer-import-alias
@@ -1374,6 +1375,11 @@ type NitroSetupContext = {
     preset?: string;
     routeRules?: Record<string, NitroRouteRuleConfig>;
     traceDeps?: string[];
+    /** Nitro's Rolldown bundler options (final `nitro` environment build). */
+    rolldownConfig?: {
+      external?: string | RegExp | Array<string | RegExp>;
+      [key: string]: unknown;
+    };
     output?: {
       serverDir?: string;
     };
@@ -6398,19 +6404,23 @@ export const loadServerActionClient = ${
     createServerExternalsManifestPlugin({
       onExternalPackage: (packageName) => nitroServerExternalPackages.add(packageName),
     }),
-    // Nitro's configEnvironment auto-wraps rsc/ssr as services and only puts
-    // `/^nitro/` in rollupOptions.external. Vite mergeConfig concatenates
-    // arrays, but Rolldown still emits UNRESOLVED_IMPORT for bare packages that
-    // never made it onto rolldownOptions.external (seen with
-    // `@opentelemetry/semantic-conventions` from better-auth under bun/Docker).
-    // Re-assert both resolve.external and rolldownOptions.external after Nitro.
+    // Authoritative externalization for Nitro/Rolldown: return
+    // `{ id, external: true }` from resolveId so Rolldown never tries to
+    // node-resolve serverExternalPackages (config-only externals are not
+    // enough — see vinext:force-server-externals).
+    createForceServerExternalsPlugin({
+      getExternals: () => serverBuildExternals,
+      isDisabled: () => hasCloudflarePlugin,
+    }),
+    // Also re-assert resolve/rolldownOptions.external after Nitro's service
+    // configEnvironment (belt-and-suspenders alongside the resolveId plugin).
     {
       name: "vinext:nitro-rolldown-server-externals",
       enforce: "post",
       apply: "build",
       configEnvironment(name) {
         if (!hasNitroPlugin || hasCloudflarePlugin) return null;
-        if (name !== "rsc" && name !== "ssr") return null;
+        if (name !== "rsc" && name !== "ssr" && name !== "nitro") return null;
         if (serverBuildExternals === true) {
           // Rolldown has no `external: true`; keep Vite resolve.external only.
           return { resolve: { external: true as const } };
@@ -6525,6 +6535,23 @@ export const loadServerActionClient = ${
             nitro.options.traceDeps = [
               ...new Set([...(nitro.options.traceDeps ?? []), ...nitroTraceDepsFromExternals]),
             ];
+          }
+
+          // Nitro's own bundler (environments.nitro) uses
+          // `nitro.options.rolldownConfig.external`, not Vite's per-env
+          // resolve.external. Without this, the final Nitro pass can still
+          // UNRESOLVED_IMPORT bare OTel imports left in service chunks.
+          if (Array.isArray(serverBuildExternals) && serverBuildExternals.length > 0) {
+            const prevExternal = nitro.options.rolldownConfig?.external;
+            const prevList = Array.isArray(prevExternal)
+              ? prevExternal
+              : prevExternal
+                ? [prevExternal]
+                : [];
+            nitro.options.rolldownConfig = {
+              ...nitro.options.rolldownConfig,
+              external: [...new Set([...prevList, ...serverBuildExternals])],
+            };
           }
 
           if (nitro.options.dev) return;
