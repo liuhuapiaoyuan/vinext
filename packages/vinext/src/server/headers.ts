@@ -15,6 +15,7 @@ import {
   MIDDLEWARE_SKIP_HEADER,
   VINEXT_PRERENDER_ROUTE_PARAMS_HEADER,
   VINEXT_PRERENDER_SPECULATIVE_HEADER,
+  VINEXT_REVALIDATE_HOST_HEADER,
 } from "../utils/protocol-headers.js";
 
 // ---------------------------------------------------------------------------
@@ -26,6 +27,9 @@ export const VINEXT_CACHE_HEADER = "X-Vinext-Cache";
 
 /** Next.js public ISR / page cache state indicator. */
 export const NEXTJS_CACHE_HEADER = "x-nextjs-cache";
+
+/** Next.js cache-tag metadata carried by prerendered App Router responses. */
+export const NEXT_CACHE_TAGS_HEADER = "x-next-cache-tags";
 
 /** Static file signal — value is URL-encoded pathname. */
 export const VINEXT_STATIC_FILE_HEADER = "x-vinext-static-file";
@@ -44,6 +48,7 @@ export {
   VINEXT_PRERENDER_ROUTE_PARAMS_HEADER,
   VINEXT_PRERENDER_SECRET_HEADER,
   VINEXT_PRERENDER_SPECULATIVE_HEADER,
+  VINEXT_REVALIDATE_HOST_HEADER,
 } from "../utils/protocol-headers.js";
 
 /** Internal endpoint used to evaluate App Router generateStaticParams exports. */
@@ -225,4 +230,5 @@ export const VINEXT_INTERNAL_HEADERS = [
   VINEXT_PRERENDER_ROUTE_PARAMS_HEADER,
   VINEXT_PRERENDER_SPECULATIVE_HEADER,
   VINEXT_PRERENDER_CACHE_LIFE_HEADER,
+  VINEXT_REVALIDATE_HOST_HEADER,
 ];

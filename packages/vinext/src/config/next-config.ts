@@ -174,8 +174,16 @@ export type NextConfig = {
    * @see https://nextjs.org/docs/app/api-reference/config/next-config-js/assetPrefix
    */
   assetPrefix?: string;
+  /** Cross-origin mode applied to framework scripts and preload links. */
+  crossOrigin?: "anonymous" | "use-credentials";
   /** Whether to add trailing slashes */
   trailingSlash?: boolean;
+  /** TypeScript build settings. */
+  typescript?: {
+    /** Project-relative path to the TypeScript configuration file. */
+    tsconfigPath?: string;
+    [key: string]: unknown;
+  };
   /** Internationalization routing config */
   i18n?: NextI18nConfig;
   /** URL redirect rules */
@@ -326,6 +334,8 @@ export type NextConfig = {
      * values are clamped to Number.MAX_SAFE_INTEGER.
      */
     prefetchInlining?: boolean | { maxBundleSize?: number; maxSize?: number };
+    /** Header names forwarded by Pages Router `res.revalidate()` internal requests. */
+    allowedRevalidateHeaderKeys?: string[];
     [key: string]: unknown;
   };
   /**
@@ -397,6 +407,7 @@ export type ResolvedNextConfig = {
    */
   assetPrefix: string;
   trailingSlash: boolean;
+  typescript: { tsconfigPath?: string };
   output: "" | "export" | "standalone";
   pageExtensions: string[];
   resolveExtensions: string[] | null;
@@ -431,6 +442,8 @@ export type ResolvedNextConfig = {
   allowedDevOrigins: string[];
   /** Extra allowed origins for server action CSRF validation (from experimental.serverActions.allowedOrigins). */
   serverActionsAllowedOrigins: string[];
+  /** Header names forwarded by Pages Router `res.revalidate()` internal requests. */
+  allowedRevalidateHeaderKeys: string[];
   /** Packages whose barrel imports should be optimized (from experimental.optimizePackageImports). */
   optimizePackageImports: string[];
   /** Packages explicitly requested for server/client transpilation. */
@@ -519,6 +532,8 @@ export type ResolvedNextConfig = {
    * `test/e2e/optimized-loading` test fixture.
    */
   disableOptimizedLoading: boolean;
+  /** Cross-origin mode applied to framework scripts and preload links. */
+  crossOrigin: "anonymous" | "use-credentials" | undefined;
   /**
    * Resolved `reactStrictMode` from next.config, preserved as `boolean | null`
    * so each router can apply its own default (Next.js resolves `null` to OFF
@@ -1570,6 +1585,7 @@ export async function resolveNextConfig(
       basePath: "",
       assetPrefix: "",
       trailingSlash: false,
+      typescript: {},
       output: "",
       pageExtensions: normalizePageExtensions(),
       resolveExtensions: null,
@@ -1587,6 +1603,7 @@ export async function resolveNextConfig(
       aliases: {},
       allowedDevOrigins: [],
       serverActionsAllowedOrigins: [],
+      allowedRevalidateHeaderKeys: [],
       optimizePackageImports: [],
       transpilePackages: [],
       turbopackTranspilePackages: [...DEFAULT_TRANSPILED_PACKAGES],
@@ -1608,6 +1625,7 @@ export async function resolveNextConfig(
       sassOptions: null,
       removeConsole: false,
       disableOptimizedLoading: false,
+      crossOrigin: undefined,
       reactStrictMode: null,
       scrollRestoration: false,
       compilerDefine: {},
@@ -1620,6 +1638,18 @@ export async function resolveNextConfig(
     };
     detectNextIntlConfig(root, resolved);
     return resolved;
+  }
+
+  if (
+    config.crossOrigin !== undefined &&
+    config.crossOrigin !== "anonymous" &&
+    config.crossOrigin !== "use-credentials"
+  ) {
+    console.warn(
+      "Invalid next.config options detected:\n" +
+        '    Invalid option at "crossOrigin": expected "anonymous" or "use-credentials"\n' +
+        "See more info here: https://nextjs.org/docs/messages/invalid-next-config",
+    );
   }
 
   warnDeprecatedConfigOptions(config, root);
@@ -1904,6 +1934,10 @@ export async function resolveNextConfig(
     basePath: config.basePath ?? "",
     assetPrefix: normalizeAssetPrefix(config.assetPrefix),
     trailingSlash: config.trailingSlash ?? false,
+    typescript:
+      typeof config.typescript?.tsconfigPath === "string"
+        ? { tsconfigPath: config.typescript.tsconfigPath }
+        : {},
     output: output === "export" || output === "standalone" ? output : "",
     pageExtensions,
     resolveExtensions: resolveExtensions ?? webpackProbe.resolveExtensions,
@@ -1926,6 +1960,11 @@ export async function resolveNextConfig(
     aliases,
     allowedDevOrigins,
     serverActionsAllowedOrigins,
+    allowedRevalidateHeaderKeys: Array.isArray(experimental?.allowedRevalidateHeaderKeys)
+      ? (experimental.allowedRevalidateHeaderKeys as unknown[])
+          .filter((value): value is string => typeof value === "string")
+          .map((value) => value.toLowerCase())
+      : [],
     optimizePackageImports,
     transpilePackages,
     turbopackTranspilePackages,
@@ -1957,6 +1996,10 @@ export async function resolveNextConfig(
     // Next.js stores this under `experimental.disableOptimizedLoading`.
     // Default `false` matches Next.js: page scripts get `defer` in <head>.
     disableOptimizedLoading: experimental?.disableOptimizedLoading === true,
+    crossOrigin:
+      config.crossOrigin === "anonymous" || config.crossOrigin === "use-credentials"
+        ? config.crossOrigin
+        : undefined,
     // Preserve `null` (unset) so each router applies its own default — Next.js
     // resolves `null` to OFF for Pages Router, ON for App Router.
     reactStrictMode: typeof config.reactStrictMode === "boolean" ? config.reactStrictMode : null,

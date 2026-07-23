@@ -19,6 +19,7 @@ import {
   VINEXT_PRERENDER_SECRET_HEADER,
   VINEXT_PRERENDER_SPECULATIVE_HEADER,
   VINEXT_PRERENDER_STATIC_PARAMS_PATH,
+  VINEXT_REVALIDATE_HOST_HEADER,
 } from "./headers.js";
 import { ensureFetchPatch, setCurrentFetchSoftTags } from "vinext/shims/fetch-cache";
 import type { ReactFormState } from "react-dom/client";
@@ -27,7 +28,12 @@ import {
   type ExecutionContextLike,
 } from "vinext/shims/request-context";
 import { pickRootParams, setRootParams, type RootParams } from "vinext/shims/root-params";
-import { createRequestContext, runWithRequestContext } from "vinext/shims/unified-request-context";
+import {
+  closeAfterResponse,
+  closeAfterResponseWithBody,
+  createRequestContext,
+  runWithRequestContext,
+} from "vinext/shims/unified-request-context";
 import { flattenErrorCauses } from "../utils/error-cause.js";
 import { addBasePathToPathname, hasBasePath, stripBasePath } from "../utils/base-path.js";
 import { mergeRewriteQuery } from "../utils/query.js";
@@ -50,6 +56,7 @@ import { normalizeRscRequest } from "./app-rsc-request-normalization.js";
 import { buildNextDataNotFoundResponse, normalizePagesDataRequest } from "./pages-data-route.js";
 import { normalizeDefaultLocalePathname } from "./pages-i18n.js";
 import { notFoundResponse } from "./http-error-responses.js";
+import { isOnDemandRevalidateRequest, PRERENDER_REVALIDATE_HEADER } from "./isr-cache.js";
 import { getRenderedConcreteUrlPathsForRoute } from "./pregenerated-concrete-paths.js";
 import { getScriptNonceFromHeaderSources } from "./csp.js";
 import { buildPageCacheTags } from "./implicit-tags.js";
@@ -243,6 +250,7 @@ type HandleServerActionRequestOptions<TRoute> = {
   middlewareContext: AppRscMiddlewareContext;
   mountedSlotsHeader: string | null;
   request: Request;
+  scriptNonce?: string;
   routeMatch: AppRscRouteMatch<TRoute> | null;
   routePathname: string;
   searchParams: URLSearchParams;
@@ -321,6 +329,10 @@ type CreateAppRscHandlerOptions<TRoute extends AppRscHandlerRoute> = {
   imageConfig?: ImageConfig;
   isDev: boolean;
   loadPrerenderPagesRoutes?: () => Promise<unknown>;
+  matchInterceptRoute?: (
+    pathname: string,
+    sourcePathname: string,
+  ) => AppRscRouteMatch<TRoute> | null;
   matchRoute: (pathname: string) => AppRscRouteMatch<TRoute> | null;
   matchRequestRoute?: (pathname: string) => AppRscRouteMatch<TRoute> | null;
   runMiddleware?: (options: RunAppMiddlewareOptions) => Promise<ApplyAppMiddlewareResult>;
@@ -638,9 +650,14 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   };
   let didMiddlewareRewrite = false;
   let didMiddlewareRewritePathname = false;
+  const runMiddleware = isOnDemandRevalidateRequest(
+    request.headers.get(PRERENDER_REVALIDATE_HEADER),
+  )
+    ? undefined
+    : options.runMiddleware;
 
-  if (options.runMiddleware) {
-    const middlewareResult = await options.runMiddleware({
+  if (runMiddleware) {
+    const middlewareResult = await runMiddleware({
       cleanPathname,
       context: middlewareContext,
       hadBasePath,
@@ -862,7 +879,22 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   // where the second `setRootParams` call replaces this value before rendering.
   // Out-of-basePath Server Actions resolve those late rewrites above so this
   // match already uses their claimed destination.
-  const preActionMatch = filesystemRouteEligible ? matchCleanPathname() : null;
+  // Interception-only RSC targets promote their source route at this same
+  // boundary so Server Action rerenders receive the same route and params as
+  // the subsequent page dispatch. Document requests remain direct-route-only.
+  const directPreActionMatch = filesystemRouteEligible ? matchCleanPathname() : null;
+  const preActionRoutePathname = cleanPathnameIsRequestPathname
+    ? requestCleanPathname
+    : cleanPathname;
+  const interceptionPreActionMatch =
+    filesystemRouteEligible &&
+    directPreActionMatch === null &&
+    isRscRequest &&
+    interceptionContextHeader !== null
+      ? (options.matchInterceptRoute?.(preActionRoutePathname, interceptionContextHeader) ?? null)
+      : null;
+  const preActionMatch = directPreActionMatch ?? interceptionPreActionMatch;
+  const isInterceptionMatch = interceptionPreActionMatch !== null;
   if (preActionMatch) {
     setRootParams(pickRootParams(preActionMatch.params, preActionMatch.route.rootParamNames));
   }
@@ -937,8 +969,9 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
           middlewareContext,
           mountedSlotsHeader,
           request,
+          scriptNonce,
           routeMatch: preActionMatch,
-          routePathname: cleanPathnameIsRequestPathname ? requestCleanPathname : cleanPathname,
+          routePathname: preActionRoutePathname,
           searchParams: getResolvedSearchParams(),
         })
       : null;
@@ -953,7 +986,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   ): Promise<Response | null> => {
     if (!filesystemRouteEligible) return null;
     const response =
-      match === null || match.route.isDynamic
+      !isInterceptionMatch && (match === null || match.route.isDynamic)
         ? ((await options.renderPagesFallback?.({
             appRouteMatch: match ?? null,
             allowRscDocumentFallback: didMiddlewareRewritePathname,
@@ -982,7 +1015,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     options.clearRequestContext();
     return staticPagesFallbackResponse;
   }
-  if (!resolvedLateRewritesForAction && (!match || match.route.isDynamic)) {
+  if (!isInterceptionMatch && !resolvedLateRewritesForAction && (!match || match.route.isDynamic)) {
     for (const rewrite of options.configRewrites.afterFiles) {
       const afterFilesRewrite = await applyRewrite(
         {
@@ -1084,7 +1117,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   if (pagesDataRequest) {
     options.clearRequestContext();
     if (
-      options.runMiddleware &&
+      runMiddleware &&
       (middlewareContext.status === null ||
         middlewareContext.status === 200 ||
         middlewareContext.status === 404)
@@ -1363,6 +1396,9 @@ export function createAppRscHandler<TRoute extends AppRscHandlerRoute>(
       return pagesDataNormalization.notFoundResponse;
     }
     const isPagesDataRequest = pagesDataNormalization?.isDataReq === true;
+    const executionContext = isExecutionContextLike(ctx)
+      ? ctx
+      : (getRequestExecutionContext() ?? null);
     // Read the trusted prerender route params before filtering strips the
     // route-params header (it IS in VINEXT_INTERNAL_HEADERS), then re-attach the
     // validated value below so the second read in handleAppRscRequest still sees
@@ -1376,7 +1412,10 @@ export function createAppRscHandler<TRoute extends AppRscHandlerRoute>(
       process.env.VINEXT_PRERENDER === "1" &&
       rawRequest.headers.get(VINEXT_PRERENDER_SECRET_HEADER) !== null &&
       rawRequest.headers.get(VINEXT_PRERENDER_SPECULATIVE_HEADER) === "1";
-    const filteredHeaders = filterInternalHeaders(rawRequest.headers);
+    const filteredHeaders = executionContext?.isInternalPagesRevalidation
+      ? new Headers(rawRequest.headers)
+      : filterInternalHeaders(rawRequest.headers);
+    filteredHeaders.delete(VINEXT_REVALIDATE_HOST_HEADER);
     if (mwCtx !== null) {
       filteredHeaders.set(VINEXT_MW_CTX_HEADER, mwCtx);
     }
@@ -1400,9 +1439,6 @@ export function createAppRscHandler<TRoute extends AppRscHandlerRoute>(
       ? cloneRequestWithHeaders(pagesDataCandidate!, filteredHeaders)
       : null;
 
-    const executionContext = isExecutionContextLike(ctx)
-      ? ctx
-      : (getRequestExecutionContext() ?? null);
     const headersContext = headersContextFromRequest(request, {
       draftModeSecret: options.draftModeSecret,
     });
@@ -1412,7 +1448,7 @@ export function createAppRscHandler<TRoute extends AppRscHandlerRoute>(
       unstableCacheRevalidation: "background",
     });
 
-    return runWithRequestContext(requestContext, () =>
+    const responsePromise = runWithRequestContext(requestContext, () =>
       runWithPrerenderWorkUnit(
         async () => {
           ensureFetchPatch();
@@ -1445,5 +1481,13 @@ export function createAppRscHandler<TRoute extends AppRscHandlerRoute>(
         { route: () => new URL(request.url).pathname },
       ),
     );
+    let response: Response;
+    try {
+      response = await responsePromise;
+    } catch (error) {
+      await closeAfterResponse(requestContext);
+      throw error;
+    }
+    return closeAfterResponseWithBody(response, requestContext);
   };
 }

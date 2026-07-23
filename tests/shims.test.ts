@@ -55,6 +55,35 @@ describe("vinext next data client helpers", () => {
 });
 
 describe("dynamic route href interpolation", () => {
+  // Ported from Next.js: test/e2e/dynamic-routing/pages/index.js
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/dynamic-routing/pages/index.js
+  it("resolves a Pages Router href/as pair and omits consumed params from as", async () => {
+    const { resolveDynamicRouteHref } =
+      await import("../packages/vinext/src/shims/internal/interpolate-as.js");
+
+    expect(resolveDynamicRouteHref("/[a]/[b]/c?a=a&b=b&q=q#section")).toEqual({
+      href: "/[a]/[b]/c?a=a&b=b&q=q#section",
+      as: "/a/b/c?q=q#section",
+    });
+  });
+
+  it("resolves repeated query values into catch-all segments", async () => {
+    const { resolveDynamicRouteHref } =
+      await import("../packages/vinext/src/shims/internal/interpolate-as.js");
+
+    expect(resolveDynamicRouteHref("/docs/[...slug]?slug=one&slug=two&preview=1")).toEqual({
+      href: "/docs/[...slug]?slug=one&slug=two&preview=1",
+      as: "/docs/one/two?preview=1",
+    });
+  });
+
+  it("does not treat brackets in a query value as a dynamic route", async () => {
+    const { resolveDynamicRouteHref } =
+      await import("../packages/vinext/src/shims/internal/interpolate-as.js");
+
+    expect(resolveDynamicRouteHref("/search?q=[literal]")).toBeNull();
+  });
+
   it("preserves query and hash suffixes while interpolating", async () => {
     const { interpolateDynamicRouteHref } =
       await import("../packages/vinext/src/shims/internal/interpolate-as.js");
@@ -4905,19 +4934,163 @@ describe("next/server shim", () => {
     expect(human.isBot).toBe(false);
   });
 
-  it("after() runs a callback asynchronously without throwing", async () => {
+  it("after() waits for the response body to close before running a callback", async () => {
     const { after } = await import("../packages/vinext/src/shims/server.js");
+    const { closeAfterResponseWithBody, createRequestContext, runWithRequestContext } =
+      await import("../packages/vinext/src/shims/unified-request-context.js");
     let called = false;
-    after(() => {
-      called = true;
+    const requestContext = createRequestContext();
+    let response!: Response;
+    await runWithRequestContext(requestContext, () => {
+      after(() => {
+        called = true;
+      });
+      response = closeAfterResponseWithBody(new Response("streamed"), requestContext);
     });
-    // after() schedules as a microtask, so await a tick
-    await new Promise((r) => setTimeout(r, 10));
+
+    await Promise.resolve();
+    expect(called).toBe(false);
+    await response.text();
+    await requestContext.afterContext.completion;
     expect(called).toBe(true);
+  });
+
+  // Ported from Next.js: packages/next/src/server/after/after-context.test.ts
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/after/after-context.test.ts
+  it("after() captures callbacks registered while the response is streaming", async () => {
+    const { after } = await import("../packages/vinext/src/shims/server.js");
+    const { closeAfterResponseWithBody, createRequestContext, runWithRequestContext } =
+      await import("../packages/vinext/src/shims/unified-request-context.js");
+    let releaseStream!: () => void;
+    const streamGate = new Promise<void>((resolve) => {
+      releaseStream = resolve;
+    });
+    let called = false;
+    const requestContext = createRequestContext();
+    let response!: Response;
+
+    await runWithRequestContext(requestContext, () => {
+      const body = new ReadableStream<Uint8Array>({
+        async start(controller) {
+          await streamGate;
+          after(() => {
+            called = true;
+          });
+          controller.enqueue(new TextEncoder().encode("streamed"));
+          controller.close();
+        },
+      });
+      response = closeAfterResponseWithBody(new Response(body), requestContext);
+    });
+
+    releaseStream();
+    await response.text();
+    await vi.waitFor(() => expect(called).toBe(true));
+  });
+
+  // Ported from Next.js: packages/next/src/server/after/after-context.test.ts
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/after/after-context.test.ts
+  it("after() waits for callbacks added within another callback", async () => {
+    const { after } = await import("../packages/vinext/src/shims/server.js");
+    const { closeAfterResponseWithBody, createRequestContext, runWithRequestContext } =
+      await import("../packages/vinext/src/shims/unified-request-context.js");
+    let releaseNested!: () => void;
+    const nestedGate = new Promise<void>((resolve) => {
+      releaseNested = resolve;
+    });
+    let nestedStarted = false;
+    let nestedFinished = false;
+    const requestContext = createRequestContext();
+    let response!: Response;
+
+    await runWithRequestContext(requestContext, () => {
+      after(() => {
+        after(async () => {
+          nestedStarted = true;
+          await nestedGate;
+          nestedFinished = true;
+        });
+      });
+      response = closeAfterResponseWithBody(new Response("streamed"), requestContext);
+    });
+
+    await response.text();
+    await vi.waitFor(() => expect(nestedStarted).toBe(true));
+    expect(nestedFinished).toBe(false);
+
+    let completed = false;
+    void requestContext.afterContext.completion?.then(() => {
+      completed = true;
+    });
+    await Promise.resolve();
+    expect(completed).toBe(false);
+
+    releaseNested();
+    await requestContext.afterContext.completion;
+    expect(nestedFinished).toBe(true);
+    expect(completed).toBe(true);
+  });
+
+  // Next.js uses an unbounded PromiseQueue for after callbacks, so callbacks
+  // registered together start concurrently rather than blocking each other.
+  it("after() starts sibling callbacks concurrently", async () => {
+    const { after } = await import("../packages/vinext/src/shims/server.js");
+    const { closeAfterResponse, createRequestContext, runWithRequestContext } =
+      await import("../packages/vinext/src/shims/unified-request-context.js");
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let firstStarted = false;
+    let secondStarted = false;
+    const requestContext = createRequestContext();
+
+    await runWithRequestContext(requestContext, () => {
+      after(async () => {
+        firstStarted = true;
+        await firstGate;
+      });
+      after(() => {
+        secondStarted = true;
+      });
+    });
+
+    const completion = closeAfterResponse(requestContext);
+    await vi.waitFor(() => {
+      expect(firstStarted).toBe(true);
+      expect(secondStarted).toBe(true);
+    });
+    releaseFirst();
+    await completion;
+  });
+
+  // Ported from Next.js: packages/next/src/server/after/after-context.test.ts
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/after/after-context.test.ts
+  it("after() preserves the AsyncLocalStorage context from registration", async () => {
+    const { AsyncLocalStorage } = await import("node:async_hooks");
+    const { after } = await import("../packages/vinext/src/shims/server.js");
+    const { closeAfterResponse, createRequestContext, runWithRequestContext } =
+      await import("../packages/vinext/src/shims/unified-request-context.js");
+    const storage = new AsyncLocalStorage<string>();
+    const requestContext = createRequestContext();
+    let observed: string | undefined;
+
+    await storage.run("registration-scope", () =>
+      runWithRequestContext(requestContext, () => {
+        after(() => {
+          observed = storage.getStore();
+        });
+      }),
+    );
+
+    await closeAfterResponse(requestContext);
+    expect(observed).toBe("registration-scope");
   });
 
   it("after() handles a promise argument", async () => {
     const { after } = await import("../packages/vinext/src/shims/server.js");
+    const { createRequestContext, runWithRequestContext } =
+      await import("../packages/vinext/src/shims/unified-request-context.js");
     let resolved = false;
     const p = new Promise<void>((resolve) => {
       setTimeout(() => {
@@ -4925,21 +5098,23 @@ describe("next/server shim", () => {
         resolve();
       }, 5);
     });
-    after(p);
+    await runWithRequestContext(createRequestContext(), () => after(p));
     await new Promise((r) => setTimeout(r, 20));
     expect(resolved).toBe(true);
   });
 
   it("after() swallows errors from failing tasks", async () => {
     const { after } = await import("../packages/vinext/src/shims/server.js");
+    const { closeAfterResponse, createRequestContext, runWithRequestContext } =
+      await import("../packages/vinext/src/shims/unified-request-context.js");
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
-    after(() => {
-      throw new Error("task failed");
+    const requestContext = createRequestContext();
+    await runWithRequestContext(requestContext, () => {
+      after(() => {
+        throw new Error("task failed");
+      });
     });
-    // after() wraps function tasks in Promise.resolve().then(task) — two microtask
-    // ticks are sufficient and more deterministic than a setTimeout.
-    await Promise.resolve();
-    await Promise.resolve();
+    await closeAfterResponse(requestContext);
     expect(consoleError).toHaveBeenCalledWith("[vinext] after() task failed:", expect.any(Error));
     consoleError.mockRestore();
   });
@@ -4970,19 +5145,39 @@ describe("next/server shim", () => {
     expect(called).toBe(true);
   });
 
-  it("after() falls back to fire-and-forget when no execution context exists", async () => {
+  it("after() shares lifecycle state through nested unified scopes", async () => {
+    const { after } = await import("../packages/vinext/src/shims/server.js");
+    const { runWithExecutionContext } =
+      await import("../packages/vinext/src/shims/request-context.js");
+    const { closeAfterResponse, createRequestContext, runWithRequestContext } =
+      await import("../packages/vinext/src/shims/unified-request-context.js");
+    const waitUntilCalls: Promise<unknown>[] = [];
+    const executionContext = {
+      waitUntil(promise: Promise<unknown>) {
+        waitUntilCalls.push(promise);
+      },
+    };
+    const requestContext = createRequestContext();
+    let called = false;
+
+    await runWithRequestContext(requestContext, () =>
+      runWithExecutionContext(executionContext, () => {
+        after(() => {
+          called = true;
+        });
+      }),
+    );
+
+    expect(waitUntilCalls).toHaveLength(1);
+    await closeAfterResponse(requestContext);
+    await waitUntilCalls[0];
+    expect(called).toBe(true);
+  });
+
+  it("after() throws outside a request or execution context", async () => {
     const { after } = await import("../packages/vinext/src/shims/server.js");
 
-    // Outside any execution context scope — should still run the task
-    let called = false;
-    after(() => {
-      called = true;
-    });
-    // after() wraps function tasks in Promise.resolve().then(task) — two microtask
-    // ticks are sufficient and more deterministic than a setTimeout.
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(called).toBe(true);
+    expect(() => after(() => {})).toThrow("outside a request scope");
   });
 
   it('after() throws inside "use cache" scope', async () => {
@@ -6592,6 +6787,19 @@ describe('"use cache" runtime', () => {
     expect(zero.length).toBe(0);
     expect(one.length).toBe(1);
     expect(two.length).toBe(2);
+  });
+
+  it("preserves transform metadata for cached functions that accept a second argument", async () => {
+    const { registerCachedFunction } =
+      await import("../packages/vinext/src/shims/cache-runtime.js");
+    const fn = async (_props: unknown, _parent = Promise.resolve({})) => ({});
+    const cached = registerCachedFunction(fn, "test:default-parent", "", {
+      acceptsSecondArgument: true,
+    });
+
+    expect(fn.length).toBe(1);
+    expect(cached.length).toBe(1);
+    expect(Reflect.get(cached, Symbol.for("vinext.useCacheAcceptsSecondArgument"))).toBe(true);
   });
 
   it("falls back to JSON when RSC module is unavailable (test environment)", async () => {
@@ -10440,6 +10648,22 @@ describe("NextURL basePath and locale properties", () => {
     expect(cloned.basePath).toBe("");
   });
 
+  it("clone retains the configured basePath for later href assignments", async () => {
+    // Next.js keeps the original constructor options in clone():
+    // packages/next/src/server/web/next-url.ts
+    // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/web/next-url.ts
+    const { NextURL } = await import("../packages/vinext/src/shims/server.js");
+    const url = new NextURL("http://localhost/dashboard", undefined, {
+      basePath: "/docs",
+    });
+    const cloned = url.clone();
+
+    expect(cloned.basePath).toBe("");
+    cloned.href = "http://localhost/docs/settings";
+    expect(cloned.basePath).toBe("/docs");
+    expect(cloned.pathname).toBe("/settings");
+  });
+
   it("basePath is preserved through clone() when URL has the prefix", async () => {
     const { NextURL } = await import("../packages/vinext/src/shims/server.js");
     const url = new NextURL("http://localhost/docs/page", undefined, {
@@ -12803,6 +13027,9 @@ describe("proxyExternalRequest", () => {
         "x-middleware-next": "1",
         "x-vinext-prerender-secret": "build-secret-123",
         "x-vinext-prerender-route-params": "%7B%22id%22%3A%22forged%22%7D",
+        "x-vinext-revalidate-host": "example.fr",
+        "x-prerender-revalidate": "revalidation-secret",
+        "x-prerender-revalidate-if-generated": "1",
         "x-custom-header": "keep-me",
         "user-agent": "vinext-test",
       },
@@ -12828,6 +13055,9 @@ describe("proxyExternalRequest", () => {
       expect(capturedHeaders!.get("x-middleware-next")).toBeNull();
       expect(capturedHeaders!.get("x-vinext-prerender-secret")).toBeNull();
       expect(capturedHeaders!.get("x-vinext-prerender-route-params")).toBeNull();
+      expect(capturedHeaders!.get("x-vinext-revalidate-host")).toBeNull();
+      expect(capturedHeaders!.get("x-prerender-revalidate")).toBeNull();
+      expect(capturedHeaders!.get("x-prerender-revalidate-if-generated")).toBeNull();
       // Non-sensitive headers must be preserved
       expect(capturedHeaders!.get("x-custom-header")).toBe("keep-me");
       expect(capturedHeaders!.get("user-agent")).toBe("vinext-test");
@@ -13658,6 +13888,71 @@ describe("next/font/local shim", () => {
     const preloads = fontLocal.getSSRFontPreloads();
     const matches = preloads.filter((p: any) => p.href === "/assets/dedup-test.woff2");
     expect(matches.length).toBe(1);
+  });
+
+  // Next.js derives next/font class names from a hash of the generated CSS,
+  // keeping the export stable across its server and client compilations.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/build/webpack/loaders/next-font-loader/index.ts
+  it("shares SSR collection state with stable class identities across module copies", async () => {
+    // Regression: in Vite's multi-environment dev mode the shim can be loaded
+    // more than once in the same worker (different resolved IDs / different
+    // environments), so the localFont() call site and the SSR readers can land
+    // on different module copies. Dynamic imports are intentional here — this
+    // test exercises the module-loading boundary itself.
+    const slotNames = [
+      "vinext.fontLocal.injectedFonts",
+      "vinext.fontLocal.injectedClassRules",
+      "vinext.fontLocal.injectedVariableRules",
+      "vinext.fontLocal.injectedRootVariables",
+      "vinext.fontLocal.ssrFontStyles",
+      "vinext.fontLocal.ssrFontPreloads",
+      "vinext.fontLocal.ssrFontPreloadHrefs",
+    ];
+    try {
+      const copyA = await import("../packages/vinext/src/shims/font-local.js");
+      const a = copyA.default({
+        src: "/assets/multi-copy-a.woff2",
+        variable: "--font-multi-copy-a",
+        _vinext: { font: { family: "multiCopyA" } },
+      });
+
+      // Simulate a second, genuinely fresh module copy: reset the module
+      // registry so the next import re-evaluates the shim from scratch.
+      vi.resetModules();
+      const copyB = await import("../packages/vinext/src/shims/font-local.js");
+      expect(copyB).not.toBe(copyA);
+
+      // Copy B must see the SSR styles/preloads pushed through copy A.
+      expect(copyB.getSSRFontStyles().some((css) => css.includes("multi-copy-a"))).toBe(true);
+      expect(copyB.getSSRFontPreloads().some((p) => p.href === "/assets/multi-copy-a.woff2")).toBe(
+        true,
+      );
+
+      // The same logical call must have the same identity in every module
+      // graph so SSR markup and browser hydration agree. A distinct font must
+      // still receive a distinct class and variable identity.
+      const sameA = copyB.default({
+        src: "/assets/multi-copy-a.woff2",
+        variable: "--font-multi-copy-a",
+        _vinext: { font: { family: "multiCopyA" } },
+      });
+      expect(sameA.className).toBe(a.className);
+      expect(sameA.variable).toBe(a.variable);
+
+      const b = copyB.default({
+        src: "/assets/multi-copy-b.woff2",
+        variable: "--font-multi-copy-b",
+        _vinext: { font: { family: "multiCopyB" } },
+      });
+      expect(b.className).not.toBe(a.className);
+      expect(b.variable).not.toBe(a.variable);
+    } finally {
+      // Symbol.for slots survive vi.resetModules() by design — clear them so
+      // other tests observe pristine module state on their next import.
+      vi.resetModules();
+      const g = globalThis as Record<symbol, unknown>;
+      for (const name of slotNames) delete g[Symbol.for(name)];
+    }
   });
 });
 
@@ -14909,6 +15204,80 @@ describe("app router scroll document-top fallback", () => {
       },
     ],
   };
+
+  it("defers hash fallback scrolling and ignores a stale animation frame", async () => {
+    const { beginAppRouterScrollIntent, clearAppRouterScrollIntent } =
+      await import("../packages/vinext/src/shims/app-router-scroll-state.js");
+    const { applyAppRouterScrollFallback } =
+      await import("../packages/vinext/src/shims/navigation.js");
+    const scrollIntoView = vi.fn();
+    let frame: (() => void) | null = null;
+    const originalDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+    const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+    const originalRequestAnimationFrame = Object.getOwnPropertyDescriptor(
+      globalThis,
+      "requestAnimationFrame",
+    );
+
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: {
+        documentElement: { scrollTop: 0 },
+        getElementById: () => ({ scrollIntoView }),
+        getElementsByName: () => [],
+        head: { querySelectorAll: () => [] },
+      },
+    });
+    Object.defineProperty(globalThis, "window", { configurable: true, value: {} });
+    Object.defineProperty(globalThis, "requestAnimationFrame", {
+      configurable: true,
+      value: (callback: () => void) => {
+        frame = callback;
+        return 1;
+      },
+    });
+
+    try {
+      clearAppRouterScrollIntent();
+      const intent = beginAppRouterScrollIntent("#target");
+      applyAppRouterScrollFallback(intent);
+      expect(scrollIntoView).not.toHaveBeenCalled();
+      expect(frame).not.toBeNull();
+      frame!();
+      expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "auto" });
+
+      scrollIntoView.mockClear();
+      frame = null;
+      const staleIntent = beginAppRouterScrollIntent("#stale");
+      applyAppRouterScrollFallback(staleIntent);
+      expect(frame).not.toBeNull();
+      beginAppRouterScrollIntent("#new");
+      frame!();
+      expect(scrollIntoView).not.toHaveBeenCalled();
+
+      clearAppRouterScrollIntent();
+      frame = null;
+      const clearedIntent = beginAppRouterScrollIntent("#cleared");
+      applyAppRouterScrollFallback(clearedIntent);
+      expect(frame).not.toBeNull();
+      clearAppRouterScrollIntent();
+      frame!();
+      expect(scrollIntoView).not.toHaveBeenCalled();
+    } finally {
+      clearAppRouterScrollIntent();
+      for (const [key, descriptor] of [
+        ["document", originalDocument],
+        ["window", originalWindow],
+        ["requestAnimationFrame", originalRequestAnimationFrame],
+      ] as const) {
+        if (descriptor) {
+          Object.defineProperty(globalThis, key, descriptor);
+        } else {
+          Reflect.deleteProperty(globalThis, key);
+        }
+      }
+    }
+  });
 
   it("scrolls to the document top even when hoisted stylesheets exist in <head>", async () => {
     const { beginAppRouterScrollIntent, clearAppRouterScrollIntent } =
@@ -16203,6 +16572,53 @@ describe("Pages Router concurrent navigation", () => {
         Router.push({ query: { category: "music" } }, undefined, { shallow: true }),
       ).rejects.toThrow(
         "The provided `href` (/catalog/[category]/[item]?category=music) value is missing query values (item) to be interpolated properly. Read more: https://nextjs.org/docs/messages/href-interpolation-failed",
+      );
+      expect(win.history.pushState).not.toHaveBeenCalled();
+    } finally {
+      vi.resetModules();
+      if (previousWindow === undefined) delete (globalThis as any).window;
+      else (globalThis as any).window = previousWindow;
+    }
+  });
+
+  // Ported from Next.js: test/e2e/dynamic-routing/dynamic-routing.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/dynamic-routing/dynamic-routing.test.ts
+  it("throws href-interpolation-failed when a full dynamic href omits a required param", async () => {
+    const previousWindow = (globalThis as any).window;
+    const { win } = createNavWindow();
+    (globalThis as any).window = win;
+
+    try {
+      vi.resetModules();
+      const { default: Router } = await import("../packages/vinext/src/shims/router.js");
+
+      await expect(
+        Router.push({
+          pathname: "/catalog/[category]/[item]",
+          query: { category: "music" },
+        }),
+      ).rejects.toThrow(
+        "The provided `href` (/catalog/[category]/[item]?category=music) value is missing query values (item) to be interpolated properly. Read more: https://nextjs.org/docs/messages/href-interpolation-failed",
+      );
+      expect(win.history.pushState).not.toHaveBeenCalled();
+    } finally {
+      vi.resetModules();
+      if (previousWindow === undefined) delete (globalThis as any).window;
+      else (globalThis as any).window = previousWindow;
+    }
+  });
+
+  it("throws incompatible-href-as when an explicit as does not match a dynamic href", async () => {
+    const previousWindow = (globalThis as any).window;
+    const { win } = createNavWindow();
+    (globalThis as any).window = win;
+
+    try {
+      vi.resetModules();
+      const { default: Router } = await import("../packages/vinext/src/shims/router.js");
+
+      await expect(Router.push("/catalog/[id]", "/wrong")).rejects.toThrow(
+        "The provided `as` value (/wrong) is incompatible with the `href` value (/catalog/[id]). Read more: https://nextjs.org/docs/messages/incompatible-href-as",
       );
       expect(win.history.pushState).not.toHaveBeenCalled();
     } finally {
@@ -19289,6 +19705,46 @@ describe("Pages Router _next/data client navigation", () => {
   function makePageModule(name: string): { default: unknown } {
     return { default: ((): string => `page:${name}`) as unknown };
   }
+
+  it("allows middleware to resolve an incomplete explicit dynamic href", async () => {
+    const previousWindow = (globalThis as any).window;
+    const originalFetch = globalThis.fetch;
+    const routePattern = "/catalog/[category]/[item]";
+    const { win } = createDataNavWindow({
+      loaders: {
+        "/": vi.fn(async () => makePageModule("home")),
+        [routePattern]: vi.fn(async () => makePageModule("catalog")),
+      },
+      sspPatterns: [routePattern],
+    });
+    (win.__NEXT_DATA__ as any).__vinext = { hasMiddleware: true };
+    (win as any).__VINEXT_MIDDLEWARE_MATCHER__ = ["/:path*"];
+    (globalThis as any).window = win;
+    globalThis.fetch = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ pageProps: { resolvedByMiddleware: true } }), {
+          headers: { "Content-Type": "application/json" },
+        }),
+    ) as typeof fetch;
+
+    try {
+      vi.resetModules();
+      const { default: Router } = await import("../packages/vinext/src/shims/router.js");
+
+      await expect(
+        Router.push({
+          pathname: routePattern,
+          query: { category: "music" },
+        }),
+      ).resolves.toBe(true);
+      expect(globalThis.fetch).toHaveBeenCalled();
+    } finally {
+      vi.resetModules();
+      if (previousWindow === undefined) delete (globalThis as any).window;
+      else (globalThis as any).window = previousWindow;
+      globalThis.fetch = originalFetch;
+    }
+  });
 
   it("fetches /_next/data/<buildId>/<page>.json instead of the HTML page", async () => {
     const previousWindow = (globalThis as any).window;

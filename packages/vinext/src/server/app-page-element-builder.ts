@@ -1,4 +1,4 @@
-import { createElement } from "react";
+import { Suspense, createElement } from "react";
 import { makeThenableParams } from "vinext/shims/thenable-params";
 import {
   prepareAppPageHead,
@@ -82,6 +82,8 @@ export type AppPageInterceptOptions<TModule extends AppPageModule = AppPageModul
   interceptLayouts?: readonly (TModule | null | undefined)[] | null;
   interceptLayoutSegments?: readonly (readonly string[])[] | null;
   interceptBranchSegments?: readonly string[] | null;
+  interceptLoadings?: readonly (TModule | null | undefined)[] | null;
+  interceptLoadingTreePositions?: readonly number[] | null;
   interceptNotFoundBranchSegments?: readonly string[] | null;
   interceptNotFound?: TModule | null;
   interceptNotFoundTreePosition?: number | null;
@@ -146,6 +148,7 @@ export type BuildPageElementsOptions<
   trailingSlash?: boolean;
   /** Serialized next.config `htmlLimitedBots` regexp source. */
   htmlLimitedBots?: string;
+  scriptNonce?: string;
 };
 
 type AppPageNavigationParamModule = {
@@ -332,8 +335,8 @@ export async function buildPageElements<
       }
     : null;
   const parallelRoutes = [
-    ...activeParallelRouteHeadInputs.map((input) => input.head),
     ...(primaryParallelRouteHeadInput ? [primaryParallelRouteHeadInput.head] : []),
+    ...activeParallelRouteHeadInputs.map((input) => input.head),
   ];
   const metadataSearchParamsObserver = observeMetadataSearchParamsAccess
     ? createAppPageSearchParamsObserver()
@@ -517,23 +520,51 @@ export async function buildPageElements<
     isSiblingIntercept && EffectivePageComponent
       ? createPageElement(EffectivePageComponent, pageProps)
       : null;
-  if (isSiblingIntercept && siblingInterceptElement !== null && opts?.interceptLayouts?.length) {
-    for (let i = opts.interceptLayouts.length - 1; i >= 0; i--) {
-      const layoutMod = opts.interceptLayouts[i] as AppPageModule | null | undefined;
-      const LayoutComponent = layoutMod?.default;
-      if (LayoutComponent) {
-        const interceptLayoutSegments = opts.interceptLayoutSegments?.[i] ?? [];
+  if (isSiblingIntercept && siblingInterceptElement !== null) {
+    const layoutIndexesByTreePosition = new Map<number, number[]>();
+    for (const [index, layoutModule] of (opts?.interceptLayouts ?? []).entries()) {
+      if (!layoutModule?.default) continue;
+      const treePosition = opts?.interceptLayoutSegments?.[index]?.length ?? 0;
+      const indexes = layoutIndexesByTreePosition.get(treePosition) ?? [];
+      indexes.push(index);
+      layoutIndexesByTreePosition.set(treePosition, indexes);
+    }
+    const loadingIndexesByTreePosition = new Map<number, number>();
+    for (const [index, loadingModule] of (opts?.interceptLoadings ?? []).entries()) {
+      if (!loadingModule?.default) continue;
+      const treePosition = opts?.interceptLoadingTreePositions?.[index];
+      if (treePosition !== undefined) loadingIndexesByTreePosition.set(treePosition, index);
+    }
+    const treePositions = Array.from(
+      new Set([...layoutIndexesByTreePosition.keys(), ...loadingIndexesByTreePosition.keys()]),
+    ).sort((left, right) => left - right);
+
+    for (let index = treePositions.length - 1; index >= 0; index--) {
+      const treePosition = treePositions[index];
+      const loadingIndex = loadingIndexesByTreePosition.get(treePosition);
+      const LoadingComponent =
+        loadingIndex === undefined ? null : opts?.interceptLoadings?.[loadingIndex]?.default;
+      if (LoadingComponent) {
+        siblingInterceptElement = createElement(
+          Suspense,
+          { fallback: createElement(LoadingComponent) },
+          siblingInterceptElement,
+        );
+      }
+
+      const layoutIndexes = layoutIndexesByTreePosition.get(treePosition) ?? [];
+      for (let layoutOffset = layoutIndexes.length - 1; layoutOffset >= 0; layoutOffset--) {
+        const layoutIndex = layoutIndexes[layoutOffset];
+        const LayoutComponent = opts?.interceptLayouts?.[layoutIndex]?.default;
+        if (!LayoutComponent) continue;
+        const interceptLayoutSegments = opts?.interceptLayoutSegments?.[layoutIndex] ?? [];
         const interceptLayoutParams = resolveInterceptLayoutParams(
-          opts.interceptBranchSegments ?? interceptLayoutSegments,
+          opts?.interceptBranchSegments ?? interceptLayoutSegments,
           interceptLayoutSegments,
           effectiveParams,
         );
-        // Layout component types vary; cast to any to avoid overload-resolution
-        // issues in createElement while preserving runtime safety.
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const LC = LayoutComponent as (props: any) => any;
         siblingInterceptElement = createElement(
-          LC,
+          LayoutComponent,
           { params: makeThenableParams(interceptLayoutParams) },
           siblingInterceptElement,
         );
@@ -563,6 +594,7 @@ export async function buildPageElements<
     resolvedMetadata,
     resolvedMetadataPathname: routePath,
     resolvedViewport,
+    scriptNonce: options.scriptNonce,
     streamingMetadata,
     streamingMetadataOutlet,
     streamingMetadataOutletSuspended: streamGeneratedHead,
@@ -613,6 +645,8 @@ function buildSlotOverrides<TModule extends AppPageModule, TErrorModule extends 
       branchSegments: opts.interceptBranchSegments ?? null,
       layoutModules: opts.interceptLayouts || null,
       layoutSegments: opts.interceptLayoutSegments ?? null,
+      loadingModules: opts.interceptLoadings || null,
+      loadingTreePositions: opts.interceptLoadingTreePositions ?? null,
       pageModule: opts.interceptPage,
       params: opts.interceptParams || routeParams,
       routeSegments: resolveInterceptedSlotSegments(

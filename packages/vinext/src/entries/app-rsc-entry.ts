@@ -403,6 +403,7 @@ import {
   isrGet as __isrGet,
   isrSet as __isrSet,
   isrSetPrerenderedAppPage as __isrSetPrerenderedAppPage,
+  isOnDemandRevalidateRequest as __isOnDemandRevalidateRequest,
   triggerBackgroundRegeneration as __triggerBackgroundRegeneration,
 } from ${JSON.stringify(isrCachePath)};
 // Import server-only state module to register ALS-backed accessors.
@@ -643,7 +644,7 @@ function findIntercept(pathname, sourcePathname = null) {
   return __routeMatcher.findIntercept(pathname, sourcePathname);
 }
 
-async function buildPageElements(route, params, routePath, pageRequest, layoutParamAccess, displayPathname = routePath) {
+async function buildPageElements(route, params, routePath, pageRequest, layoutParamAccess, displayPathname = routePath, scriptNonce) {
   // Hydrate lazy page/route-handler modules before any synchronous read.
   await __ensureRouteLoaded(route);
   return __buildPageElements({
@@ -662,10 +663,13 @@ async function buildPageElements(route, params, routePath, pageRequest, layoutPa
     basePath: __basePath,
     trailingSlash: __trailingSlash,
     htmlLimitedBots: __htmlLimitedBots,
+    scriptNonce,
   });
 }
 
 const __i18nConfig = ${JSON.stringify(i18nConfig)};
+export { __i18nConfig };
+export const authorizeOnDemandRevalidate = __isOnDemandRevalidateRequest;
 const __configRedirects = ${JSON.stringify(redirects)};
 const __configRewrites = ${JSON.stringify(rewrites)};
 const __configHeaders = ${JSON.stringify(headers)};
@@ -829,7 +833,7 @@ export default createAppRscHandler({
           observePageSearchParamsAccess: buildOptions?.observePageSearchParamsAccess === true,
           serveStreamingMetadata: buildOptions?.serveStreamingMetadata,
           isProduction: process.env.NODE_ENV === "production",
-        }, layoutParamAccess, displayPathname);
+        }, layoutParamAccess, displayPathname, scriptNonce);
       },
       clientReuseManifest,
       cleanPathname,
@@ -1079,6 +1083,7 @@ export default createAppRscHandler({
     middlewareContext,
     mountedSlotsHeader,
     request,
+    scriptNonce,
     routeMatch,
     routePathname,
     searchParams,
@@ -1121,7 +1126,7 @@ export default createAppRscHandler({
           renderMode: actionRenderMode,
           observeMetadataSearchParamsAccess: observeMetadataSearchParamsAccess === true,
           observePageSearchParamsAccess: observePageSearchParamsAccess === true,
-        });
+        }, undefined, actionCleanPathname, scriptNonce);
       },
       cleanPathname,
       clearRequestContext() {
@@ -1227,6 +1232,19 @@ export default createAppRscHandler({
   }
   matchRoute,
   matchRequestRoute,
+  matchInterceptRoute(pathname, sourcePathname) {
+    const intercept = findIntercept(pathname, sourcePathname);
+    if (!intercept) return null;
+    const route = routes[intercept.sourceRouteIndex];
+    if (!route) return null;
+    const params = Object.create(null);
+    for (const name of route.params) {
+      if (Object.prototype.hasOwnProperty.call(intercept.sourceMatchedParams, name)) {
+        params[name] = intercept.sourceMatchedParams[name];
+      }
+    }
+    return { route, params };
+  },
   ${
     middlewarePath
       ? `runMiddleware({ cleanPathname, context, hadBasePath, isDataRequest, request }) {

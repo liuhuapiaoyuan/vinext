@@ -15,6 +15,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { PassThrough } from "node:stream";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
+import { gzipSync } from "node:zlib";
 import { handleApiRoute } from "../packages/vinext/src/server/api-handler.js";
 import {
   reportRequestError,
@@ -950,6 +951,45 @@ describe("handleApiRoute", () => {
     });
   });
 
+  describe("res.revalidate()", () => {
+    it("uses the trusted origin instead of the request Host header", async () => {
+      const originalFetch = globalThis.fetch;
+      let capturedUrl: URL | undefined;
+      globalThis.fetch = async (input: string | URL | Request, init?: RequestInit) => {
+        capturedUrl =
+          typeof input === "string"
+            ? new URL(input)
+            : input instanceof URL
+              ? input
+              : new URL(input.url);
+        expect(input instanceof Request ? input.method : init?.method).toBe("HEAD");
+        return new Response(null, { status: 200 });
+      };
+
+      try {
+        const handler = vi.fn(async (_req: any, res: any) => {
+          await res.revalidate("/fixed-page");
+          res.json({ revalidated: true });
+        });
+        const server = mockServer({ default: handler });
+        const req = mockReq("GET", "/api/revalidate", undefined, {
+          host: "127.0.0.1:9999",
+        });
+        const res = mockRes();
+
+        await handleApiRoute(server, req, res, "/api/revalidate", [route("/api/revalidate")], {
+          trustedRevalidateOrigin: "http://app.local:3000",
+        });
+
+        expect(capturedUrl?.href).toBe("http://app.local:3000/fixed-page");
+        expect(res._statusCode).toBe(200);
+        expect(res._body).toBe(JSON.stringify({ revalidated: true }));
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+  });
+
   // ── Query and dynamic params ───────────────────────────────────────
 
   describe("query and dynamic params", () => {
@@ -1235,6 +1275,41 @@ describe("handleApiRoute", () => {
         hello: "world",
         query: { a: "b" },
       });
+    });
+
+    it("does not forward stale encoding headers from Node fetch responses", async () => {
+      const body = "Example Domain";
+      const compressedBody = gzipSync(body);
+      const upstream = http.createServer((_req, res) => {
+        res.writeHead(200, {
+          "content-encoding": "gzip",
+          "content-length": String(compressedBody.byteLength),
+          "content-type": "text/plain",
+        });
+        res.end(compressedBody);
+      });
+      await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+
+      try {
+        const address = upstream.address() as AddressInfo;
+        const server = mockServer({
+          config: { runtime: "edge" },
+          default: () => fetch(`http://127.0.0.1:${address.port}`),
+        });
+        const req = mockReq("GET", "/api/proxy", undefined, { host: "example.com" });
+        const res = mockRes();
+
+        await handleApiRoute(server, req, res, "/api/proxy", [route("/api/proxy")]);
+
+        expect(res._headers["content-encoding"]).toBeUndefined();
+        expect(res._headers["content-length"]).toBeUndefined();
+        expect(res._body.toString()).toBe(body);
+      } finally {
+        upstream.closeAllConnections();
+        await new Promise<void>((resolve, reject) => {
+          upstream.close((error) => (error ? reject(error) : resolve()));
+        });
+      }
     });
 
     it("applies basePath and i18n config to edge API nextUrl", async () => {

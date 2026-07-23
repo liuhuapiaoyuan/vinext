@@ -1595,6 +1595,30 @@ describe("resolveNextConfig disableOptimizedLoading", () => {
   });
 });
 
+describe("resolveNextConfig crossOrigin", () => {
+  it("reads supported crossOrigin values", async () => {
+    const anonymous = await resolveNextConfig({ crossOrigin: "anonymous" });
+    const credentials = await resolveNextConfig({ crossOrigin: "use-credentials" });
+    expect(anonymous.crossOrigin).toBe("anonymous");
+    expect(credentials.crossOrigin).toBe("use-credentials");
+  });
+
+  it("warns about unsupported crossOrigin values", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const resolved = await resolveNextConfig({ crossOrigin: "invalid" as "anonymous" });
+
+    expect(resolved.crossOrigin).toBeUndefined();
+    expect(warn).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("Invalid next.config options detected"),
+    );
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('"crossOrigin"'));
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("https://nextjs.org/docs/messages/invalid-next-config"),
+    );
+  });
+});
+
 describe("resolveNextConfig scrollRestoration", () => {
   it("defaults scrollRestoration to false", async () => {
     const resolved = await resolveNextConfig({});
@@ -2030,6 +2054,7 @@ describe("detectNextIntlConfig", () => {
       assetPrefix: "",
       basePath: "",
       trailingSlash: false,
+      typescript: {},
       output: "",
       pageExtensions: ["tsx", "ts", "jsx", "js"],
       resolveExtensions: null,
@@ -2047,6 +2072,7 @@ describe("detectNextIntlConfig", () => {
       aliases: {},
       allowedDevOrigins: [],
       serverActionsAllowedOrigins: [],
+      allowedRevalidateHeaderKeys: [],
       optimizePackageImports: [],
       transpilePackages: [],
       turbopackTranspilePackages: ["geist"],
@@ -2068,6 +2094,7 @@ describe("detectNextIntlConfig", () => {
       sassOptions: null,
       removeConsole: false,
       disableOptimizedLoading: false,
+      crossOrigin: undefined,
       reactStrictMode: null,
       scrollRestoration: false,
       compilerDefine: {},
