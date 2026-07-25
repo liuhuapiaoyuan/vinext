@@ -298,6 +298,10 @@ function writeStandaloneServerEntry(filePath: string): void {
   // (emitStandaloneOutput copies vinext's dist/ directory in full). A static
   // import gives a clearer ERR_MODULE_NOT_FOUND at startup rather than a
   // runtime error deep inside the server if the import were deferred.
+  //
+  // Shebang defaults to node; `bun dist/standalone/server.js` also works —
+  // prod-server preloads POST bodies under Bun so Server Actions survive
+  // Request.clone().
   const content = `#!/usr/bin/env node
 import { join } from "node:path";
 import { startProdServer } from "vinext/server/prod-server";

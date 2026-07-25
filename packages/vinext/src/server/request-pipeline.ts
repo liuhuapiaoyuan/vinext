@@ -532,6 +532,40 @@ function getRawNodeRequest(request: Request): unknown {
   return raw === undefined ? undefined : raw;
 }
 
+/**
+ * Bytes materialized by `bufferRequestBodyForHeaderClone`.
+ *
+ * Bun (and some adapters) can return an empty body from `Request.clone()` even
+ * when the original POST body is intact. After we buffer once, later sync
+ * clones (`cloneRequestWithHeaders` / `cloneRequestWithUrl`) reuse these bytes
+ * instead of calling `request.clone()` again.
+ */
+const VINEXT_BUFFERED_REQUEST_BODY = Symbol.for("vinext.bufferedRequestBody");
+
+function getBufferedRequestBody(request: Request): Uint8Array | undefined {
+  const buffered = Reflect.get(request, VINEXT_BUFFERED_REQUEST_BODY);
+  return buffered instanceof Uint8Array ? buffered : undefined;
+}
+
+function setBufferedRequestBody(request: Request, body: Uint8Array): void {
+  Object.defineProperty(request, VINEXT_BUFFERED_REQUEST_BODY, {
+    value: body,
+    enumerable: false,
+    configurable: true,
+  });
+}
+
+/**
+ * Remember a fully-materialized request body for later sync clones.
+ *
+ * Used by the Bun standalone/prod Node→Web adapter: streaming `Request.clone()`
+ * can drop POST bodies under Bun, so production Server Actions preload the
+ * IncomingMessage bytes once and attach them here.
+ */
+export function rememberBufferedRequestBody(request: Request, body: Uint8Array): void {
+  setBufferedRequestBody(request, body);
+}
+
 function copyPrivateRequestMetadata(source: Request, target: Request): void {
   const cf = getRequestCf(source);
   if (cf !== undefined) {
@@ -552,6 +586,13 @@ function copyPrivateRequestMetadata(source: Request, target: Request): void {
       enumerable: true,
       configurable: true,
     });
+  }
+
+  const bufferedBody = getBufferedRequestBody(source);
+  if (bufferedBody !== undefined) {
+    // Keep a shared view; callers that need an independent BodyInit copy via
+    // `Uint8Array.from` in getRequestBodyForClone.
+    setBufferedRequestBody(target, bufferedBody);
   }
 }
 
@@ -624,12 +665,23 @@ function peekRequestBody(request: Request): ReadableStream<Uint8Array> | null {
  * Important: never return the original `request.body` stream. Passing it to
  * `new Request` locks/steals it from the source, and callers (e.g.
  * `createAppRscHandler`) still need that source for a later header clone.
- * Only a teed body from `request.clone()` is safe to attach.
+ * Prefer already-buffered bytes, then a teed body from `request.clone()`.
  */
 function getRequestBodyForClone(request: Request): {
   body: BodyInit | undefined;
   duplex: boolean;
 } {
+  // Prefer bytes from bufferRequestBodyForHeaderClone. Bun's Request.clone()
+  // has historically returned an empty body for POST actions; reusing the
+  // buffered copy keeps production Server Actions working under `bun` runtimes.
+  const bufferedBody = getBufferedRequestBody(request);
+  if (bufferedBody !== undefined) {
+    return {
+      body: bufferedBody.byteLength > 0 ? Uint8Array.from(bufferedBody) : undefined,
+      duplex: bufferedBody.byteLength > 0,
+    };
+  }
+
   const bodyStream = peekRequestBody(request);
   if (!bodyStream) {
     return { body: undefined, duplex: false };
@@ -735,15 +787,40 @@ export async function bufferRequestBodyForHeaderClone(request: Request): Promise
             bytes = rawBytes;
           }
         }
-        if (!bytes) {
-          return request;
-        }
       }
+    }
+
+    // Bun / some adapters: clone() resolves to an empty body while the original
+    // request is still readable. Prefer the original before giving up — otherwise
+    // production Server Actions decode an empty Flight payload
+    // (`JSON Parse error: Unexpected EOF` under Bun).
+    if ((!bytes || bytes.byteLength === 0) && !consumedRawNode) {
+      try {
+        if (!request.bodyUsed) {
+          const originalBytes = new Uint8Array(await request.arrayBuffer());
+          if (originalBytes.byteLength > 0) {
+            bytes = originalBytes;
+          }
+        }
+      } catch {
+        // Original body unavailable (locked / already consumed).
+      }
+    }
+
+    if (!bytes) {
+      return request;
     }
 
     if (bytes.byteLength === 0 && contentLength > 0) {
       return request;
     }
+
+    // Avoid replacing a still-readable original with an empty buffered body
+    // when Content-Length is missing (chunked) and clone yielded nothing.
+    if (bytes.byteLength === 0) {
+      return request;
+    }
+
     const bodyBytes = Uint8Array.from(bytes);
     const init: RequestInitWithCf = {
       method: request.method,
@@ -759,12 +836,11 @@ export async function bufferRequestBodyForHeaderClone(request: Request): Promise
       mode: request.mode,
       cache: request.cache,
     };
-    if (bytes.byteLength > 0) {
-      // @ts-expect-error — duplex needed for bodied requests on Node/undici
-      init.duplex = "half";
-    }
+    // @ts-expect-error — duplex needed for bodied requests on Node/undici
+    init.duplex = "half";
     const buffered = new Request(request.url, init);
     copyPrivateRequestMetadata(request, buffered);
+    setBufferedRequestBody(buffered, bodyBytes);
     return buffered;
   } catch {
     return request;

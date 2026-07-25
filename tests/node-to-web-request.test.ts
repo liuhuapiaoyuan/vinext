@@ -114,6 +114,36 @@ describe("nodeToWebRequest", () => {
     expect(text).toBe(bodyContent);
   });
 
+  it("keeps preloaded Bun POST bodies readable across header clones", async () => {
+    const { cloneRequestWithHeaders } =
+      await import("../packages/vinext/src/server/request-pipeline.js");
+    const bodyContent = JSON.stringify(["action-arg"]);
+    const req = mockReq({
+      method: "POST",
+      url: "/action",
+      headers: {
+        host: "localhost:3000",
+        "content-type": "text/plain;charset=UTF-8",
+        "content-length": String(bodyContent.length),
+      },
+    });
+    const preloadedBody = new TextEncoder().encode(bodyContent);
+    const webReq = nodeToWebRequest(req, "/action", undefined, undefined, undefined, preloadedBody);
+
+    Object.defineProperty(webReq, "clone", {
+      configurable: true,
+      value: () =>
+        new Request("http://localhost:3000/action", {
+          method: "POST",
+          headers: webReq.headers,
+          body: "",
+        }),
+    });
+
+    const cloned = cloneRequestWithHeaders(webReq, new Headers(webReq.headers));
+    expect(await cloned.text()).toBe(bodyContent);
+  });
+
   it("reads from paused Node streams only as Web stream demand advances", async () => {
     let produced = 0;
     const request = new Readable({

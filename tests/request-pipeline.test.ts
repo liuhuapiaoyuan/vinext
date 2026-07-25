@@ -973,15 +973,20 @@ describe("bufferRequestBodyForHeaderClone", () => {
     expect(await cloned.text()).toBe(payload);
   });
 
-  it("keeps the original request when a foreign clone reads an empty body", async () => {
+  it("materializes from the original body when a foreign clone reads empty", async () => {
+    // Bun historically returns an empty body from Request.clone() while the
+    // original POST body is still readable. Production Server Actions must
+    // survive that — the empty clone used to become a blank Flight payload
+    // (`JSON Parse error: Unexpected EOF` under Bun).
+    const payload = "[]";
     const original = new Request("http://localhost/action", {
       method: "POST",
       headers: {
-        "content-length": "2",
+        "content-length": String(payload.length),
         "content-type": "text/plain;charset=UTF-8",
         "next-action": "/app/actions.ts#getData",
       },
-      body: "[]",
+      body: payload,
     });
     Object.defineProperty(original, "clone", {
       value: () =>
@@ -993,9 +998,37 @@ describe("bufferRequestBodyForHeaderClone", () => {
     });
 
     const buffered = await bufferRequestBodyForHeaderClone(original);
+    const cloned = cloneRequestWithHeaders(buffered, new Headers(buffered.headers));
 
-    expect(buffered).toBe(original);
-    expect(await original.text()).toBe("[]");
+    expect(buffered).not.toBe(original);
+    expect(await buffered.text()).toBe(payload);
+    expect(await cloned.text()).toBe(payload);
+  });
+
+  it("keeps header clones readable when Request.clone() drops the body", async () => {
+    const payload = JSON.stringify(["arg", { nested: true }]);
+    const original = new Request("http://localhost/action", {
+      method: "POST",
+      headers: {
+        "content-length": String(payload.length),
+        "content-type": "text/plain;charset=UTF-8",
+        "next-action": "/app/actions.ts#getData",
+      },
+      body: payload,
+    });
+    const buffered = await bufferRequestBodyForHeaderClone(original);
+    Object.defineProperty(buffered, "clone", {
+      configurable: true,
+      value: () =>
+        new Request("http://localhost/action", {
+          method: "POST",
+          headers: buffered.headers,
+          body: "",
+        }),
+    });
+
+    const cloned = cloneRequestWithHeaders(buffered, new Headers(buffered.headers));
+    expect(await cloned.text()).toBe(payload);
   });
 
   it("materializes srvx NodeRequest bodies from the raw request stream", async () => {

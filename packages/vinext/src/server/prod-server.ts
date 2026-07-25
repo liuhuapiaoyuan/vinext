@@ -39,6 +39,7 @@ import {
   canonicalizeRequestPathname,
   filterInternalHeaders,
   isOpenRedirectShaped,
+  rememberBufferedRequestBody,
 } from "./request-pipeline.js";
 import { notFoundResponse } from "./http-error-responses.js";
 import {
@@ -173,6 +174,27 @@ export function rememberCurrentServerEntryImportMtime(entryPath: string): void {
 // oxlint-disable-next-line typescript/no-explicit-any -- built entry modules are untyped, matching the previous inline `await import(...)`
 export async function importServerEntryModule(entryPath: string): Promise<any> {
   return import(resolveServerEntryImportUrl(entryPath));
+}
+
+function isBunRuntime(): boolean {
+  return typeof process.versions.bun === "string";
+}
+
+/**
+ * Fully buffer a Node IncomingMessage body.
+ *
+ * Bun's `Request.clone()` can drop streaming POST bodies. Standalone production
+ * under `bun dist/standalone/server.js` therefore materializes the body once at
+ * the Node→Web boundary instead of relying on stream teeing.
+ */
+async function readIncomingMessageBytes(req: IncomingMessage): Promise<Uint8Array> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : Buffer.from(chunk));
+  }
+  if (chunks.length === 0) return new Uint8Array();
+  if (chunks.length === 1) return new Uint8Array(chunks[0]);
+  return new Uint8Array(Buffer.concat(chunks));
 }
 
 /** Convert a Node.js IncomingMessage into a ReadableStream for Web Request body. */
@@ -835,6 +857,9 @@ async function statIfFile(filePath: string): Promise<{ size: number; mtimeMs: nu
  *
  * When `urlOverride` is provided, it is used as the path + query string
  * instead of `req.url`.
+ *
+ * Under Bun, pass `preloadedBody` from `readIncomingMessageBytes` so Server
+ * Action POSTs do not depend on Bun's streaming `Request.clone()`.
  */
 function nodeToWebRequest(
   req: IncomingMessage,
@@ -842,6 +867,7 @@ function nodeToWebRequest(
   prerenderSecret?: string,
   i18nConfig?: NextI18nConfig | null,
   authorizeOnDemandRevalidate?: (headerValue: string | null) => boolean,
+  preloadedBody?: Uint8Array,
 ): Request {
   const proto = resolveRequestProtocol(req);
   const rawHeaders = nodeHeadersToWebHeaders(req.headers);
@@ -885,11 +911,16 @@ function nodeToWebRequest(
   };
 
   if (hasBody) {
-    init.body = readNodeStream(req);
+    // Uint8Array generics differ across DOM/Bun lib targets; BodyInit accepts
+    // BufferSource, so cast the preloaded copy explicitly.
+    init.body = preloadedBody !== undefined ? (preloadedBody as BodyInit) : readNodeStream(req);
     init.duplex = "half"; // Required for streaming request bodies
   }
 
   const request = new Request(url, init);
+  if (preloadedBody !== undefined) {
+    rememberBufferedRequestBody(request, preloadedBody);
+  }
   return request;
 }
 
@@ -1496,12 +1527,21 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
       // handler must receive the original URL so its request boundary decodes
       // each segment exactly once. Passing `pathname` here would make encoded
       // percent signs eligible for a second decode inside normalizeRscRequest.
+      //
+      // Under Bun, preload the POST body before building the Web Request —
+      // `bun dist/standalone/server.js` otherwise loses Server Action bodies on
+      // internal Request clones (`JSON Parse error: Unexpected EOF`).
+      const method = req.method ?? "GET";
+      const hasBody = method !== "GET" && method !== "HEAD";
+      const preloadedBody =
+        hasBody && isBunRuntime() ? await readIncomingMessageBytes(req) : undefined;
       const request = nodeToWebRequest(
         req,
         rawUrl,
         prerenderSecret,
         appRouterI18nConfig,
         appRouterAuthorizeOnDemandRevalidate,
+        preloadedBody,
       );
       const response = await rscHandler(
         request,
@@ -1945,13 +1985,25 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
       if (revalidationHostname) reqHeaders.set("host", revalidationHostname);
       const method = req.method ?? "GET";
       const hasBody = method !== "GET" && method !== "HEAD";
-      const webRequest = new Request(`${protocol}://${revalidationHostname ?? hostHeader}${url}`, {
+      // Same Bun Server Action body guard as the App Router path above.
+      const preloadedBody =
+        hasBody && isBunRuntime() ? await readIncomingMessageBytes(req) : undefined;
+      const webRequestInit: RequestInit & { duplex?: string } = {
         method,
         headers: reqHeaders,
-        body: hasBody ? readNodeStream(req) : undefined,
-        // @ts-expect-error — duplex needed for streaming request bodies
-        duplex: hasBody ? "half" : undefined,
-      });
+      };
+      if (hasBody) {
+        webRequestInit.body =
+          preloadedBody !== undefined ? (preloadedBody as BodyInit) : readNodeStream(req);
+        webRequestInit.duplex = "half";
+      }
+      const webRequest = new Request(
+        `${protocol}://${revalidationHostname ?? hostHeader}${url}`,
+        webRequestInit,
+      );
+      if (preloadedBody !== undefined) {
+        rememberBufferedRequestBody(webRequest, preloadedBody);
+      }
 
       // ── Delegate steps 3–11 to the shared Pages Router pipeline ──
       const deps: PagesPipelineDeps = {
@@ -2139,6 +2191,7 @@ export {
   trustedHosts,
   trustProxy,
   nodeToWebRequest,
+  readIncomingMessageBytes,
   mergeResponseHeaders,
   mergeWebResponse,
   tryServeStatic,

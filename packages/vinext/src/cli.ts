@@ -723,7 +723,8 @@ async function buildApp() {
     console.log(
       `  Generated standalone output in ${path.relative(process.cwd(), standalone.standaloneDir)}/`,
     );
-    console.log("  Start it with: node dist/standalone/server.js\n");
+    console.log("  Start it with: node dist/standalone/server.js");
+    console.log("               or: bun dist/standalone/server.js\n");
     return process.exit(0);
   }
 
@@ -1005,7 +1006,9 @@ function printHelp(cmd?: string) {
 
   Serves the output from \`vinext build\`. Supports SSR, static files,
   compression, and all middleware.
-  For output: "standalone", you can also run: node dist/standalone/server.js
+  For output: "standalone", you can also run:
+    node dist/standalone/server.js
+    bun dist/standalone/server.js
 
   Options:
     -p, --port <port>        Port to listen on (default: 3000, or PORT env)
