@@ -14,6 +14,7 @@
  */
 
 import {
+  type CacheControlMetadata,
   type CacheHandlerValue,
   type IncrementalCacheValue,
   type CachedPagesValue,
@@ -179,26 +180,55 @@ export async function isrGet(key: string): Promise<ISRCacheEntry | null> {
 }
 
 /**
- * Store a value in the ISR cache with a revalidation period.
+ * Assemble cache-control metadata, omitting the dimensions the producing
+ * render made no claim about. Shared by every ISR writer so `expire`/`stale`
+ * are never invented from `revalidate`.
+ */
+export function isrCacheControl(
+  revalidateSeconds: number | false,
+  claims: { expireSeconds?: number; staleSeconds?: number } = {},
+): CacheControlMetadata {
+  return {
+    revalidate: revalidateSeconds,
+    ...(claims.expireSeconds === undefined ? {} : { expire: claims.expireSeconds }),
+    ...(claims.staleSeconds === undefined ? {} : { stale: claims.staleSeconds }),
+  };
+}
+
+/**
+ * Write policy for one ISR entry: the cache metadata the producing render
+ * resolved, plus the tags that can invalidate it. Routers differ only in which
+ * `cacheControl` dimensions they populate — App pages carry the client-router
+ * `stale` bound, Pages Router and route handlers do not.
+ */
+export type IsrWritePolicy = {
+  cacheControl: CacheControlMetadata;
+  tags?: string[];
+};
+
+/**
+ * Store a value in the ISR cache under the given write policy.
  */
 export async function isrSet(
   key: string,
   data: IncrementalCacheValue | null,
-  revalidateSeconds: number | false,
-  tags?: string[],
-  expireSeconds?: number,
+  policy: IsrWritePolicy,
 ): Promise<void> {
   await getCdnCacheAdapter().set(key, data, {
-    cacheControl:
-      expireSeconds === undefined
-        ? { revalidate: revalidateSeconds }
-        : { revalidate: revalidateSeconds, expire: expireSeconds },
+    cacheControl: policy.cacheControl,
     // `revalidate` is the legacy vinext CacheHandler context field. `expire`
-    // is new metadata and intentionally only lives inside cacheControl.
-    revalidate: revalidateSeconds,
-    tags: tags ?? [],
+    // and `stale` are newer metadata and intentionally only live inside
+    // cacheControl.
+    revalidate: policy.cacheControl.revalidate,
+    tags: policy.tags ?? [],
   });
 }
+
+export type AppPageCacheSetter = (
+  key: string,
+  data: CachedAppPageValue,
+  policy: IsrWritePolicy,
+) => Promise<void>;
 
 export async function isrSetPrerenderedAppPage(
   key: string,
@@ -206,6 +236,8 @@ export async function isrSetPrerenderedAppPage(
   metadata: {
     expireSeconds?: number;
     revalidateSeconds?: number;
+    /** Client reuse bound from the prerender's `cacheLife`. */
+    staleSeconds?: number;
     /**
      * Implicit/path tags to attach to the seeded entry. Required so that
      * `revalidatePath()` (and `revalidateTag()`) can invalidate prerender-seeded
@@ -228,19 +260,12 @@ export async function isrSetPrerenderedAppPage(
   const ctx: Record<string, unknown> = {};
   if (revalidateSeconds !== undefined) {
     ctx.revalidate = revalidateSeconds;
-    ctx.cacheControl =
-      metadata.expireSeconds === undefined
-        ? { revalidate: revalidateSeconds }
-        : { revalidate: revalidateSeconds, expire: metadata.expireSeconds };
+    ctx.cacheControl = isrCacheControl(revalidateSeconds, metadata);
   }
   if (tags && tags.length > 0) {
     ctx.tags = tags;
   }
   await getCdnCacheAdapter().set(key, data, ctx);
-
-  if (revalidateSeconds !== undefined) {
-    setRevalidateDuration(key, revalidateSeconds);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -437,8 +462,9 @@ function normalizeInterceptionContextForCacheKey(interceptionContext: string): s
  * Build the ISR cache key for an RSC payload.
  *
  * Variants are sequenced in order: `source:<hash>` (intercepted source context,
- * only when an interception context is present), `slots:<hash>` (mounted parallel
- * route slots), and optionally `<render-mode-variant>` (for example,
+ * only when an interception context is present), `selector:<hash>` (a verified
+ * supplemental interception edge), `slots:<hash>` (mounted parallel route slots),
+ * and optionally `<render-mode-variant>` (for example,
  * `prefetch-loading-shell`). Existing cached entries under the old format will
  * become unreachable after deployment. This is acceptable because ISR entries
  * have TTLs and will be regenerated on the next request.
@@ -448,6 +474,7 @@ export function appIsrRscKey(
   mountedSlotsHeader?: string | null,
   renderMode: AppRscRenderMode = APP_RSC_RENDER_MODE_NAVIGATION,
   interceptionContext?: string | null,
+  interceptionId?: string | null,
 ): string {
   const normalizedMountedSlotsHeader = normalizeMountedSlotsHeader(mountedSlotsHeader);
   const sourceVariant =
@@ -456,6 +483,7 @@ export function appIsrRscKey(
       : normalizeInterceptionContextForCacheKey(interceptionContext);
   const variant = [
     sourceVariant ? `source:${fnv1a64(sourceVariant)}` : null,
+    interceptionId ? `selector:${fnv1a64(interceptionId)}` : null,
     normalizedMountedSlotsHeader ? `slots:${fnv1a64(normalizedMountedSlotsHeader)}` : null,
     getRscRenderModeCacheVariant(renderMode),
   ]
@@ -466,39 +494,4 @@ export function appIsrRscKey(
 
 export function appIsrRouteKey(pathname: string): string {
   return appIsrCacheKey(pathname, "route");
-}
-
-// ---------------------------------------------------------------------------
-// Revalidate duration tracking — remembers how long each ISR key's TTL is
-// so we can emit correct Cache-Control headers on cache hits.
-// ---------------------------------------------------------------------------
-
-const MAX_REVALIDATE_ENTRIES = 10_000;
-const _REVALIDATE_KEY = Symbol.for("vinext.isrCache.revalidateDurations");
-const revalidateDurations = (_g[_REVALIDATE_KEY] ??= new Map<string, number>()) as Map<
-  string,
-  number
->;
-
-/**
- * Store the revalidate duration for a cache key.
- * Uses insertion-order LRU eviction to prevent unbounded growth.
- */
-export function setRevalidateDuration(key: string, seconds: number): void {
-  // Simple LRU: delete and re-insert to move to end (most recent)
-  revalidateDurations.delete(key);
-  revalidateDurations.set(key, seconds);
-  // Evict oldest entries if over limit
-  while (revalidateDurations.size > MAX_REVALIDATE_ENTRIES) {
-    const first = revalidateDurations.keys().next().value;
-    if (first !== undefined) revalidateDurations.delete(first);
-    else break;
-  }
-}
-
-/**
- * Get the revalidate duration for a cache key.
- */
-export function getRevalidateDuration(key: string): number | undefined {
-  return revalidateDurations.get(key);
 }

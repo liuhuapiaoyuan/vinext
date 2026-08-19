@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import path from "node:path";
+import path from "pathslash";
 import { fileURLToPath } from "node:url";
 import { shouldUseTerminalFormat } from "./server/terminal-link.js";
 

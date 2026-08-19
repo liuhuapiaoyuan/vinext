@@ -45,6 +45,7 @@ export async function generateServerEntry(
   fileMatcher: ReturnType<typeof createValidFileMatcher>,
   middlewarePath: string | null,
   instrumentationPath: string | null,
+  publicFiles: string[] = [],
   webSocketAllowedOrigins?: true | string[],
 ): Promise<string> {
   const pageRoutes = await pagesRouter(pagesDir, nextConfig?.pageExtensions, fileMatcher);
@@ -120,6 +121,7 @@ export async function generateServerEntry(
     basePath: nextConfig?.basePath ?? "",
     assetPrefix: nextConfig?.assetPrefix ?? "",
     trailingSlash: nextConfig?.trailingSlash ?? false,
+    skipProxyUrlNormalize: nextConfig?.skipProxyUrlNormalize ?? false,
     redirects: nextConfig?.redirects ?? [],
     rewrites: nextConfig?.rewrites ?? { beforeFiles: [], afterFiles: [], fallback: [] },
     headers: nextConfig?.headers ?? [],
@@ -235,7 +237,7 @@ import { buildRouteTrie as _buildRouteTrie, trieMatch as _trieMatch } from ${JSO
 import { reportRequestError as _reportRequestError } from "vinext/instrumentation";
 import { resolvePagesI18nRequest } from ${JSON.stringify(_pagesI18nPath)};
 import { handlePagesApiRoute as __handlePagesApiRoute } from ${JSON.stringify(_pagesApiRoutePath)};
-import { normalizePagesDataRequest as __normalizePagesDataRequest, buildNextDataNotFoundResponse as __buildNextDataNotFoundResponse } from ${JSON.stringify(_pagesDataRoutePath)};
+import { normalizePagesDataRequest as __normalizePagesDataRequest, shouldAddTrailingSlashToPagesDataPath as __shouldAddTrailingSlashToPagesDataPath, buildNextDataNotFoundResponse as __buildNextDataNotFoundResponse } from ${JSON.stringify(_pagesDataRoutePath)};
 import { buildDefaultPagesNotFoundResponse as __buildDefaultPagesNotFoundResponse } from ${JSON.stringify(_pagesDefault404Path)};
 import { createPagesPageHandler as __createPagesPageHandler } from ${JSON.stringify(_pagesPageHandlerPath)};
 import { isOnDemandRevalidateRequest as __isOnDemandRevalidateRequest } from ${JSON.stringify(_isrCachePath)};
@@ -262,7 +264,11 @@ export function normalizeDataRequest(request) {
     request,
     buildId,
     vinextConfig.basePath,
-    hasMiddleware && vinextConfig.trailingSlash,
+    __shouldAddTrailingSlashToPagesDataPath(
+      hasMiddleware,
+      vinextConfig.trailingSlash,
+      vinextConfig.skipProxyUrlNormalize,
+    ),
   );
 }
 export const hasMiddleware = ${JSON.stringify(Boolean(middlewarePath))};
@@ -287,7 +293,7 @@ async function _renderToStringAsync(element) {
   return new Response(stream).text();
 }
 
-async function _renderIsrPassToStringAsync(element) {
+async function _renderIsrPassToStringAsync(element, onHeadReady) {
   // The cache-fill render is a second render pass for the same request.
   // Reset render-scoped state so it cannot leak from the streamed response
   // render or affect async work that is still draining from that stream.
@@ -296,7 +302,17 @@ async function _renderIsrPassToStringAsync(element) {
   return await runWithServerInsertedHTMLState(() =>
     runWithHeadState(() =>
       _runWithCacheState(() =>
-        runWithPrivateCache(() => runWithFetchCache(async () => _renderToStringAsync(element))),
+        runWithPrivateCache(() =>
+          runWithFetchCache(async () => {
+            const html = await _renderToStringAsync(element);
+            // next/head tags are collected as a side effect of the render
+            // above and live in this ALS scope only, so a caller that wants
+            // the regenerated head has to read it here — after the render,
+            // before the scope unwinds.
+            await onHeadReady?.();
+            return html;
+          }),
+        ),
       ),
     ),
   );
@@ -312,6 +328,7 @@ ${errorImportCode}
 export const pageRoutes = [
 ${pageRouteEntries.join(",\n")}
 ];
+export const publicFiles = new Set(${JSON.stringify(publicFiles)});
 const _pageRouteTrie = _buildRouteTrie(pageRoutes);
 const _errorPageRoute = {
   pattern: "/_error",

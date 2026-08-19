@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import path from "node:path";
+import path from "pathslash";
 
 /**
  * next/* shims and other entries that always resolve via vinext aliases.

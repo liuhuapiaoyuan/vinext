@@ -1,4 +1,4 @@
-import path from "node:path";
+import path from "pathslash";
 import { pathToFileURL } from "node:url";
 
 const OSC8 = "\x1b]8;;";

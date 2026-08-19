@@ -39,8 +39,12 @@ import {
   handleConfiguredImageOptimization,
   isImageOptimizationPath,
 } from "./image-optimization.js";
-import { finalizeMissingStaticAssetResponse, resolveStaticAssetSignal } from "./worker-utils.js";
 import { handleAppRouterImageOptimizationRequest } from "./app-router-image-optimization.js";
+import {
+  createStaticAssetRequest,
+  finalizeMissingStaticAssetResponse,
+  resolveStaticAssetSignal,
+} from "./worker-utils.js";
 import {
   bufferRequestBodyForHeaderClone,
   cloneRequestWithHeaders,
@@ -156,13 +160,19 @@ async function handleRequest(
   // Builds a new Headers — Request.headers is immutable in Workers.
   {
     request = await bufferRequestBodyForHeaderClone(request);
-    const prerenderRouteParamsPayload = readTrustedPrerenderRouteParams(request);
+    // Only prod-server's `createNodeExecutionContext` sets `hostRuntime: "node"`,
+    // and it runs after `nodeToWebRequest` verified the payload against the build
+    // secret, so that payload is trusted and must survive filtering. A request
+    // reaching a deployed Worker carries no such context, so a forged payload
+    // stays dropped. Never trust a header for this decision.
+    const trustedPrerenderRouteParams =
+      ctx.hostRuntime === "node" ? readTrustedPrerenderRouteParams(request) : null;
     const filteredHeaders = ctx.isInternalPagesRevalidation
       ? new Headers(request.headers)
       : filterInternalHeaders(request.headers);
     filteredHeaders.delete(VINEXT_REVALIDATE_HOST_HEADER);
     const prerenderRouteParamsHeader = serializePrerenderRouteParamsHeader(
-      prerenderRouteParamsPayload,
+      trustedPrerenderRouteParams,
     );
     if (prerenderRouteParamsHeader !== null) {
       filteredHeaders.set(VINEXT_PRERENDER_ROUTE_PARAMS_HEADER, prerenderRouteParamsHeader);
@@ -196,7 +206,7 @@ async function handleRequest(
       const assetFetcher = env.ASSETS;
       const assetResponse = await resolveStaticAssetSignal(response, {
         fetchAsset: (path) =>
-          Promise.resolve(assetFetcher.fetch(new Request(new URL(path, request.url)))),
+          Promise.resolve(assetFetcher.fetch(createStaticAssetRequest(path, request))),
       });
       if (assetResponse) response = assetResponse;
     }

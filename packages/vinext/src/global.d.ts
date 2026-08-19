@@ -20,7 +20,8 @@ import type { Root } from "react-dom/client";
 import type { OnRequestErrorHandler } from "./server/instrumentation";
 import type { InitialDevServerErrorPayload } from "./server/dev-initial-server-error";
 import type { CachedRscResponse, PrefetchCacheEntry } from "vinext/shims/navigation";
-import type { NextRedirect, NextRewrite } from "./config/next-config";
+import type { NextRedirect } from "./config/next-config";
+import type { ClientRewrites } from "./client/client-rewrites";
 
 // `window.next` is declared inline in `./client/window-next.ts` (mirroring
 // Next.js's own pattern in `packages/next/src/client/next.ts`), not here, so
@@ -118,13 +119,7 @@ declare global {
     __VINEXT_CLIENT_REDIRECTS__: NextRedirect[] | undefined;
 
     /** Resolved client-safe rewrites from next.config.js. */
-    __VINEXT_CLIENT_REWRITES__:
-      | {
-          beforeFiles: NextRewrite[];
-          afterFiles: NextRewrite[];
-          fallback: NextRewrite[];
-        }
-      | undefined;
+    __VINEXT_CLIENT_REWRITES__: ClientRewrites | undefined;
 
     /**
      * Static `middleware/proxy` matcher config embedded for client-side Pages
@@ -250,17 +245,6 @@ declare global {
    */
   // oxlint-disable-next-line no-var
   var __VINEXT_RSC_PARAMS__: Record<string, string | string[]> | undefined;
-
-  /**
-   * Navigation context embedded by `generateSsrEntry()` for hydration
-   * snapshot consistency. Contains the pathname and searchParams used
-   * during SSR so `useSyncExternalStore` `getServerSnapshot` matches the
-   * SSR-rendered HTML.
-   * `searchParams` is serialised as an array of `[key, value]` pairs to
-   * preserve duplicate keys (e.g. `?tag=a&tag=b`).
-   */
-  // oxlint-disable-next-line no-var
-  var __VINEXT_RSC_NAV__: { pathname: string; searchParams: [string, string][] } | undefined;
 
   /**
    * Maps emitted CSS asset hrefs to file contents when next.config enables

@@ -44,20 +44,26 @@ import type { BfcacheIdMap } from "./app-history-state.js";
 import { createNextBfcacheIdMap } from "./app-bfcache-identity.js";
 
 export {
-  createBfcacheSegmentStateKeyMap,
+  createBfcacheSegmentIdentityMap,
   createInitialBfcacheIdMap,
   createNextBfcacheIdMap,
   preserveBfcacheIdsForMergedElements,
 } from "./app-bfcache-identity.js";
 
 export {
+  createAppOwnedHistoryState,
+  createExternalHistoryStatePreservingMetadata,
+  createHistoryStateWithTreeSnapshotId,
   createHistoryStateWithNavigationMetadata,
   createHistoryStateWithPreviousNextUrl,
+  isExternalHistoryState,
   isHistoryStateBfcacheVersionCurrent,
   readHistoryStateBfcacheIds,
   readHistoryStateBfcacheVersion,
+  readHistoryStateActiveRoutePaths,
   readHistoryStatePreviousNextUrl,
   readHistoryStateTraversalIndex,
+  resolveActiveRoutePaths,
   resolveHistoryTraversalIntent,
   type HistoryTraversalIntent,
 } from "./app-history-state.js";
@@ -676,9 +682,7 @@ export function createPendingNavigationCommitFromElements(
       bfcacheIds: createNextBfcacheIdMap({
         current: options.currentState.bfcacheIds,
         currentElements: options.currentState.elements,
-        currentPathname: options.currentState.navigationSnapshot.pathname,
         elements,
-        nextPathname: options.navigationSnapshot.pathname,
         restored: options.restoredBfcacheIds,
         reuseCurrent: options.reuseCurrentBfcacheIds,
       }),

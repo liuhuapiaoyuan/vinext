@@ -58,6 +58,7 @@ import {
 } from "../packages/vinext/src/build/pages-client-assets-module.js";
 import { fetchWorkerFilesystemRoute } from "../packages/vinext/src/server/pages-request-pipeline.js";
 import {
+  createStaticAssetRequest,
   finalizeMissingStaticAssetResponse,
   mergeHeaders,
   resolveStaticAssetSignal,
@@ -1245,6 +1246,32 @@ describe("scanPublicFileRoutes", () => {
 
     expect(scanPublicFileRoutes(tmpDir)).toEqual(["/first.txt", "/nested/second.txt"]);
   });
+
+  it("scans the configured public directory and respects publicDir: false", () => {
+    writeFile(tmpDir, "custom-public/custom.txt", "custom");
+    writeFile(tmpDir, "public/default.txt", "default");
+
+    expect(scanPublicFileRoutes(tmpDir, "custom-public")).toEqual(["/custom.txt"]);
+    expect(scanPublicFileRoutes(tmpDir, false)).toEqual([]);
+    // Vite's resolved config represents `publicDir: false` as an empty string.
+    expect(scanPublicFileRoutes(tmpDir, "")).toEqual([]);
+  });
+
+  // Ported from Next.js: test/e2e/dynamic-routing/shared.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/dynamic-routing/shared.ts
+  it("stores public-file routes with URL-encoded path segments", () => {
+    writeFile(tmpDir, "public/hello copy.txt", "space");
+    writeFile(tmpDir, "public/hello+copy.txt", "plus");
+    writeFile(tmpDir, "public/hello%20copy.txt", "percent");
+
+    expect(scanPublicFileRoutes(tmpDir)).toEqual([
+      "/hello copy.txt",
+      "/hello%20copy.txt",
+      "/hello%2520copy.txt",
+      "/hello%2Bcopy.txt",
+      "/hello+copy.txt",
+    ]);
+  });
 });
 
 describe("readPagesRouterEntrySource", () => {
@@ -1358,6 +1385,9 @@ describe("readPagesRouterEntrySource", () => {
     // Worker passes configRewrites dep with all three phases.
     expect(content).toContain("configRewrites,");
     expect(content).toContain(
+      'matchApiRoute: typeof matchApiRoute === "function" ? matchApiRoute : null',
+    );
+    expect(content).toContain(
       'matchPageRoute: typeof matchPageRoute === "function" ? matchPageRoute : null',
     );
     expect(content).toContain("runPagesRequest(request, deps)");
@@ -1447,10 +1477,12 @@ describe("readPagesRouterEntrySource", () => {
     expect(content).toContain("serveFilesystemRoute: async");
     expect(content).toContain("fetchWorkerFilesystemRoute(");
     expect(content).toContain("env.ASSETS!.fetch(assetRequest)");
+    expect(content).toContain("publicFiles");
   });
 
   it("exports the built-in fetch handler and router-specific worker entries", () => {
     const exportsMap = readVinextPackageExports();
+    expect(hasPackageExport(exportsMap, "./client")).toBe(true);
     expect(hasPackageExport(exportsMap, "./server/fetch-handler")).toBe(true);
     expect(hasPackageExport(exportsMap, "./server/app-router-entry")).toBe(true);
     expect(hasPackageExport(exportsMap, "./server/pages-router-entry")).toBe(true);
@@ -1648,12 +1680,23 @@ describe("readPagesRouterEntrySource", () => {
           canceled = true;
         },
       }),
-      { status: 404, headers: { "content-type": "text/html" } },
+      {
+        status: 404,
+        headers: {
+          "content-length": "12",
+          "content-type": "text/html",
+          "req-url-path": "/_next/static/build/_devMiddlewareManifest.json?foo=1",
+        },
+      },
     );
 
     const finalized = finalizeMissingStaticAssetResponse(routed404, true);
     expect(finalized.status).toBe(404);
     expect(finalized.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+    expect(finalized.headers.get("content-length")).toBeNull();
+    expect(finalized.headers.get("req-url-path")).toBe(
+      "/_next/static/build/_devMiddlewareManifest.json?foo=1",
+    );
     expect(await finalized.text()).toBe("Not Found");
     await vi.waitFor(() => expect(canceled).toBe(true));
 
@@ -1662,6 +1705,15 @@ describe("readPagesRouterEntrySource", () => {
 
     const regular404 = new Response("rendered 404", { status: 404 });
     expect(finalizeMissingStaticAssetResponse(regular404, false)).toBe(regular404);
+  });
+
+  it("finalizes missing build-asset 404s in both Node production routers", () => {
+    const content = fs.readFileSync(
+      path.join(import.meta.dirname, "../packages/vinext/src/server/prod-server.ts"),
+      "utf8",
+    );
+
+    expect(content.match(/finalizeMissingStaticAssetResponse\(/g)).toHaveLength(2);
   });
 
   it("resolveStaticAssetSignal fetches and merges static asset responses with middleware status", async () => {
@@ -1692,6 +1744,52 @@ describe("readPagesRouterEntrySource", () => {
     expect(resolved!.headers.get("x-middleware")).toBe("blocked");
     expect(resolved!.headers.get("x-asset-path")).toBe("/logo/logo.svg");
     expect(await resolved!.text()).toBe("<svg />");
+  });
+
+  it("preserves partial asset status over a middleware status override", async () => {
+    const signalResponse = new Response(null, {
+      status: 403,
+      headers: {
+        "x-vinext-static-file": encodeURIComponent("/asset.txt"),
+        "x-middleware": "blocked",
+      },
+    });
+
+    const resolved = await resolveStaticAssetSignal(signalResponse, {
+      fetchAsset: async () =>
+        new Response("par", {
+          status: 206,
+          headers: {
+            "content-length": "3",
+            "content-range": "bytes 0-2/7",
+          },
+        }),
+    });
+
+    expect(resolved).not.toBeNull();
+    expect(resolved!.status).toBe(206);
+    expect(resolved!.headers.get("content-length")).toBe("3");
+    expect(resolved!.headers.get("content-range")).toBe("bytes 0-2/7");
+    expect(resolved!.headers.get("x-middleware")).toBe("blocked");
+    expect(await resolved!.text()).toBe("par");
+  });
+
+  it("retargets Worker assets without dropping conditional and range fields", () => {
+    const source = new Request("https://example.com/rewrite", {
+      method: "HEAD",
+      headers: {
+        "cache-control": "no-cache",
+        "if-none-match": 'W/"asset"',
+        "if-modified-since": "Sun, 26 Jul 2026 12:34:56 GMT",
+        "if-range": '"asset"',
+        range: "bytes=0-2",
+      },
+    });
+
+    const assetRequest = createStaticAssetRequest("/asset.txt", source);
+    expect(assetRequest.url).toBe("https://example.com/asset.txt");
+    expect(assetRequest.method).toBe("HEAD");
+    expect(Object.fromEntries(assetRequest.headers)).toEqual(Object.fromEntries(source.headers));
   });
 
   it("preserves x-middleware-request-* headers for prod request override handling", () => {
@@ -1739,13 +1837,18 @@ describe("readPagesRouterEntrySource", () => {
     expect(content).toContain("runPagesRequest(request, deps)");
   });
 
-  it("checks image optimization after basePath stripping", () => {
+  it("dispatches image optimization through the post-middleware filesystem phase", () => {
     const content = readPagesRouterEntrySource();
     const basePathPos = content.indexOf("const stripped = stripBasePath(pathname, basePath);");
-    const imagePos = content.indexOf("isImageOptimizationPath(pathname)");
+    const filesystemPos = content.indexOf("serveFilesystemRoute: async");
+    const imagePos = content.indexOf("isImageOptimizationPath(requestPathname)");
     expect(basePathPos).toBeGreaterThan(-1);
+    expect(filesystemPos).toBeGreaterThan(-1);
     expect(imagePos).toBeGreaterThan(-1);
-    expect(basePathPos).toBeLessThan(imagePos);
+    expect(basePathPos).toBeLessThan(filesystemPos);
+    expect(filesystemPos).toBeLessThan(imagePos);
+    expect(content).not.toContain("isImageOptimizationPath(pathname)");
+    expect(content).toContain("new URL(resolvedUrl, request.url)");
   });
 
   it("threads configured image widths and qualities into optimization validation", () => {
@@ -1831,6 +1934,104 @@ describe("fetchWorkerFilesystemRoute", () => {
     );
 
     expect(result).toBe(false);
+    expect(fetchAsset).toHaveBeenCalledOnce();
+  });
+
+  it.each(["POST", "DELETE"])(
+    "uses a bodyless HEAD probe before returning 405 for an existing asset on %s",
+    async (method) => {
+      const fetchAsset = vi.fn(async (request: Request) => {
+        expect(request.method).toBe("HEAD");
+        expect(request.body).toBeNull();
+        return new Response(null, { status: 200 });
+      });
+
+      const sourceRequest =
+        method === "POST"
+          ? new Request("https://example.com/file.txt", {
+              method: "POST",
+              body: "must-not-forward",
+            })
+          : new Request("https://example.com/file.txt", { method: "DELETE" });
+      const result = await fetchWorkerFilesystemRoute(
+        sourceRequest,
+        "/file.txt",
+        "direct",
+        fetchAsset,
+        new Set(["/file.txt"]),
+      );
+
+      expect(result).toBeInstanceOf(Response);
+      if (!(result instanceof Response)) return;
+      expect(result.status).toBe(405);
+      expect(result.headers.get("allow")).toBe("GET, HEAD");
+      await expect(result.text()).resolves.toBe("Method Not Allowed");
+    },
+  );
+
+  it("falls through after a HEAD probe misses for an unsupported method", async () => {
+    const fetchAsset = vi.fn(async (request: Request) => {
+      expect(request.method).toBe("HEAD");
+      return new Response(null, { status: 404 });
+    });
+
+    await expect(
+      fetchWorkerFilesystemRoute(
+        new Request("https://example.com/missing.txt", { method: "POST" }),
+        "/missing.txt",
+        "direct",
+        fetchAsset,
+        new Set(["/missing.txt"]),
+      ),
+    ).resolves.toBe(false);
+  });
+
+  it("skips direct mutation probes when the pathname is not a public file", async () => {
+    const fetchAsset = vi.fn(async () => new Response(null, { status: 200 }));
+
+    await expect(
+      fetchWorkerFilesystemRoute(
+        new Request("https://example.com/checkout", { method: "POST", body: "order=1" }),
+        "/checkout",
+        "direct",
+        fetchAsset,
+        new Set(["/file.txt"]),
+      ),
+    ).resolves.toBe(false);
+    expect(fetchAsset).not.toHaveBeenCalled();
+  });
+
+  it.each(["/hello%20copy.txt", "/hello copy.txt"])(
+    "matches encoded public-file inventory for %s",
+    async (requestPathname) => {
+      const fetchAsset = vi.fn(async () => new Response(null, { status: 200 }));
+
+      const result = await fetchWorkerFilesystemRoute(
+        new Request("https://example.com/hello%20copy.txt", { method: "POST" }),
+        requestPathname,
+        "direct",
+        fetchAsset,
+        new Set(["/hello copy.txt", "/hello%20copy.txt"]),
+      );
+
+      expect(result).toBeInstanceOf(Response);
+      expect(fetchAsset).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("still probes direct built assets outside the public-file inventory", async () => {
+    const fetchAsset = vi.fn(async () => new Response(null, { status: 200 }));
+
+    const result = await fetchWorkerFilesystemRoute(
+      new Request("https://example.com/_next/static/chunks/app.js", { method: "POST" }),
+      "/_next/static/chunks/app.js",
+      "direct",
+      fetchAsset,
+      new Set(),
+      true,
+    );
+
+    expect(result).toBeInstanceOf(Response);
     expect(fetchAsset).toHaveBeenCalledOnce();
   });
 

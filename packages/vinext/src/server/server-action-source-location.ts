@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import path from "node:path";
+import path from "pathslash";
 import { parseSync } from "vite";
 import type { ServerActionLogInfo } from "./server-action-logger.js";
 

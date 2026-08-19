@@ -58,6 +58,8 @@ import {
 } from "../packages/vinext/src/shims/headers.js";
 import { isPromiseLike } from "../packages/vinext/src/utils/promise.js";
 import { isUnknownRecord } from "../packages/vinext/src/utils/record.js";
+import { extractRscCompletionMetadata } from "../packages/vinext/src/server/rsc-completion-metadata.js";
+import { VINEXT_INTERCEPTION_ID_HEADER } from "../packages/vinext/src/server/headers.js";
 
 type TestRoute = {
   __buildTimeClassifications?: ReadonlyMap<number, "static" | "dynamic"> | null;
@@ -174,7 +176,11 @@ async function renderReactNodeText(node: unknown): Promise<string> {
   }
   if (!React.isValidElement<{ children?: unknown }>(node)) return "";
 
-  if (node.type === React.Fragment || typeof node.type === "string") {
+  if (
+    node.type === React.Fragment ||
+    node.type === React.Suspense ||
+    typeof node.type === "string"
+  ) {
     return renderReactNodeText(node.props.children);
   }
   if (typeof node.type === "function") {
@@ -312,6 +318,7 @@ type CreateDispatchOptionsOverrides = {
   request?: Request;
   revalidateSeconds?: number | null;
   resolveRouteFetchCacheMode?: DispatchOptions["resolveRouteFetchCacheMode"];
+  resolveRouteRevalidateSeconds?: DispatchOptions["resolveRouteRevalidateSeconds"];
   resolveRouteDynamicConfig?: DispatchOptions["resolveRouteDynamicConfig"];
   route?: TestRoute;
   scheduleBackgroundRegeneration?: DispatchOptions["scheduleBackgroundRegeneration"];
@@ -408,6 +415,7 @@ function createDispatchOptions(overrides: CreateDispatchOptionsOverrides = {}) {
     request: overrides.request ?? new Request("https://example.test/posts/hello"),
     revalidateSeconds: overrides.revalidateSeconds ?? null,
     resolveRouteFetchCacheMode: overrides.resolveRouteFetchCacheMode,
+    resolveRouteRevalidateSeconds: overrides.resolveRouteRevalidateSeconds,
     resolveRouteDynamicConfig: overrides.resolveRouteDynamicConfig,
     route,
     runWithSuppressedHookWarning<T>(probe: () => Promise<T>) {
@@ -776,7 +784,7 @@ describe("app page dispatch", () => {
     await expect(response.text()).resolves.toBe("<html>page</html>");
     await Promise.all(waitUntilPromises.splice(0));
     expect(isrSet).toHaveBeenCalledTimes(1);
-    const [cacheKey, cacheValue, revalidateSeconds, tags, expireSeconds] = isrSet.mock.calls[0]!;
+    const [cacheKey, cacheValue, cachePolicy] = isrSet.mock.calls[0]!;
     expect(cacheKey).toBe("html:/posts/hello");
     expect(cacheValue).toMatchObject({
       kind: "APP_PAGE",
@@ -784,9 +792,9 @@ describe("app page dispatch", () => {
         requestApis: expect.arrayContaining([{ kind: "searchParams", status: "notObserved" }]),
       },
     });
-    expect(revalidateSeconds).toBe(60);
-    expect(tags).toEqual(expect.arrayContaining(["_N_T_/posts/hello"]));
-    expect(expireSeconds).toBeUndefined();
+    expect(cachePolicy.cacheControl.revalidate).toBe(60);
+    expect(cachePolicy.tags).toEqual(expect.arrayContaining(["_N_T_/posts/hello"]));
+    expect(cachePolicy.cacheControl.expire).toBeUndefined();
   });
 
   it("does not reuse queryless HTML when the page reads searchParams", async () => {
@@ -1308,10 +1316,15 @@ describe("app page dispatch", () => {
       const response = await runWithExecutionContext(executionContext, () =>
         dispatchAppPage(options),
       );
-      const text = await response.text();
+      const completed = extractRscCompletionMetadata(await response.arrayBuffer());
       await Promise.all(waitUntilPromises.splice(0));
       expect(response.headers.get("x-vinext-cache")).not.toBe("HIT");
-      return text;
+      expect(response.headers.get("x-vinext-rsc-completion-metadata")).toBe("1");
+      expect(completed.metadata).toEqual({
+        dynamicStaleTimeSeconds: 0,
+        serverStaleTimeSeconds: null,
+      });
+      return new TextDecoder().decode(completed.buffer);
     }
 
     await expect(request("first")).resolves.toBe("first");
@@ -2072,6 +2085,9 @@ describe("app page dispatch", () => {
   });
 
   it("returns not found for dynamicParams=false paths outside generated params", async () => {
+    const renderHttpAccessFallbackPage = vi.fn(
+      async () => new Response('<html><h1 class="next-error-h1">404</h1></html>', { status: 404 }),
+    );
     const { options } = createDispatchOptions({
       async buildPageElement() {
         throw new Error("unknown static params should not render the page");
@@ -2081,6 +2097,7 @@ describe("app page dispatch", () => {
       },
       route: createRoute({ isDynamic: true, params: ["slug"] }),
     });
+    options.renderHttpAccessFallbackPage = renderHttpAccessFallbackPage;
 
     const response = await dispatchAppPage({
       ...options,
@@ -2088,14 +2105,73 @@ describe("app page dispatch", () => {
     });
 
     expect(response.status).toBe(404);
-    await expect(response.text()).resolves.toBe("This page could not be found");
+    await expect(response.text()).resolves.toContain('class="next-error-h1"');
+    expect(renderHttpAccessFallbackPage).toHaveBeenCalledWith(
+      404,
+      { matchedParams: { slug: "hello" } },
+      options.middlewareContext,
+    );
+  });
+
+  it("keeps request context alive while rendering a generated-param not-found response", async () => {
+    const observedHeaderValues: Array<string | null> = [];
+    let releaseStream!: () => void;
+    const streamGate = new Promise<void>((resolve) => {
+      releaseStream = resolve;
+    });
+    const clearRequestContext = vi.fn(() => setHeadersContext(null));
+    const renderHttpAccessFallbackPage = vi.fn(async () => {
+      observedHeaderValues.push(getHeadersContext()?.headers.get("x-static-miss") ?? null);
+      return new Response(
+        new ReadableStream({
+          async pull(controller) {
+            await streamGate;
+            observedHeaderValues.push(getHeadersContext()?.headers.get("x-static-miss") ?? null);
+            controller.enqueue(new TextEncoder().encode("not found"));
+            controller.close();
+          },
+        }),
+        { status: 404 },
+      );
+    });
+    const { options } = createDispatchOptions({
+      clearRequestContext,
+      async generateStaticParams() {
+        return [{ slug: "known" }];
+      },
+      isRscRequest: true,
+      route: createRoute({ isDynamic: true, params: ["slug"] }),
+    });
+    options.renderHttpAccessFallbackPage = renderHttpAccessFallbackPage;
+    const requestContext = createRequestContext({
+      headersContext: {
+        cookies: new Map(),
+        headers: new Headers({ "x-static-miss": "available" }),
+      },
+    });
+
+    const response = await runWithRequestContext(requestContext, () =>
+      dispatchAppPage({
+        ...options,
+        dynamicParamsConfig: false,
+      }),
+    );
+
+    expect(response.status).toBe(404);
+    expect(observedHeaderValues).toEqual(["available"]);
+    releaseStream();
+    await expect(response.text()).resolves.toBe("not found");
+    expect(observedHeaderValues).toEqual(["available", "available"]);
+    expect(clearRequestContext).not.toHaveBeenCalled();
   });
 
   it("rejects generated scalar params with different casing", async () => {
+    const clearRequestContext = vi.fn();
     const { options } = createDispatchOptions({
       async buildPageElement() {
         throw new Error("case-mismatched static params should not render the page");
       },
+      clearRequestContext,
       async generateStaticParams() {
         return [{ region: "SE" }, { region: "DE" }];
       },
@@ -2109,6 +2185,7 @@ describe("app page dispatch", () => {
     });
 
     expect(response.status).toBe(404);
+    expect(clearRequestContext).toHaveBeenCalledTimes(1);
   });
 
   it("rejects generated catch-all params with different casing", async () => {
@@ -2255,6 +2332,7 @@ describe("app page dispatch", () => {
       findIntercept() {
         return {
           interceptBranchSegments: ["(.)photos", "[id]"],
+          interceptionGraphId: "graph-interception:/feed->/photos/:id",
           matchedParams: { id: "123" },
           notFound: { default: "modal-not-found" },
           notFoundTreePosition: 2,
@@ -2273,6 +2351,7 @@ describe("app page dispatch", () => {
     expect(response.headers.get("x-from-middleware")).toBe("yes");
     await expect(response.text()).resolves.toBe("/feed:{}:modal@app/feed/@modal");
     expect(capturedInterceptOpts).toMatchObject({
+      interceptGraphId: "graph-interception:/feed->/photos/:id",
       interceptBranchSegments: ["(.)photos", "[id]"],
       interceptNotFound: { default: "modal-not-found" },
       interceptNotFoundTreePosition: 2,
@@ -2315,6 +2394,9 @@ describe("app page dispatch", () => {
     };
     const resolveRouteFetchCacheMode = vi.fn((route: TestRoute) =>
       route === sourceRoute ? "force-cache" : null,
+    );
+    const resolveRouteRevalidateSeconds = vi.fn((route: TestRoute) =>
+      route === sourceRoute ? 30 : null,
     );
     const { options } = createDispatchOptions({
       buildPageElement,
@@ -2360,6 +2442,7 @@ describe("app page dispatch", () => {
       mountedSlotsHeader: "slot:modal:/feed",
       revalidateSeconds: 60,
       resolveRouteFetchCacheMode,
+      resolveRouteRevalidateSeconds,
       route: currentRoute,
       scheduleBackgroundRegeneration,
       searchParams: new URLSearchParams("tab=popular"),
@@ -2373,6 +2456,7 @@ describe("app page dispatch", () => {
 
     const [routeArg, paramsArg, optsArg, searchParamsArg] = buildPageElement.mock.calls[0];
     expect(resolveRouteFetchCacheMode).toHaveBeenCalledWith(sourceRoute);
+    expect(resolveRouteRevalidateSeconds).toHaveBeenCalledWith(sourceRoute);
     expect(routeArg).toBe(sourceRoute);
     expect(paramsArg).toEqual({});
     expect(searchParamsArg.toString()).toBe("tab=popular");
@@ -2385,6 +2469,54 @@ describe("app page dispatch", () => {
     });
     expect(options.isrGet).not.toHaveBeenCalled();
     expect(options.isrSet).not.toHaveBeenCalled();
+  });
+
+  it("uses a verified interception id in the persistent RSC cache key", async () => {
+    const interceptionId = "interception:slot:modal:/feed:/feed->/photos/:id";
+    const isrRscKey = vi.fn(
+      (
+        pathname: string,
+        _mountedSlotsHeader?: string | null,
+        _renderMode?: DispatchOptions["renderMode"],
+        _interceptionContext?: string | null,
+        selector?: string | null,
+      ) => `rsc:${pathname}:${selector ?? "none"}`,
+    );
+    const isrGet = vi.fn(async () =>
+      buildISRCacheEntry(
+        buildCachedAppPageValue(
+          "",
+          new TextEncoder().encode("stale-flight").buffer,
+          undefined,
+          buildQueryInvariantRenderObservation(),
+        ),
+      ),
+    );
+    const isrSet = vi.fn<DispatchOptions["isrSet"]>(async () => {});
+    const request = new Request("https://example.test/photos/123", {
+      headers: {
+        [VINEXT_INTERCEPTION_ID_HEADER]: interceptionId,
+      },
+    });
+    const { options } = createDispatchOptions({
+      cleanPathname: "/photos/123",
+      isProduction: true,
+      isRscRequest: true,
+      isrGet,
+      isrRscKey,
+      isrSet,
+      request,
+      revalidateSeconds: 60,
+    });
+
+    const response = await dispatchAppPage(options);
+    await expect(response.text()).resolves.toBe("stale-flight");
+
+    expect(response.headers.get("cache-control")).not.toContain("no-store");
+    expect(response.headers.get("x-vinext-cache")).toBe("HIT");
+    expect(isrRscKey).toHaveBeenCalledWith("/photos/123", null, undefined, null, interceptionId);
+    expect(isrGet).toHaveBeenCalledWith(`rsc:/photos/123:${interceptionId}`);
+    expect(isrSet).not.toHaveBeenCalled();
   });
 
   it("resolves the intercept source route's dynamic config for force-dynamic fetch defaults", async () => {

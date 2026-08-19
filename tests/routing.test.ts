@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vite-plus/test";
+import { describe, it, expect, vi } from "vite-plus/test";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
@@ -23,6 +23,15 @@ import { toSlash } from "pathslash";
 function canonical(base: string, relativePath = ""): string {
   return toSlash(relativePath ? path.join(base, relativePath) : base);
 }
+
+// Each case rebuilds the App Router graph from a real fixture directory, and
+// the graph cache holds a single appDir at a time, so cases that interleave the
+// shared fixture with per-test temp dirs rebuild from scratch dozens of times.
+// On Windows the filesystem scan is far slower than on Linux, and under the
+// unit project's parallelism a single rebuild can exceed the 5s default. Give
+// only Windows the integration project's headroom so these fs-bound cases don't
+// time out; Linux keeps the default.
+if (process.platform === "win32") vi.setConfig({ testTimeout: 30000 });
 
 const FIXTURE_DIR = path.resolve(import.meta.dirname, "./fixtures/pages-basic/pages");
 const EMPTY_PAGE = "export default function Page() { return null; }\n";
@@ -2122,15 +2131,32 @@ describe("pagesRouter - hyphenated param names", () => {
 });
 
 describe("pagesRouter - dotted/colon param names (Next.js parity)", () => {
-  it("discovers dynamic segments with dots and colons", async () => {
+  it("discovers dynamic segments with dots", async () => {
     await withTempDir("vinext-pages-dotted-param-", async (tmpDir) => {
       const pagesDir = path.join(tmpDir, "pages");
       await mkdir(path.join(pagesDir, "products"), { recursive: true });
-      await mkdir(path.join(pagesDir, "repos"), { recursive: true });
       await writeFile(
         path.join(pagesDir, "products", "[variant.id].tsx"),
         "export default function Page() { return null; }",
       );
+
+      invalidateRouteCache(pagesDir);
+      const routes = await pagesRouter(pagesDir);
+      const patterns = routes.map((r) => r.pattern);
+
+      expect(patterns).toContain("/products/:variant.id");
+      invalidateRouteCache(pagesDir);
+    });
+  });
+
+  // `:` is a reserved character in Windows filenames — it delimits an NTFS
+  // alternate data stream, so writing `[repo:name].tsx` there silently produces
+  // a `[repo` file instead. The scenario is unreachable on Windows, so gate it
+  // to POSIX and keep the assertion unconditional.
+  it.runIf(process.platform !== "win32")("discovers dynamic segments with colons", async () => {
+    await withTempDir("vinext-pages-colon-param-", async (tmpDir) => {
+      const pagesDir = path.join(tmpDir, "pages");
+      await mkdir(path.join(pagesDir, "repos"), { recursive: true });
       await writeFile(
         path.join(pagesDir, "repos", "[repo:name].tsx"),
         "export default function Page() { return null; }",
@@ -2140,7 +2166,6 @@ describe("pagesRouter - dotted/colon param names (Next.js parity)", () => {
       const routes = await pagesRouter(pagesDir);
       const patterns = routes.map((r) => r.pattern);
 
-      expect(patterns).toContain("/products/:variant.id");
       expect(patterns).toContain("/repos/:repo:name");
       invalidateRouteCache(pagesDir);
     });
@@ -2166,16 +2191,15 @@ describe("pagesRouter - dotted/colon param names (Next.js parity)", () => {
     });
   });
 
-  it("skips routes whose param names end in + or * (would collide with internal modifiers)", async () => {
+  // The + and * cases are split because `*` is a reserved character in Windows
+  // filenames — a literal `[id*].tsx` file can't exist there, so that scenario
+  // is gated to POSIX (where it's reachable).
+  it("skips routes whose param names end in + (would collide with internal modifiers)", async () => {
     await withTempDir("vinext-pages-skip-plus-", async (tmpDir) => {
       const pagesDir = path.join(tmpDir, "pages");
       await mkdir(pagesDir, { recursive: true });
       await writeFile(
         path.join(pagesDir, "[id+].tsx"),
-        "export default function Page() { return null; }",
-      );
-      await writeFile(
-        path.join(pagesDir, "[id*].tsx"),
         "export default function Page() { return null; }",
       );
 
@@ -2187,4 +2211,25 @@ describe("pagesRouter - dotted/colon param names (Next.js parity)", () => {
       invalidateRouteCache(pagesDir);
     });
   });
+
+  it.runIf(process.platform !== "win32")(
+    "skips routes whose param names end in * (would collide with internal modifiers)",
+    async () => {
+      await withTempDir("vinext-pages-skip-star-", async (tmpDir) => {
+        const pagesDir = path.join(tmpDir, "pages");
+        await mkdir(pagesDir, { recursive: true });
+        await writeFile(
+          path.join(pagesDir, "[id*].tsx"),
+          "export default function Page() { return null; }",
+        );
+
+        invalidateRouteCache(pagesDir);
+        const routes = await pagesRouter(pagesDir);
+
+        // Skipped entirely to avoid ambiguity with internal :name+ / :name* modifiers
+        expect(routes).toHaveLength(0);
+        invalidateRouteCache(pagesDir);
+      });
+    },
+  );
 });

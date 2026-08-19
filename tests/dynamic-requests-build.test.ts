@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
 import { createBuilder, createServer } from "vite";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 import vinext from "../packages/vinext/src/index.js";
 import {
   _transformVeryDynamicRequests,
@@ -12,6 +12,9 @@ import {
 } from "../packages/vinext/src/plugins/ignore-dynamic-requests.js";
 
 const ROOT_NODE_MODULES = path.resolve(import.meta.dirname, "../node_modules");
+
+// The dev-server and build cases exceed the 5s default under Windows parallelism.
+if (process.platform === "win32") vi.setConfig({ testTimeout: 30000 });
 
 async function withTempDir<T>(run: (root: string) => Promise<T>): Promise<T> {
   const root = await mkdtemp(path.join(os.tmpdir(), "vinext-dynamic-requests-"));
@@ -790,6 +793,40 @@ function withDeclaration(value = require(request)) {
       "/app/node_modules/dynamic-request-dependency/index.js",
     )?.code;
     expect(transformed?.match(/Cannot find module as expression is too dynamic/g)).toHaveLength(2);
+  });
+
+  it("resolves static require requests encoded with String.fromCharCode", () => {
+    // Regression for the downstream patch in nodejs/nodejs.org@30ca20133337398e6707bb2cb21df450d6d9da04.
+    const transformed = _transformVeryDynamicRequests(
+      "const loaded = require(String.fromCharCode(46, 47, 118, 97, 108, 117, 101));",
+      "/app/load.js",
+    )?.code;
+
+    expect(transformed).toContain('require("./value")');
+    expect(transformed).not.toContain("MODULE_NOT_FOUND");
+  });
+
+  it("does not evaluate shadowed or non-literal String.fromCharCode calls", () => {
+    const transformed = _transformVeryDynamicRequests(
+      `function load(String) {
+  return require(String.fromCharCode(46, 47, 118, 97, 108, 117, 101));
+}
+require(String.fromCharCode(...codeUnits));`,
+      "/app/load.js",
+    )?.code;
+
+    expect(transformed).not.toContain('require("./value")');
+    expect(transformed?.match(/MODULE_NOT_FOUND/g)).toHaveLength(2);
+  });
+
+  it("matches literal require handling for empty and root character-code requests", () => {
+    const transformed = _transformVeryDynamicRequests(
+      "require(String.fromCharCode()); require(String.fromCharCode(47));",
+      "/app/load.js",
+    )?.code;
+
+    expect(transformed).toContain('require("")');
+    expect(transformed?.match(/MODULE_NOT_FOUND/g)).toHaveLength(1);
   });
 
   it("serves guarded fully dynamic requests in pages and route handlers during development", async () => {

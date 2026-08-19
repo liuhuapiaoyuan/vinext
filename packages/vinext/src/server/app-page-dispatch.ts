@@ -2,11 +2,7 @@ import { type ReactNode } from "react";
 import type { ReactFormState } from "react-dom/client";
 import type { NavigationContext } from "vinext/shims/navigation";
 import type { ClassificationReason } from "../build/layout-classification-types.js";
-import {
-  _consumeRequestScopedCacheLife,
-  _peekRequestScopedCacheLife,
-} from "vinext/shims/cache-request-state";
-import type { CachedAppPageValue } from "vinext/shims/cache-handler";
+import { _captureRequestScopedCacheLifeAccessors } from "vinext/shims/cache-request-state";
 import type { RootParams } from "vinext/shims/root-params";
 import type { PprFallbackShellState } from "vinext/shims/ppr-fallback-shell";
 import {
@@ -34,6 +30,7 @@ import {
   peekDynamicFetchObservations,
   runWithFetchDedupe,
   setCurrentFetchCacheMode,
+  setCurrentFetchRevalidate,
   setCurrentForceDynamicFetchDefault,
   setCurrentFetchSoftTags,
   setRefreshStaleFetchesInForeground,
@@ -86,10 +83,10 @@ import {
 import { shouldServeStreamingMetadata } from "./streaming-metadata.js";
 import { createAppPageTreePath } from "./app-page-route-wiring.js";
 import type { AppPageSsrHandler } from "./app-page-stream.js";
-import { VINEXT_PRERENDER_SPECULATIVE_HEADER } from "./headers.js";
+import { VINEXT_INTERCEPTION_ID_HEADER, VINEXT_PRERENDER_SPECULATIVE_HEADER } from "./headers.js";
 import type { ClientReuseManifestParseResult } from "./client-reuse-manifest.js";
 import { buildAppPageTags } from "./implicit-tags.js";
-import type { ISRCacheEntry } from "./isr-cache.js";
+import type { AppPageCacheSetter, ISRCacheEntry } from "./isr-cache.js";
 import {
   createAppLayoutParamAccessTracker,
   isAppLayoutObservationUnsafeForStaticReuse,
@@ -105,13 +102,6 @@ export type AppPageBoundaryOnError = (
   errorContext: unknown,
 ) => unknown;
 type AppPageDebugLogger = (event: string, detail: string) => void;
-type AppPageCacheSetter = (
-  key: string,
-  data: CachedAppPageValue,
-  revalidateSeconds: number,
-  tags: string[],
-  expireSeconds?: number,
-) => Promise<void>;
 type AppPageCacheGetter = (key: string) => Promise<ISRCacheEntry | null>;
 type AppPageBackgroundRegenerationErrorContext = {
   routerKind: "App Router";
@@ -125,6 +115,8 @@ type AppPageBackgroundRegenerator = (
 ) => void;
 
 type AppPageDispatchIntercept<TPage = unknown> = {
+  interceptionId?: string | null;
+  interceptionGraphId?: string | null;
   // Lazy-loaded layout modules: typed `unknown` because they arrive as
   // dynamically-imported modules (read sites cast to AppPageModule). Matches the
   // transport-level `interceptLayouts` on the route-matching/request types so an
@@ -144,9 +136,13 @@ type AppPageDispatchIntercept<TPage = unknown> = {
   slotKey: string;
   sourceRouteIndex: number;
   sourcePageSegments?: readonly string[] | null;
+  targetPatternParts?: readonly string[];
+  targetRouteGraphId?: string | null;
 };
 
 type AppPageDispatchInterceptOptions<TPage = unknown> = {
+  interceptionId?: string | null;
+  interceptGraphId?: string | null;
   interceptionContext: string | null;
   interceptLayouts?: readonly unknown[] | null;
   interceptLayoutSegments?: readonly (readonly string[])[] | null;
@@ -162,6 +158,8 @@ type AppPageDispatchInterceptOptions<TPage = unknown> = {
   interceptSlotKey: string;
   interceptSourceMatchedUrl?: string | null;
   interceptSourcePageSegments?: readonly string[] | null;
+  interceptTargetPatternParts?: readonly string[] | null;
+  interceptTargetRouteGraphId?: string | null;
 };
 
 type AppPageModule = {
@@ -345,6 +343,7 @@ export type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
     mountedSlotsHeader?: string | null,
     renderMode?: AppRscRenderMode,
     interceptionContext?: string | null,
+    interceptionId?: string | null,
   ) => string;
   isrSet: AppPageCacheSetter;
   loadSsrHandler: () => Promise<AppPageSsrHandler>;
@@ -398,6 +397,7 @@ export type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
   revalidateSeconds: number | null;
   renderedPathAndSearch?: string | null;
   resolveRouteFetchCacheMode?: (route: TRoute) => FetchCacheMode | null;
+  resolveRouteRevalidateSeconds?: (route: TRoute) => number | null;
   resolveRouteDynamicConfig?: (route: TRoute) => string | null | undefined;
   rootForbiddenModule?: AppPageModule | null;
   rootNotFoundModule?: AppPageModule | null;
@@ -543,6 +543,7 @@ async function runAppPageRevalidationContext<
     cleanPathname: string;
     displayPathname?: string;
     currentFetchCacheMode?: FetchCacheMode | null;
+    currentFetchRevalidate?: number | null;
     draftModeSecret: string;
     dynamicConfig?: string;
     params: AppPageParams;
@@ -563,6 +564,7 @@ async function runAppPageRevalidationContext<
   const requestContext = createRequestContext({
     headersContext,
     currentFetchCacheMode: options.currentFetchCacheMode ?? null,
+    currentFetchRevalidate: options.currentFetchRevalidate ?? null,
     currentForceDynamicFetchDefault: options.dynamicConfig === "force-dynamic",
     executionContext: getRequestExecutionContext(),
     unstableCacheRevalidation: "foreground",
@@ -591,6 +593,8 @@ function toInterceptOptions(
   intercept: AppPageDispatchIntercept,
 ): AppPageDispatchInterceptOptions {
   return {
+    interceptionId: intercept.interceptionId ?? null,
+    interceptGraphId: intercept.interceptionGraphId ?? null,
     interceptionContext,
     interceptLayouts: intercept.interceptLayouts,
     interceptLayoutSegments: intercept.interceptLayoutSegments,
@@ -606,6 +610,8 @@ function toInterceptOptions(
     interceptSlotKey: intercept.slotKey,
     interceptSourceMatchedUrl: interceptionContext,
     interceptSourcePageSegments: intercept.sourcePageSegments ?? null,
+    interceptTargetPatternParts: intercept.targetPatternParts ?? null,
+    interceptTargetRouteGraphId: intercept.targetRouteGraphId ?? null,
   };
 }
 
@@ -626,6 +632,9 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
   const route = options.route;
   const dynamicConfig = options.dynamicConfig;
   const currentRevalidateSeconds = options.revalidateSeconds;
+  const interceptionId = options.isRscRequest
+    ? options.request.headers.get(VINEXT_INTERCEPTION_ID_HEADER)
+    : null;
   const isForceStatic = dynamicConfig === "force-static";
   const isDynamicError = dynamicConfig === "error";
   const isForceDynamic = dynamicConfig === "force-dynamic";
@@ -654,6 +663,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
 
   setCurrentFetchSoftTags(buildAppPageTags(options.cleanPathname, [], route.routeSegments));
   setCurrentFetchCacheMode(options.fetchCache ?? null);
+  setCurrentFetchRevalidate(currentRevalidateSeconds);
   setCurrentForceDynamicFetchDefault(isForceDynamic);
 
   if (options.hasPageModule && !options.hasPageDefaultExport) {
@@ -722,6 +732,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
       isrRscKey: options.isrRscKey,
       isrSet: options.isrSet,
       interceptionContext: options.interceptionContext,
+      interceptionId,
       middlewareHeaders: options.middlewareContext.headers,
       middlewareStatus: options.middlewareContext.status,
       mountedSlotsHeader: options.mountedSlotsHeader,
@@ -775,6 +786,9 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
             currentFetchCacheMode:
               options.resolveRouteFetchCacheMode?.(revalidationTarget.route) ??
               (revalidationTarget.route === route ? (options.fetchCache ?? null) : null),
+            currentFetchRevalidate:
+              options.resolveRouteRevalidateSeconds?.(revalidationTarget.route) ??
+              (revalidationTarget.route === route ? currentRevalidateSeconds : null),
             draftModeSecret: options.draftModeSecret,
             dynamicConfig: revalidationDynamicConfig,
             params: revalidationTarget.navigationParams,
@@ -823,6 +837,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
               rootParams: options.rootParams,
               route: revalidationTarget.route,
               waitForAllReady: true,
+              isForceStatic: revalidationDynamicConfig === "force-static",
             });
             options.clearRequestContext();
             return {
@@ -855,13 +870,26 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
   // resolves and exact-matches generateStaticParams for the same route.
   if (options.skipStaticParamsValidation !== true && !(options.isProduction && isForceDynamic)) {
     const dynamicParamsResponse = await validateAppPageDynamicParams({
-      clearRequestContext: options.clearRequestContext,
       enforceStaticParamsOnly: options.dynamicParamsConfig === false,
       generateStaticParams: options.generateStaticParams,
       isDynamicRoute: route.isDynamic,
       params: options.staticParamsValidationParams ?? options.params,
     });
     if (dynamicParamsResponse) {
+      // A generated-param miss belongs to a matched App route, so render the
+      // route's not-found boundary just like a page-level notFound() signal.
+      // The plain response remains a defensive fallback if boundary rendering
+      // is unavailable, but the normal path must include Next.js's canonical
+      // not-found markup (and custom not-found.tsx when present).
+      const renderedNotFound = await options.renderHttpAccessFallbackPage(
+        404,
+        { matchedParams: options.params },
+        options.middlewareContext,
+      );
+      if (renderedNotFound) {
+        return renderedNotFound;
+      }
+      options.clearRequestContext();
       return dynamicParamsResponse;
     }
   }
@@ -918,6 +946,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
         setHeadersContext(requestHeadersContext);
       }
       setCurrentFetchCacheMode(options.resolveRouteFetchCacheMode?.(interceptRoute) ?? null);
+      setCurrentFetchRevalidate(options.resolveRouteRevalidateSeconds?.(interceptRoute) ?? null);
       setCurrentForceDynamicFetchDefault(sourceDynamicConfig === "force-dynamic");
       return options.buildPageElement(
         interceptRoute,
@@ -1072,6 +1101,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
   const pprFallbackShellReactSignal = activeFallbackShellState?.reactAbortController.signal;
   const isSpeculativePrerender =
     isPrerender && options.request.headers.get(VINEXT_PRERENDER_SPECULATIVE_HEADER) === "1";
+  const requestCacheLife = _captureRequestScopedCacheLifeAccessors();
 
   return renderAppPageLifecycle({
     basePath: options.basePath,
@@ -1097,10 +1127,10 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
       return buildAppPageTags(options.cleanPathname, getCollectedFetchTags(), route.routeSegments);
     },
     getRequestCacheLife() {
-      return _consumeRequestScopedCacheLife();
+      return requestCacheLife.consume();
     },
     peekRequestCacheLife() {
-      return _peekRequestScopedCacheLife();
+      return requestCacheLife.peek();
     },
     handlerStart: options.handlerStart,
     hasLoadingBoundary: hasActiveLoadingBoundary,
@@ -1121,6 +1151,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     isrRscKey: options.isrRscKey,
     isrSet: options.isrSet,
     interceptionContext: options.interceptionContext,
+    interceptionId,
     expireSeconds: options.expireSeconds,
     // A loading convention at tree position N wraps descendants, but not a
     // layout co-located at N. Probing any deeper async layout before creating

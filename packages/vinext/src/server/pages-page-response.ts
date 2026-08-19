@@ -13,6 +13,7 @@ import {
   ISR_NEVER_CACHE_CONTROL,
   ISR_NO_STORE_CACHE_CONTROL,
 } from "./isr-decision.js";
+import { isrCacheControl, type IsrWritePolicy } from "./isr-cache.js";
 import { encodeCacheTag } from "../utils/encode-cache-tag.js";
 import { setCacheStateHeaders } from "./cache-headers.js";
 import { createNonceAttribute, escapeHtmlAttr } from "./html.js";
@@ -33,6 +34,7 @@ import {
 } from "./pages-document-asset-props.js";
 import { isBotUserAgent } from "../utils/html-limited-bots.js";
 import { NEXTJS_CACHE_HEADER } from "./headers.js";
+import { matchesIfNoneMatch } from "./http-conditional.js";
 
 // ---------------------------------------------------------------------------
 // Bot / crawler detection for Pages Router edge-runtime SSR
@@ -58,28 +60,6 @@ export function isPagesStreamingBot(userAgent: string): boolean {
 
 export function generatePagesETag(payload: string): string {
   return '"' + fnv1a52(payload).toString(36) + payload.length.toString(36) + '"';
-}
-
-/**
- * Mirrors Next.js `sendEtagResponse` semantics (weak/strong comparison).
- *
- * A weak ETag `W/"..."` matches both `W/"..."` and `"..."` in `If-None-Match`.
- * A strong ETag `"..."` only matches the same strong token.
- * `*` always matches.
- */
-export function etagMatches(etag: string, ifNoneMatch: string): boolean {
-  if (ifNoneMatch === "*") return true;
-  // Normalise: strip the W/ prefix for comparison. Next.js's
-  // `sendEtagResponse` (packages/next/src/server/send-payload.ts) uses the
-  // `fresh` package, which treats a weak token in `If-None-Match` as matching
-  // the corresponding strong ETag and vice versa (RFC 7232 §2.3.2 weak
-  // comparison). We replicate that behaviour here.
-  const normalize = (t: string) => t.replace(/^W\//, "");
-  const etagNorm = normalize(etag.trim());
-  for (const token of ifNoneMatch.split(",")) {
-    if (normalize(token.trim()) === etagNorm) return true;
-  }
-  return false;
 }
 
 /**
@@ -182,13 +162,7 @@ type RenderPagesPageResponseOptions = {
   /** Synchronous `res.revalidate()` render; cache persistence must finish before returning. */
   isOnDemandRevalidate?: boolean;
   isStaticPropsRoute?: boolean;
-  isrSet: (
-    key: string,
-    data: CachedPagesValue,
-    revalidateSeconds: number | false,
-    tags?: string[],
-    expireSeconds?: number,
-  ) => Promise<void>;
+  isrSet: (key: string, data: CachedPagesValue, policy: IsrWritePolicy) => Promise<void>;
   i18n: PagesI18nRenderContext;
   /**
    * True when rendering a `getStaticPaths` fallback shell for a path that
@@ -325,6 +299,8 @@ async function buildPagesShellHtml(
     "assetTags" | "disableOptimizedLoading" | "DocumentComponent" | "renderDocumentToString"
   > & {
     ssrHeadHTML: string;
+    /** Head content that Next.js renders after custom Document children and generated assets. */
+    tailHeadHTML: string;
     /**
      * Document props already resolved by `runDocumentRenderPage`. When set,
      * `getInitialProps` was consumed by the renderPage path and must not be
@@ -357,10 +333,19 @@ async function buildPagesShellHtml(
       { configuredCrossOrigin: options.crossOrigin },
     );
     html = html.replace("__NEXT_MAIN__", bodyMarker);
-    if (options.ssrHeadHTML || generatedAssetTags || fontHeadHTML) {
+    // Next.js renders the collected `next/head` array before children declared
+    // inside a custom Document's <Head>. Insert it after the opening tag so the
+    // default charset remains the first element even when <Head> has props.
+    if (options.ssrHeadHTML) {
+      html = html.replace(
+        /<head(?:\s[^>]*)?>/i,
+        (openingHead) => `${openingHead}${options.ssrHeadHTML}`,
+      );
+    }
+    if (generatedAssetTags || fontHeadHTML || options.tailHeadHTML) {
       html = html.replace(
         "</head>",
-        `  ${fontHeadHTML}${options.ssrHeadHTML}\n  ${generatedAssetTags}\n</head>`,
+        `  ${fontHeadHTML}\n  ${generatedAssetTags}\n  ${options.tailHeadHTML}\n</head>`,
       );
     }
     html = html.replace("<!-- __NEXT_SCRIPTS__ -->", generatedNextDataScript);
@@ -389,8 +374,9 @@ async function buildPagesShellHtml(
   );
   return (
     "<!DOCTYPE html>\n<html>\n<head>\n" +
-    `  ${fontHeadHTML}${options.ssrHeadHTML}\n` +
+    `  ${options.ssrHeadHTML}${fontHeadHTML}\n` +
     `  ${generatedAssetTags}\n` +
+    `  ${options.tailHeadHTML}\n` +
     "</head>\n<body>\n" +
     `  <div id="__next">${bodyMarker}</div>\n` +
     `  ${generatedNextDataScript}\n` +
@@ -469,9 +455,11 @@ async function writePagesIsrCache(options: {
       headers: undefined,
       status: options.status,
     },
-    options.revalidateSeconds,
-    undefined,
-    options.expireSeconds,
+    {
+      cacheControl: isrCacheControl(options.revalidateSeconds, {
+        expireSeconds: options.expireSeconds,
+      }),
+    },
   );
 }
 
@@ -509,7 +497,9 @@ function applyGsspHeaders(
       headers.set(key, String(value));
     }
   }
-  headers.set("Content-Type", "text/html; charset=utf-8");
+  if (!headers.has("Content-Type")) {
+    headers.set("Content-Type", "text/html; charset=utf-8");
+  }
   return statusCode ?? gsspRes.statusCode;
 }
 
@@ -618,13 +608,14 @@ export async function renderPagesPageResponse(
   // `getClientTraceMetadataHTML` returns "" and we forward the head HTML
   // verbatim — keeping the no-op path zero-overhead.
   const traceMetaHTML = getClientTraceMetadataHTML(options.clientTraceMetadata);
-  let ssrHeadHTML = headFromShim;
-  if (traceMetaHTML) ssrHeadHTML += `\n  ${traceMetaHTML}`;
+  const ssrHeadHTML = headFromShim;
+  let tailHeadHTML = traceMetaHTML;
   // `styles` returned by `_document.getInitialProps()` (e.g. collected
   // styled-components / emotion <style> tags) is already rendered to a string
   // by the shared helper, ready to merge into the SSR head.
   if (documentRenderPage.status === "rendered" && documentRenderPage.stylesHTML) {
-    ssrHeadHTML += `\n  ${documentRenderPage.stylesHTML}`;
+    if (tailHeadHTML) tailHeadHTML += "\n  ";
+    tailHeadHTML += documentRenderPage.stylesHTML;
   }
   const shellHtml = await buildPagesShellHtml(bodyMarker, fontHeadHTML, nextDataScript, {
     assetTags: options.assetTags,
@@ -632,6 +623,7 @@ export async function renderPagesPageResponse(
     DocumentComponent: options.DocumentComponent,
     renderDocumentToString: options.renderDocumentToString,
     ssrHeadHTML,
+    tailHeadHTML,
     // When the renderPage path already invoked getInitialProps, reuse its
     // resolved props instead of calling it a second time.
     // `skipped` means it was never invoked → fall through to the fast path.
@@ -708,9 +700,8 @@ export async function renderPagesPageResponse(
   if (options.scriptNonce) {
     responseHeaders.set("Cache-Control", ISR_NO_STORE_CACHE_CONTROL);
   } else if (options.isrRevalidateSeconds !== null) {
-    // Fresh ISR (MISS) response: route through the CDN adapter so edge adapters
-    // emit CDN-Cache-Control + a path-based Cache-Tag (matching revalidatePath,
-    // which Pages Router invalidation uses) while the default emits Cache-Control.
+    // Fresh ISR (MISS) response: route through the CDN adapter with the path tag
+    // used by Pages Router invalidation while the default emits Cache-Control.
     const isrPathname = options.isrCachePathname ?? options.routeUrl.split("?")[0];
     const stem = isrPathname.endsWith("/") ? isrPathname.slice(0, -1) : isrPathname;
     applyCdnResponseHeaders(responseHeaders, {
@@ -768,7 +759,7 @@ export async function renderPagesPageResponse(
     const etag = generatePagesETag(fullHtml);
     responseHeaders.set("ETag", etag);
     const noCacheRequested = requestsNoCache(options.requestCacheControl);
-    if (!noCacheRequested && options.ifNoneMatch && etagMatches(etag, options.ifNoneMatch)) {
+    if (!noCacheRequested && options.ifNoneMatch && matchesIfNoneMatch(options.ifNoneMatch, etag)) {
       return new Response(null, {
         status: 304,
         headers: responseHeaders,

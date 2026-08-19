@@ -45,6 +45,7 @@ const {
   runWithFetchCache,
   getCollectedFetchTags,
   setCurrentFetchCacheMode,
+  setCurrentFetchRevalidate,
   setCurrentForceDynamicFetchDefault,
   setCurrentFetchSoftTags,
   setRefreshStaleFetchesInForeground,
@@ -56,7 +57,8 @@ const {
 } = await import("../packages/vinext/src/shims/fetch-cache.js");
 const { getCacheHandler, revalidatePath, revalidateTag, MemoryCacheHandler, setCacheHandler } =
   await import("../packages/vinext/src/shims/cache.js");
-const { consumeDynamicUsage } = await import("../packages/vinext/src/shims/headers.js");
+const { consumeDynamicUsage, setHeadersContext } =
+  await import("../packages/vinext/src/shims/headers.js");
 const { runWithExecutionContext } = await import("../packages/vinext/src/shims/request-context.js");
 const { createRequestContext, runWithRequestContext } =
   await import("../packages/vinext/src/shims/unified-request-context.js");
@@ -119,6 +121,38 @@ describe("fetch cache shim", () => {
     });
     const data2 = await res2.json();
     expect(data2.count).toBe(1); // Cached
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  // Next.js stores CachedFetchData.body as base64:
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/lib/patch-fetch.ts
+  it("preserves binary response bodies when replaying the fetch cache", async () => {
+    const url = "https://api.example.com/compressed";
+    const body = new Uint8Array([0x1f, 0x8b, 0x08, 0x00, 0xff, 0x80, 0x00, 0x7f]);
+
+    fetchMock.mockImplementationOnce(async () => {
+      const response = new Response(body, {
+        status: 200,
+        headers: {
+          "content-encoding": "gzip",
+          "content-type": "application/octet-stream",
+        },
+      });
+      Object.defineProperty(response, "url", {
+        value: url,
+        configurable: true,
+        enumerable: true,
+        writable: false,
+      });
+      return response;
+    });
+
+    const cold = await fetch(url, { cache: "force-cache" });
+    expect(new Uint8Array(await cold.arrayBuffer())).toEqual(body);
+
+    const cached = await fetch(url, { cache: "force-cache" });
+    expect(new Uint8Array(await cached.arrayBuffer())).toEqual(body);
+    expect(cached.headers.get("content-encoding")).toBe("gzip");
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
@@ -767,6 +801,181 @@ describe("fetch cache shim", () => {
   });
 
   // ── Tag-based invalidation ──────────────────────────────────────────
+
+  it("tags-only fetch inherits the active route revalidate", async () => {
+    setCurrentFetchRevalidate(60);
+
+    await fetch("https://api.example.com/route-revalidate", {
+      next: { tags: ["route-revalidate"] },
+    });
+
+    const handler = getCacheHandler() as InstanceType<typeof MemoryCacheHandler>;
+    const store = (handler as any).store as Map<string, any>;
+    const entries = [...store.values()];
+    expect(entries).toHaveLength(1);
+    expect(entries[0].value).toMatchObject({
+      kind: "FETCH",
+      revalidate: 60,
+      tags: ["route-revalidate"],
+    });
+  });
+
+  it("explicit fetch revalidate overrides the active route revalidate", async () => {
+    setCurrentFetchRevalidate(60);
+
+    await fetch("https://api.example.com/explicit-fetch-revalidate", {
+      next: { revalidate: 5, tags: ["explicit-fetch-revalidate"] },
+    });
+
+    const handler = getCacheHandler() as InstanceType<typeof MemoryCacheHandler>;
+    const store = (handler as any).store as Map<string, any>;
+    expect([...store.values()][0].value.revalidate).toBe(5);
+  });
+
+  it("tags-only fetch inherits an earlier shorter explicit fetch revalidate", async () => {
+    setCurrentFetchRevalidate(60);
+
+    await fetch("https://api.example.com/shorter-explicit-revalidate", {
+      next: { revalidate: 5 },
+    });
+    await fetch("https://api.example.com/inherit-shorter-revalidate", {
+      next: { tags: ["inherit-shorter-revalidate"] },
+    });
+
+    const handler = getCacheHandler() as InstanceType<typeof MemoryCacheHandler>;
+    const store = (handler as any).store as Map<string, any>;
+    const revalidateByUrl = new Map(
+      [...store.values()].map((entry) => [entry.value.data.url, entry.value.revalidate]),
+    );
+    expect(revalidateByUrl).toEqual(
+      new Map([
+        ["https://api.example.com/shorter-explicit-revalidate", 5],
+        ["https://api.example.com/inherit-shorter-revalidate", 5],
+      ]),
+    );
+  });
+
+  it("tags-only fetch is uncached after an earlier zero revalidate fetch", async () => {
+    setCurrentFetchRevalidate(60);
+
+    await fetch("https://api.example.com/zero-explicit-revalidate", {
+      next: { revalidate: 0 },
+    });
+    await fetch("https://api.example.com/inherit-zero-revalidate", {
+      next: { tags: ["inherit-zero-revalidate"] },
+    });
+
+    const handler = getCacheHandler() as InstanceType<typeof MemoryCacheHandler>;
+    const store = (handler as any).store as Map<string, any>;
+    expect(store).toHaveLength(0);
+    expect(consumeDynamicUsage()).toBe(true);
+  });
+
+  it("force-static preserves the route revalidate after a zero revalidate fetch", async () => {
+    setHeadersContext({
+      cookies: new Map(),
+      forceStatic: true,
+      headers: new Headers(),
+    });
+    try {
+      setCurrentFetchRevalidate(60);
+
+      await fetch("https://api.example.com/force-static-zero-revalidate", {
+        next: { revalidate: 0 },
+      });
+      await fetch("https://api.example.com/force-static-route-revalidate", {
+        next: { tags: ["force-static-route-revalidate"] },
+      });
+
+      const handler = getCacheHandler() as InstanceType<typeof MemoryCacheHandler>;
+      const store = (handler as any).store as Map<string, any>;
+      expect([...store.values()][0].value.revalidate).toBe(60);
+      expect(consumeDynamicUsage()).toBe(false);
+    } finally {
+      setHeadersContext(null);
+    }
+  });
+
+  it("explicit indefinite fetch caching overrides the active route revalidate", async () => {
+    setCurrentFetchRevalidate(60);
+
+    await fetch("https://api.example.com/revalidate-false", {
+      next: { revalidate: false, tags: ["revalidate-false"] },
+    });
+    await fetch("https://api.example.com/force-cache", {
+      cache: "force-cache",
+      next: { tags: ["force-cache"] },
+    });
+
+    const handler = getCacheHandler() as InstanceType<typeof MemoryCacheHandler>;
+    const store = (handler as any).store as Map<string, any>;
+    expect([...store.values()].map((entry) => entry.value.revalidate)).toEqual([
+      31_536_000, 31_536_000,
+    ]);
+  });
+
+  it("resets the active route revalidate between fetch-cache scopes", async () => {
+    setCurrentFetchRevalidate(60);
+    cleanup?.();
+    cleanup = withFetchCache();
+
+    await fetch("https://api.example.com/no-route-revalidate", {
+      next: { tags: ["no-route-revalidate"] },
+    });
+
+    const handler = getCacheHandler() as InstanceType<typeof MemoryCacheHandler>;
+    const store = (handler as any).store as Map<string, any>;
+    expect([...store.values()][0].value.revalidate).toBe(31_536_000);
+  });
+
+  it("tags-only fetch is uncached when the active route revalidate is zero", async () => {
+    setCurrentFetchRevalidate(0);
+
+    await fetch("https://api.example.com/zero-route-revalidate", {
+      next: { tags: ["zero-route-revalidate"] },
+    });
+
+    const handler = getCacheHandler() as InstanceType<typeof MemoryCacheHandler>;
+    const store = (handler as any).store as Map<string, any>;
+    expect(store).toHaveLength(0);
+    expect(consumeDynamicUsage()).toBe(true);
+  });
+
+  it("isolates active route revalidate across concurrent fetch-cache scopes", async () => {
+    cleanup?.();
+    cleanup = null;
+
+    await Promise.all([
+      runWithFetchCache(async () => {
+        setCurrentFetchRevalidate(10);
+        await Promise.resolve();
+        await fetch("https://api.example.com/concurrent-route-a", {
+          next: { tags: ["concurrent-route-a"] },
+        });
+      }),
+      runWithFetchCache(async () => {
+        setCurrentFetchRevalidate(20);
+        await Promise.resolve();
+        await fetch("https://api.example.com/concurrent-route-b", {
+          next: { tags: ["concurrent-route-b"] },
+        });
+      }),
+    ]);
+
+    const handler = getCacheHandler() as InstanceType<typeof MemoryCacheHandler>;
+    const store = (handler as any).store as Map<string, any>;
+    const revalidateByUrl = new Map(
+      [...store.values()].map((entry) => [entry.value.data.url, entry.value.revalidate]),
+    );
+    expect(revalidateByUrl).toEqual(
+      new Map([
+        ["https://api.example.com/concurrent-route-a", 10],
+        ["https://api.example.com/concurrent-route-b", 20],
+      ]),
+    );
+
+    cleanup = withFetchCache();
+  });
 
   it("next.tags caches and revalidateTag invalidates", async () => {
     const res1 = await fetch("https://api.example.com/posts", {
@@ -1637,6 +1846,210 @@ describe("fetch cache shim", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("shares persistent cache entries between equivalent URL and Request inputs", async () => {
+    const url = "https://api.example.com";
+    const urlResponse = await fetch(url, { next: { revalidate: 60 } });
+    expect((await urlResponse.json()).count).toBe(1);
+
+    startNewFetchCacheScope();
+    const requestResponse = await fetch(new Request(url), {
+      next: { revalidate: 60 },
+    });
+    expect((await requestResponse.json()).count).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("includes synthesized Blob content types in the persistent cache key", async () => {
+    fetchMock.mockImplementation(async (input, init) => {
+      requestCount++;
+      const request = new Request(input, init);
+      return new Response(
+        JSON.stringify({
+          contentType: request.headers.get("content-type"),
+          count: requestCount,
+        }),
+      );
+    });
+    const url = "https://api.example.com/blob-content-type";
+
+    const jsonResponse = await fetch(url, {
+      method: "POST",
+      body: new Blob(["same-body"], { type: "application/json" }),
+      next: { revalidate: 60 },
+    });
+    expect(await jsonResponse.json()).toEqual({
+      contentType: "application/json",
+      count: 1,
+    });
+
+    startNewFetchCacheScope();
+    const textResponse = await fetch(url, {
+      method: "POST",
+      body: new Blob(["same-body"], { type: "text/plain" }),
+      next: { revalidate: 60 },
+    });
+    expect(await textResponse.json()).toEqual({
+      contentType: "text/plain",
+      count: 2,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("serializes ArrayBuffer and ArrayBufferView byte ranges in persistent cache keys", async () => {
+    fetchMock.mockImplementation(async (input, init) => {
+      requestCount++;
+      const request = new Request(input, init);
+      return new Response(
+        JSON.stringify({
+          bytes: Array.from(new Uint8Array(await request.arrayBuffer())),
+          count: requestCount,
+        }),
+      );
+    });
+    const url = "https://api.example.com/buffer-source-body";
+
+    const arrayBufferResponse = await fetch(url, {
+      method: "POST",
+      body: Uint8Array.of(0x80).buffer,
+      next: { revalidate: 60 },
+    });
+    expect(await arrayBufferResponse.json()).toEqual({ bytes: [0x80], count: 1 });
+
+    startNewFetchCacheScope();
+    const viewBytes = Uint8Array.of(0, 0x81, 0);
+    const dataViewResponse = await fetch(url, {
+      method: "POST",
+      body: new DataView(viewBytes.buffer, 1, 1),
+      next: { revalidate: 60 },
+    });
+    expect(await dataViewResponse.json()).toEqual({ bytes: [0x81], count: 2 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("hashes invalid UTF-8 body bytes without replacement-character collisions", async () => {
+    fetchMock.mockImplementation(async (input, init) => {
+      requestCount++;
+      const request = new Request(input, init);
+      return new Response(
+        JSON.stringify({
+          bytes: Array.from(new Uint8Array(await request.arrayBuffer())),
+          count: requestCount,
+        }),
+      );
+    });
+    const url = "https://api.example.com/binary-body";
+
+    const firstResponse = await fetch(url, {
+      method: "POST",
+      body: Uint8Array.of(0x80),
+      next: { revalidate: 60 },
+    });
+    expect(await firstResponse.json()).toEqual({ bytes: [0x80], count: 1 });
+
+    startNewFetchCacheScope();
+    const secondResponse = await fetch(url, {
+      method: "POST",
+      body: Uint8Array.of(0x81),
+      next: { revalidate: 60 },
+    });
+    expect(await secondResponse.json()).toEqual({ bytes: [0x81], count: 2 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("hashes binary Blob bodies without lossy text decoding", async () => {
+    fetchMock.mockImplementation(async (input, init) => {
+      requestCount++;
+      const request = new Request(input, init);
+      return new Response(
+        JSON.stringify({
+          bytes: Array.from(new Uint8Array(await request.arrayBuffer())),
+          count: requestCount,
+        }),
+      );
+    });
+    const url = "https://api.example.com/binary-blob-body";
+
+    const firstResponse = await fetch(url, {
+      method: "POST",
+      body: new Blob([Uint8Array.of(0x80)]),
+      next: { revalidate: 60 },
+    });
+    expect(await firstResponse.json()).toEqual({ bytes: [0x80], count: 1 });
+
+    startNewFetchCacheScope();
+    const secondResponse = await fetch(url, {
+      method: "POST",
+      body: new Blob([Uint8Array.of(0x81)]),
+      next: { revalidate: 60 },
+    });
+    expect(await secondResponse.json()).toEqual({ bytes: [0x81], count: 2 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("distinguishes an empty string body from an absent body in the persistent cache key", async () => {
+    fetchMock.mockImplementation(async (input, init) => {
+      requestCount++;
+      const request = new Request(input, init);
+      return new Response(
+        JSON.stringify({
+          contentType: request.headers.get("content-type"),
+          count: requestCount,
+        }),
+      );
+    });
+    const url = "https://api.example.com/empty-string-body";
+
+    const absentResponse = await fetch(url, {
+      method: "POST",
+      next: { revalidate: 60 },
+    });
+    expect(await absentResponse.json()).toEqual({
+      contentType: null,
+      count: 1,
+    });
+
+    startNewFetchCacheScope();
+    const emptyResponse = await fetch(url, {
+      method: "POST",
+      body: "",
+      next: { revalidate: 60 },
+    });
+    expect(await emptyResponse.json()).toEqual({
+      contentType: "text/plain;charset=UTF-8",
+      count: 2,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("distinguishes an empty binary body from an absent body in the persistent cache key", async () => {
+    fetchMock.mockImplementation(async (input, init) => {
+      requestCount++;
+      const request = new Request(input, init);
+      return new Response(
+        JSON.stringify({
+          hasBody: request.body !== null,
+          count: requestCount,
+        }),
+      );
+    });
+    const url = "https://api.example.com/empty-binary-body";
+
+    const absentResponse = await fetch(url, {
+      method: "POST",
+      next: { revalidate: 60 },
+    });
+    expect(await absentResponse.json()).toEqual({ hasBody: false, count: 1 });
+
+    startNewFetchCacheScope();
+    const emptyResponse = await fetch(url, {
+      method: "POST",
+      body: new Uint8Array(),
+      next: { revalidate: 60 },
+    });
+    expect(await emptyResponse.json()).toEqual({ hasBody: true, count: 2 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("includes Request object bodies in the cache key", async () => {
     const req1 = new Request("https://api.example.com/req-body", {
       method: "POST",
@@ -1754,6 +2167,90 @@ describe("fetch cache shim", () => {
     const data2 = await res2.json();
     expect(data2.count).toBe(1);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses replacement content-type headers when serializing Request bodies", async () => {
+    fetchMock.mockImplementation(async (input, init) => {
+      requestCount++;
+      const request = new Request(input, init);
+      return new Response(
+        JSON.stringify({
+          contentType: request.headers.get("content-type"),
+          count: requestCount,
+        }),
+      );
+    });
+    const makeMultipartRequest = () =>
+      new Request("https://api.example.com/req-form-replaced-content-type", {
+        method: "POST",
+        headers: { "content-type": "multipart/form-data; boundary=base" },
+        body: [
+          "--base",
+          'Content-Disposition: form-data; name="name"',
+          "",
+          "same-value",
+          "--base--",
+          "",
+        ].join("\r\n"),
+      });
+
+    const jsonResponse = await fetch(makeMultipartRequest(), {
+      headers: { "content-type": "application/json" },
+      next: { revalidate: 60 },
+    });
+    expect(await jsonResponse.json()).toEqual({
+      contentType: "application/json",
+      count: 1,
+    });
+
+    const textResponse = await fetch(makeMultipartRequest(), {
+      headers: { "content-type": "text/plain" },
+      next: { revalidate: 60 },
+    });
+    expect(await textResponse.json()).toEqual({
+      contentType: "text/plain",
+      count: 2,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("separates generated FormData content types from explicit bare multipart headers", async () => {
+    fetchMock.mockImplementation(async (input, init) => {
+      requestCount++;
+      const request = new Request(input, init);
+      return new Response(
+        JSON.stringify({
+          contentType: request.headers.get("content-type"),
+          count: requestCount,
+        }),
+      );
+    });
+    const makeForm = () => {
+      const form = new FormData();
+      form.append("name", "same-value");
+      return form;
+    };
+    const url = "https://api.example.com/form-data-content-type-source";
+
+    const generatedResponse = await fetch(url, {
+      method: "POST",
+      body: makeForm(),
+      next: { revalidate: 60 },
+    });
+    expect((await generatedResponse.json()).count).toBe(1);
+
+    startNewFetchCacheScope();
+    const bareResponse = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "multipart/form-data" },
+      body: makeForm(),
+      next: { revalidate: 60 },
+    });
+    expect(await bareResponse.json()).toEqual({
+      contentType: "multipart/form-data",
+      count: 2,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("malformed multipart Request bodies bypass cache instead of hashing raw bytes", async () => {
@@ -2009,6 +2506,60 @@ describe("fetch cache shim", () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
+    it("bases the auth cache bypass on effective replacement headers", async () => {
+      fetchMock.mockImplementation(async (input, init) => {
+        requestCount++;
+        const request = new Request(input, init);
+        return new Response(
+          JSON.stringify({
+            authorization: request.headers.get("authorization"),
+            count: requestCount,
+          }),
+        );
+      });
+      const makeBaseAuthRequest = () =>
+        new Request("https://api.example.com/replaced-auth-bypass", {
+          headers: { Authorization: "Bearer removed" },
+        });
+
+      const anonymousResponse = await fetch(makeBaseAuthRequest(), {
+        headers: {},
+        next: { tags: ["public-data"] },
+      });
+      expect(await anonymousResponse.json()).toEqual({ authorization: null, count: 1 });
+
+      startNewFetchCacheScope();
+      const cachedAnonymousResponse = await fetch(makeBaseAuthRequest(), {
+        headers: {},
+        next: { tags: ["public-data"] },
+      });
+      expect(await cachedAnonymousResponse.json()).toEqual({ authorization: null, count: 1 });
+
+      startNewFetchCacheScope();
+      const authenticatedResponse = await fetch("https://api.example.com/effective-auth-bypass", {
+        headers: { Authorization: "Bearer effective" },
+        next: { tags: ["user-data"] },
+      });
+      expect(await authenticatedResponse.json()).toEqual({
+        authorization: "Bearer effective",
+        count: 2,
+      });
+
+      startNewFetchCacheScope();
+      const freshAuthenticatedResponse = await fetch(
+        "https://api.example.com/effective-auth-bypass",
+        {
+          headers: { Authorization: "Bearer effective" },
+          next: { tags: ["user-data"] },
+        },
+      );
+      expect(await freshAuthenticatedResponse.json()).toEqual({
+        authorization: "Bearer effective",
+        count: 3,
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    });
+
     it("auth-keyed safety bypass records a dynamic fetch observation without marking the page dynamic", async () => {
       await fetch("https://api.example.com/auth-bypass-page-output", {
         headers: { Authorization: "Bearer alice" },
@@ -2074,6 +2625,184 @@ describe("fetch cache shim", () => {
       const data2 = await res2.json();
       expect(data2.count).toBe(2); // Different auth = different cache
       expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("applies RequestInit overrides when deduping Request inputs", async () => {
+      fetchMock.mockImplementation(async (input, init) => {
+        requestCount++;
+        const request = new Request(input, init);
+        return new Response(
+          JSON.stringify({
+            authorization: request.headers.get("authorization"),
+            credentials: request.credentials,
+          }),
+        );
+      });
+      const request = new Request("https://api.example.com/req-auth-override", {
+        headers: { Authorization: "Bearer base" },
+        credentials: "same-origin",
+      });
+
+      const [aliceResponse, bobResponse] = await Promise.all([
+        fetch(request, {
+          cache: "no-store",
+          headers: { Authorization: "Bearer alice" },
+          credentials: "include",
+        }),
+        fetch(request, {
+          cache: "no-store",
+          headers: { Authorization: "Bearer bob" },
+          credentials: "omit",
+        }),
+      ]);
+
+      expect(await aliceResponse.json()).toEqual({
+        authorization: "Bearer alice",
+        credentials: "include",
+      });
+      expect(await bobResponse.json()).toEqual({
+        authorization: "Bearer bob",
+        credentials: "omit",
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not persist a deduped response under a different RequestInit cache key", async () => {
+      fetchMock.mockImplementation(async (input, init) => {
+        requestCount++;
+        const request = new Request(input, init);
+        return new Response(
+          JSON.stringify({
+            authorization: request.headers.get("authorization"),
+            count: requestCount,
+          }),
+        );
+      });
+      const request = new Request("https://api.example.com/req-auth-cache-override");
+
+      const aliceResponse = await fetch(request, {
+        headers: { Authorization: "Bearer alice" },
+        next: { revalidate: 60 },
+      });
+      expect(await aliceResponse.json()).toEqual({
+        authorization: "Bearer alice",
+        count: 1,
+      });
+
+      const bobResponse = await fetch(request, {
+        headers: { Authorization: "Bearer bob" },
+        next: { revalidate: 60 },
+      });
+      expect(await bobResponse.json()).toEqual({
+        authorization: "Bearer bob",
+        count: 2,
+      });
+
+      startNewFetchCacheScope();
+      const cachedBobResponse = await fetch(request, {
+        headers: { Authorization: "Bearer bob" },
+        next: { revalidate: 60 },
+      });
+      expect(await cachedBobResponse.json()).toEqual({
+        authorization: "Bearer bob",
+        count: 2,
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("replaces Request headers when deriving the persistent cache key", async () => {
+      fetchMock.mockImplementation(async (input, init) => {
+        requestCount++;
+        const request = new Request(input, init);
+        return new Response(
+          JSON.stringify({
+            authorization: request.headers.get("authorization"),
+            count: requestCount,
+          }),
+        );
+      });
+      const authenticatedRequest = new Request("https://api.example.com/replaced-headers", {
+        headers: { Authorization: "Bearer alice" },
+      });
+
+      const anonymousResponse = await fetch(authenticatedRequest, {
+        headers: {},
+        next: { revalidate: 60 },
+      });
+      expect(await anonymousResponse.json()).toEqual({
+        authorization: null,
+        count: 1,
+      });
+
+      const authenticatedResponse = await fetch(authenticatedRequest, {
+        next: { revalidate: 60 },
+      });
+      expect(await authenticatedResponse.json()).toEqual({
+        authorization: "Bearer alice",
+        count: 2,
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("includes inherited Request options in the persistent cache key", async () => {
+      fetchMock.mockImplementation(async (input, init) => {
+        requestCount++;
+        const request = new Request(input, init);
+        return new Response(
+          JSON.stringify({
+            redirect: request.redirect,
+            count: requestCount,
+          }),
+        );
+      });
+      const manualRequest = new Request("https://api.example.com/request-options", {
+        redirect: "manual",
+      });
+      const followRequest = new Request("https://api.example.com/request-options", {
+        redirect: "follow",
+      });
+
+      const manualResponse = await fetch(manualRequest, {
+        next: { revalidate: 60 },
+      });
+      expect(await manualResponse.json()).toEqual({
+        redirect: "manual",
+        count: 1,
+      });
+
+      const followResponse = await fetch(followRequest, {
+        next: { revalidate: 60 },
+      });
+      expect(await followResponse.json()).toEqual({
+        redirect: "follow",
+        count: 2,
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    // Adapted from Next.js: packages/next/src/server/lib/dedupe-fetch.test.ts
+    // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/lib/dedupe-fetch.test.ts
+    it("does not consume an ineligible Request body while checking dedupe eligibility", async () => {
+      fetchMock.mockImplementationOnce(async (input) => {
+        expect(input).toBe(request);
+        expect(request.bodyUsed).toBe(false);
+        return new Response(await request.text());
+      });
+      const request = new Request("https://api.example.com/request-body", {
+        method: "POST",
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("stream data"));
+            controller.close();
+          },
+        }),
+        duplex: "half",
+      } as RequestInit & { duplex: "half" });
+
+      const response = await fetch(request, { cache: "no-store" });
+
+      expect(await response.text()).toBe("stream data");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -2341,6 +3070,35 @@ describe("fetch cache shim", () => {
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
 
+    it("hashes FormData file bytes without lossy text decoding", async () => {
+      const makeForm = (byte: number) => {
+        const form = new FormData();
+        form.append(
+          "file",
+          new File([Uint8Array.of(byte)], "binary.bin", {
+            type: "application/octet-stream",
+          }),
+        );
+        return form;
+      };
+
+      const res1 = await fetch("https://api.example.com/body-form-file-binary", {
+        method: "POST",
+        body: makeForm(0x80),
+        next: { revalidate: 60 },
+      });
+      expect((await res1.json()).count).toBe(1);
+
+      startNewFetchCacheScope();
+      const res2 = await fetch("https://api.example.com/body-form-file-binary", {
+        method: "POST",
+        body: makeForm(0x81),
+        next: { revalidate: 60 },
+      });
+      expect((await res2.json()).count).toBe(2);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
     it("ReadableStream bodies are included in cache key", async () => {
       const streamA = new ReadableStream({
         start(controller) {
@@ -2370,6 +3128,32 @@ describe("fetch cache shim", () => {
       });
       const data2 = await res2.json();
       expect(data2.count).toBe(2); // Different stream = different cache
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("hashes ReadableStream bytes without lossy text decoding", async () => {
+      const makeStream = (byte: number) =>
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(Uint8Array.of(byte));
+            controller.close();
+          },
+        });
+
+      const res1 = await fetch("https://api.example.com/body-stream-binary", {
+        method: "POST",
+        body: makeStream(0x80),
+        next: { revalidate: 60 },
+      });
+      expect((await res1.json()).count).toBe(1);
+
+      startNewFetchCacheScope();
+      const res2 = await fetch("https://api.example.com/body-stream-binary", {
+        method: "POST",
+        body: makeStream(0x81),
+        next: { revalidate: 60 },
+      });
+      expect((await res2.json()).count).toBe(2);
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
   });
@@ -2790,6 +3574,42 @@ describe("fetch cache shim", () => {
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
 
+    it("does not wait for one tee branch to cancel before oversized stream fallback", async () => {
+      let chunk = 0;
+      const stream = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (chunk >= 10) {
+            controller.close();
+            return;
+          }
+          chunk++;
+          controller.enqueue(new Uint8Array(600 * 1024));
+        },
+      });
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+
+      try {
+        const response = await Promise.race([
+          fetch("https://api.example.com/large-pull-stream", {
+            method: "POST",
+            body: stream,
+            next: { revalidate: 60 },
+          }),
+          new Promise<never>((_, reject) => {
+            timeout = setTimeout(
+              () => reject(new Error("oversized stream fallback timed out")),
+              1_000,
+            );
+          }),
+        ]);
+
+        expect((await response.json()).count).toBe(1);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      } finally {
+        clearTimeout(timeout);
+      }
+    });
+
     it("FormData with large File entry bypasses cache and still fetches", async () => {
       const largeContent = "x".repeat(1024 * 1024 + 1);
       const largeFile = new File([largeContent], "big.txt", { type: "text/plain" });
@@ -2811,6 +3631,26 @@ describe("fetch cache shim", () => {
       });
       const data2 = await res2.json();
       expect(data2.count).toBe(2); // bypassed cache because file is oversized
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("FormData with oversized File metadata bypasses cache key generation", async () => {
+      const form = new FormData();
+      form.append("file", new File([], `${"x".repeat(1024 * 1024)}.txt`));
+
+      const res1 = await fetch("https://api.example.com/large-formdata-metadata", {
+        method: "POST",
+        body: form,
+        next: { revalidate: 60 },
+      });
+      expect((await res1.json()).count).toBe(1);
+
+      const res2 = await fetch("https://api.example.com/large-formdata-metadata", {
+        method: "POST",
+        body: form,
+        next: { revalidate: 60 },
+      });
+      expect((await res2.json()).count).toBe(2);
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
   });

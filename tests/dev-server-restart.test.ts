@@ -8,12 +8,12 @@ import {
   applyDevServerRestartPolicy,
   getDevServerRestartWatchPaths,
 } from "../packages/vinext/src/server/dev-server-restart.js";
-import { normalizePathSeparators } from "../packages/vinext/src/utils/path.js";
+import { toSlash } from "pathslash";
 
 type DevServerRestartPolicyConfig = Parameters<typeof applyDevServerRestartPolicy>[0];
 
 function normalizePaths(paths: string[]): string[] {
-  return paths.map((entry) => normalizePathSeparators(path.resolve(entry))).sort();
+  return paths.map((entry) => toSlash(path.resolve(entry))).sort((a, b) => a.localeCompare(b));
 }
 
 describe("getDevServerRestartWatchPaths", () => {
@@ -114,13 +114,11 @@ describe("vinext dev-server restart policy", () => {
 
     expect(config.envDir).not.toBe(false);
     if (config.envDir !== false) {
-      expect(normalizePathSeparators(config.envDir)).toBe(normalizePathSeparators(tmpDir));
+      expect(toSlash(config.envDir)).toBe(toSlash(tmpDir));
     }
     expect(normalizePaths(config.configFileDependencies)).toEqual(
       normalizePaths([viteConfigPath, nextConfigPath]),
     );
-    expect(config.configFileDependencies).not.toContain(
-      normalizePathSeparators(path.resolve(tailwindConfigPath)),
-    );
+    expect(config.configFileDependencies).not.toContain(toSlash(path.resolve(tailwindConfigPath)));
   });
 });

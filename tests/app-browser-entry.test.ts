@@ -4,7 +4,6 @@ import {
   createDevOnCaughtError,
   createOnUncaughtError,
   createProdOnCaughtError,
-  prodOnCaughtError,
   prodOnRecoverableError,
 } from "../packages/vinext/src/server/app-browser-error.js";
 import {
@@ -32,10 +31,18 @@ import {
   hydrateRootInTransition,
 } from "../packages/vinext/src/server/app-browser-hydration.js";
 import { createAppBrowserNavigationController } from "../packages/vinext/src/server/app-browser-navigation-controller.js";
-import { resolvePrefetchNavigationResponseUrl } from "../packages/vinext/src/server/app-browser-prefetch-response.js";
+import { shouldRecoverSamePathSearchCommitOnResponseCompletion } from "../packages/vinext/src/server/app-browser-navigation-response.js";
+import {
+  peekSettledPrefetchResponseForNavigation,
+  preserveCommittedPrefetchExpiry,
+  prepareConsumedPrefetchResponseForPublication,
+  resolvePrefetchNavigationResponseUrl,
+} from "../packages/vinext/src/server/app-browser-prefetch-response.js";
+import { createVisitedResponseCacheEntry } from "../packages/vinext/src/server/app-visited-response-cache.js";
 import {
   createPopstateRestoreHandler,
   restoreSynchronousPopstateScrollPosition,
+  shouldCommitPopstateUrlWithoutNavigation,
 } from "../packages/vinext/src/server/app-browser-popstate.js";
 import {
   VINEXT_RSC_COMPATIBILITY_ID_HEADER,
@@ -66,10 +73,12 @@ import {
 import { VINEXT_DEV_ERROR_RECOVERY_EVENT } from "../packages/vinext/src/utils/dev-error-recovery-event.js";
 import {
   APP_CACHE_ENTRY_REUSE_PROOF_KEY,
+  APP_ARTIFACT_COMPATIBILITY_KEY,
   AppElementsWire,
   APP_LAYOUT_FLAGS_KEY,
   APP_ROOT_LAYOUT_KEY,
   APP_ROUTE_KEY,
+  APP_BFCACHE_SEGMENT_IDENTITIES_KEY,
   APP_SKIPPED_LAYOUT_IDS_KEY,
   UNMATCHED_SLOT,
   getMountedSlotIds,
@@ -86,9 +95,12 @@ import {
 } from "../packages/vinext/src/shims/app-router-scroll-state.js";
 import * as navigationShim from "../packages/vinext/src/shims/navigation.js";
 import {
+  createBfcacheSegmentIdentityMap,
+  createAppOwnedHistoryState,
+  createExternalHistoryStatePreservingMetadata,
   createHistoryStateWithNavigationMetadata,
   createHistoryStateWithPreviousNextUrl,
-  createBfcacheSegmentStateKeyMap,
+  createHistoryStateWithTreeSnapshotId,
   createInitialBfcacheIdMap,
   createNextBfcacheIdMap,
   FRESH_APP_NAVIGATION_PAYLOAD_ORIGIN,
@@ -97,11 +109,14 @@ import {
   isCompleteAppPayloadMetadata,
   isCacheRestorableAppPayloadMetadata,
   isHistoryStateBfcacheVersionCurrent,
+  isExternalHistoryState,
+  readHistoryStateActiveRoutePaths,
   readHistoryStateBfcacheIds,
   readHistoryStateBfcacheVersion,
   readHistoryStatePreviousNextUrl,
   readHistoryStateTraversalIndex,
   resolveInterceptionContextFromPreviousNextUrl,
+  resolveActiveRoutePaths,
   resolveHistoryTraversalIntent,
   resolveServerActionRequestState,
   resolvePendingNavigationCommitDispositionDecision,
@@ -109,6 +124,7 @@ import {
   type OperationLane,
 } from "../packages/vinext/src/server/app-browser-state.js";
 import { createInitialBfcacheMaps } from "../packages/vinext/src/server/app-bfcache-identity.js";
+import { createArtifactCompatibilityEnvelope } from "../packages/vinext/src/server/artifact-compatibility.js";
 import {
   HistoryStateSnapshotCache,
   RestorableClientStateController,
@@ -166,6 +182,24 @@ type TestRouteManifestInterception = {
   targetPattern: string;
 };
 
+function createTestBfcacheSegmentIdentities(
+  entries: Record<string, unknown>,
+  layoutIds: readonly string[],
+): Record<string, string> {
+  const identities: Record<string, string> = {};
+  for (const id of [...layoutIds, ...Object.keys(entries)]) {
+    const parsed = AppElementsWire.parseElementKey(id);
+    if (parsed?.kind === "layout" || parsed?.kind === "template") {
+      identities[id] = `test-identity:${id}`;
+    } else if (parsed?.kind === "page") {
+      identities[id] = `test-identity:${id}`;
+    } else if (parsed?.kind === "slot") {
+      identities[id] = `test-identity:${id}`;
+    }
+  }
+  return identities;
+}
+
 function createResolvedElements(
   routeId: string,
   rootLayoutTreePath: string | null,
@@ -176,7 +210,16 @@ function createResolvedElements(
     : [AppElementsWire.encodeLayoutId(rootLayoutTreePath)],
   slotBindings: readonly AppElementsSlotBinding[] = [],
   interception: AppElementsInterception | null = null,
+  sourcePage: string | null = null,
 ) {
+  const bfcacheIdentityEntries = Object.hasOwn(extraEntries, APP_BFCACHE_SEGMENT_IDENTITIES_KEY)
+    ? {}
+    : {
+        [APP_BFCACHE_SEGMENT_IDENTITIES_KEY]: createTestBfcacheSegmentIdentities(
+          extraEntries,
+          layoutIds,
+        ),
+      };
   return normalizeAppElements({
     ...AppElementsWire.createMetadataEntries({
       interception,
@@ -185,7 +228,9 @@ function createResolvedElements(
       rootLayoutTreePath,
       routeId,
       slotBindings,
+      sourcePage,
     }),
+    ...bfcacheIdentityEntries,
     ...extraEntries,
   });
 }
@@ -801,6 +846,118 @@ describe("app browser entry inline CSS cleanup", () => {
 });
 
 describe("app browser entry navigation scheduling", () => {
+  it("recovers completed same-path search responses without broadening other modes", () => {
+    const currentSnapshot = {
+      ...createClientNavigationRenderSnapshot("https://example.com/base/products?provider=8", {}),
+      pathname: "/products",
+    };
+    const classify = (overrides: {
+      navigationKind?: "navigate" | "traverse" | "refresh";
+      programmaticTransition?: boolean;
+      target?: string;
+    }) =>
+      shouldRecoverSamePathSearchCommitOnResponseCompletion({
+        basePath: "/base",
+        currentSnapshot,
+        navigationKind: overrides.navigationKind ?? "navigate",
+        programmaticTransition: overrides.programmaticTransition ?? true,
+        targetUrl: new URL(overrides.target ?? "https://example.com/base/products?provider=9"),
+      });
+
+    expect(classify({})).toBe(true);
+    expect(classify({ target: "https://example.com/base/products" })).toBe(true);
+    expect(classify({ programmaticTransition: false })).toBe(false);
+    expect(classify({ navigationKind: "traverse" })).toBe(false);
+    expect(classify({ navigationKind: "refresh" })).toBe(false);
+    expect(classify({ target: "https://example.com/base/details?provider=9" })).toBe(false);
+    expect(classify({ target: "https://example.com/base/products?provider=8#reviews" })).toBe(
+      false,
+    );
+  });
+
+  it("peeks at a settled prefetch without transferring ownership before reuse planning", () => {
+    const snapshot = {
+      buffer: new ArrayBuffer(0),
+      contentType: "text/x-component",
+      expiresAt: 123,
+      mountedSlotsHeader: null,
+      paramsHeader: null,
+      renderedPathAndSearch: null,
+      url: "/source?_rsc=prefetch-digest",
+    };
+    const peek = vi.fn(() => snapshot);
+
+    expect(
+      peekSettledPrefetchResponseForNavigation({
+        additionalRscUrls: ["/source"],
+        bypassNavigationCache: false,
+        interceptionContext: "/parent",
+        mountedSlotsHeader: "slot:children:/target",
+        navigationKind: "navigate",
+        peek,
+        targetPathAndSearch: "/target",
+      }),
+    ).toBe(snapshot);
+    expect(peek).toHaveBeenCalledWith("/target", "/parent", "slot:children:/target", {
+      additionalRscUrls: ["/source"],
+    });
+  });
+
+  it("normalizes consumed prefetch snapshots for committed-cache publication", () => {
+    const preparedElements = { route: "prepared" } as unknown as AppElements;
+    const publication = prepareConsumedPrefetchResponseForPublication(
+      {
+        buffer: new ArrayBuffer(0),
+        completedDynamicStaleTimeSeconds: 60,
+        contentType: "text/x-component",
+        dynamicStaleTimeSeconds: 300,
+        expiresAt: 123,
+        paramsHeader: null,
+        preparedElements,
+        renderedPathAndSearch: null,
+        url: "https://example.com/source?_rsc=prefetch-digest",
+      },
+      "/rewrite?_rsc=visible-digest",
+    );
+
+    expect(publication.expiresAt).toBe(123);
+    expect(publication.preparedElements).toBe(preparedElements);
+    expect(publication.snapshot).not.toHaveProperty("expiresAt");
+    expect(publication.snapshot).not.toHaveProperty("preparedElements");
+    expect(publication.snapshot.url).toBe("/rewrite?_rsc=visible-digest");
+  });
+
+  it("keeps runtime-prefetch and visited-cache deadlines independent after commit", () => {
+    const now = 1_000_000;
+    const publication = prepareConsumedPrefetchResponseForPublication(
+      {
+        buffer: new ArrayBuffer(0),
+        completedDynamicStaleTimeSeconds: 30,
+        contentType: "text/x-component",
+        dynamicStaleTimeSeconds: 30,
+        expiresAt: now + 240_000,
+        paramsHeader: null,
+        renderedPathAndSearch: null,
+        serverStaleTime: { kind: "resolved", seconds: 240 },
+        url: "/runtime-prefetch",
+      },
+      "/runtime-prefetch",
+    );
+    const prefetchSnapshot = preserveCommittedPrefetchExpiry(
+      publication.snapshot,
+      publication.expiresAt,
+    );
+    const visited = createVisitedResponseCacheEntry({
+      now,
+      params: {},
+      response: publication.snapshot,
+    });
+
+    expect(prefetchSnapshot.expiresAt).toBe(now + 240_000);
+    expect(publication.snapshot).not.toHaveProperty("expiresAt");
+    expect(visited.expiresAt).toBe(now + 30_000);
+  });
+
   it("keeps the visible URL when a settled prefetch was found through a rewrite alias", () => {
     expect(
       resolvePrefetchNavigationResponseUrl({
@@ -3385,6 +3542,267 @@ describe("app browser navigation controller", () => {
     }
   });
 
+  it("writes history metadata from the approved merged visible state", async () => {
+    const sourceSlotId = "slot:children:/";
+    const rootLayout = React.createElement("div", null, "root layout");
+    const sourceBinding: AppElementsSlotBinding = {
+      activeRouteId: "route:/nested",
+      ownerLayoutId: "layout:/",
+      slotId: sourceSlotId,
+      state: "active",
+    };
+    const initialElements = createResolvedElements(
+      "route:/nested",
+      "/",
+      null,
+      {
+        "layout:/": rootLayout,
+        [sourceSlotId]: React.createElement("main", null, "source"),
+      },
+      ["layout:/"],
+      [sourceBinding],
+    );
+    const initialState = createState({
+      bfcacheIds: { "layout:/": "layout-bfcache", [sourceSlotId]: "source-bfcache" },
+      elements: initialElements,
+      routeId: "route:/nested",
+      slotBindings: [sourceBinding],
+    });
+    const routeManifest = createTestRouteManifest([
+      {
+        id: "route:/nested",
+        layoutIds: ["layout:/"],
+        pattern: "/nested",
+        rootBoundaryId: "root-boundary:/",
+        slotBindings: [sourceBinding],
+      },
+      {
+        id: "route:/nested/drawer",
+        layoutIds: ["layout:/"],
+        pattern: "/nested/drawer",
+        rootBoundaryId: "root-boundary:/",
+      },
+    ]);
+    const { controller, detach, stateRef } = createControllerHarness(initialState, {
+      getRouteManifest: () => routeManifest,
+    });
+    const pendingRouterState = controller.beginPendingBrowserRouterState();
+    const createNavigationCommitEffect = vi.fn(() => vi.fn());
+
+    try {
+      void renderCurrentStateNavigationPayload(controller, {
+        actionType: "navigate",
+        createNavigationCommitEffect,
+        historyUpdateMode: "push",
+        navigationSnapshot: stateRef.current.navigationSnapshot,
+        nextElements: Promise.resolve(
+          createResolvedElements(
+            "route:/nested/drawer",
+            "/",
+            null,
+            {
+              "layout:/": rootLayout,
+              "page:/nested/drawer": React.createElement("aside", null, "drawer"),
+            },
+            ["layout:/"],
+          ),
+        ),
+        operationLane: "navigation",
+        params: {},
+        payloadOrigin: FRESH_APP_NAVIGATION_PAYLOAD_ORIGIN,
+        pendingRouterState,
+        previousNextUrl: null,
+        targetHref: "https://example.com/nested/drawer",
+        navId: controller.beginNavigation(),
+      });
+
+      const committedState = await pendingRouterState.promise;
+      expect(createNavigationCommitEffect).toHaveBeenCalledWith(
+        expect.objectContaining({
+          activeRoutePaths: resolveActiveRoutePaths(committedState.slotBindings),
+          bfcacheIds: committedState.bfcacheIds,
+        }),
+      );
+    } finally {
+      detach();
+    }
+  });
+
+  it("recovers an uncommitted navigation after its streamed response completes", async () => {
+    const { controller, detach, setBrowserRouterState, stateRef } = createControllerHarness();
+    const pendingRouterState = controller.beginPendingBrowserRouterState();
+    const commitEffect = vi.fn();
+    let resolveResponse!: () => void;
+    const navigationResponseCompletion = new Promise<void>((resolve) => {
+      resolveResponse = resolve;
+    });
+
+    try {
+      const renderPromise = renderCurrentStateNavigationPayload(controller, {
+        actionType: "navigate",
+        createNavigationCommitEffect: () => commitEffect,
+        historyUpdateMode: "push",
+        navigationResponseCompletion,
+        navigationSnapshot: createClientNavigationRenderSnapshot(
+          "https://example.com/dashboard?provider=8",
+          {},
+        ),
+        nextElements: Promise.resolve(
+          createResolvedElements("route:/dashboard", "/", null, {
+            "page:/dashboard": React.createElement("main", null, "dashboard"),
+          }),
+        ),
+        operationLane: "navigation",
+        params: {},
+        payloadOrigin: FRESH_APP_NAVIGATION_PAYLOAD_ORIGIN,
+        pendingRouterState,
+        previousNextUrl: null,
+        targetHref: "https://example.com/dashboard?provider=8",
+        navId: controller.beginNavigation(),
+      });
+
+      await expect(pendingRouterState.promise).resolves.toMatchObject({ renderId: 1 });
+      expect(setBrowserRouterState).toHaveBeenCalledTimes(1);
+
+      resolveResponse();
+      await Promise.resolve();
+
+      expect(setBrowserRouterState).toHaveBeenCalledTimes(2);
+      expect(setBrowserRouterState).toHaveBeenLastCalledWith(stateRef.current);
+      expect(stateRef.current.renderId).toBe(1);
+
+      controller.commitNavigationRender(1);
+      await expect(renderPromise).resolves.toBe("committed");
+      expect(commitEffect).toHaveBeenCalledTimes(1);
+      expect(setBrowserRouterState).toHaveBeenCalledTimes(2);
+    } finally {
+      detach();
+    }
+  });
+
+  it("suppresses response-completion recovery after the render already committed", async () => {
+    const { controller, detach, setBrowserRouterState } = createControllerHarness();
+    const pendingRouterState = controller.beginPendingBrowserRouterState();
+    const commitEffect = vi.fn();
+    let resolveResponse!: () => void;
+    const navigationResponseCompletion = new Promise<void>((resolve) => {
+      resolveResponse = resolve;
+    });
+
+    try {
+      const renderPromise = renderCurrentStateNavigationPayload(controller, {
+        actionType: "navigate",
+        createNavigationCommitEffect: () => commitEffect,
+        historyUpdateMode: "push",
+        navigationResponseCompletion,
+        navigationSnapshot: createClientNavigationRenderSnapshot(
+          "https://example.com/dashboard?provider=8",
+          {},
+        ),
+        nextElements: Promise.resolve(
+          createResolvedElements("route:/dashboard", "/", null, {
+            "page:/dashboard": React.createElement("main", null, "dashboard"),
+          }),
+        ),
+        operationLane: "navigation",
+        params: {},
+        payloadOrigin: FRESH_APP_NAVIGATION_PAYLOAD_ORIGIN,
+        pendingRouterState,
+        previousNextUrl: null,
+        targetHref: "https://example.com/dashboard?provider=8",
+        navId: controller.beginNavigation(),
+      });
+
+      await expect(pendingRouterState.promise).resolves.toBeDefined();
+      controller.commitNavigationRender(1);
+      await expect(renderPromise).resolves.toBe("committed");
+      resolveResponse();
+      await Promise.resolve();
+
+      expect(commitEffect).toHaveBeenCalledTimes(1);
+      expect(setBrowserRouterState).toHaveBeenCalledTimes(1);
+    } finally {
+      detach();
+    }
+  });
+
+  it("does not recover a completed response after a newer navigation starts", async () => {
+    const { controller, detach, setBrowserRouterState, stateRef } = createControllerHarness();
+    const pendingRouterState = controller.beginPendingBrowserRouterState();
+    let resolveResponse!: () => void;
+    const navigationResponseCompletion = new Promise<void>((resolve) => {
+      resolveResponse = resolve;
+    });
+    const navId = controller.beginNavigation();
+
+    try {
+      void renderCurrentStateNavigationPayload(controller, {
+        actionType: "navigate",
+        createNavigationCommitEffect: () => () => {},
+        historyUpdateMode: "push",
+        navigationResponseCompletion,
+        navigationSnapshot: stateRef.current.navigationSnapshot,
+        nextElements: Promise.resolve(
+          createResolvedElements("route:/dashboard", "/", null, {
+            "page:/dashboard": React.createElement("main", null, "dashboard"),
+          }),
+        ),
+        operationLane: "navigation",
+        params: {},
+        payloadOrigin: FRESH_APP_NAVIGATION_PAYLOAD_ORIGIN,
+        pendingRouterState,
+        previousNextUrl: null,
+        targetHref: "https://example.com/dashboard?provider=8",
+        navId,
+      });
+
+      await expect(pendingRouterState.promise).resolves.toBeDefined();
+      controller.beginNavigation();
+      resolveResponse();
+      await Promise.resolve();
+
+      expect(setBrowserRouterState).toHaveBeenCalledTimes(1);
+    } finally {
+      detach();
+    }
+  });
+
+  it("does not recover a completed response after the browser root detaches", async () => {
+    const { controller, detach, setBrowserRouterState, stateRef } = createControllerHarness();
+    const pendingRouterState = controller.beginPendingBrowserRouterState();
+    let resolveResponse!: () => void;
+    const navigationResponseCompletion = new Promise<void>((resolve) => {
+      resolveResponse = resolve;
+    });
+
+    void renderCurrentStateNavigationPayload(controller, {
+      actionType: "navigate",
+      createNavigationCommitEffect: () => () => {},
+      historyUpdateMode: "push",
+      navigationResponseCompletion,
+      navigationSnapshot: stateRef.current.navigationSnapshot,
+      nextElements: Promise.resolve(
+        createResolvedElements("route:/dashboard", "/", null, {
+          "page:/dashboard": React.createElement("main", null, "dashboard"),
+        }),
+      ),
+      operationLane: "navigation",
+      params: {},
+      payloadOrigin: FRESH_APP_NAVIGATION_PAYLOAD_ORIGIN,
+      pendingRouterState,
+      previousNextUrl: null,
+      targetHref: "https://example.com/dashboard?provider=8",
+      navId: controller.beginNavigation(),
+    });
+
+    await expect(pendingRouterState.promise).resolves.toBeDefined();
+    detach();
+    resolveResponse();
+    await Promise.resolve();
+
+    expect(setBrowserRouterState).toHaveBeenCalledTimes(1);
+  });
+
   it("hard-navigates cache-restored payloads missing cache-entry proof metadata", async () => {
     const performHardNavigation = vi.fn(() => true);
     const createNavigationCommitEffect = vi.fn(() => vi.fn());
@@ -5372,6 +5790,55 @@ describe("app browser root-layout hard navigation", () => {
 });
 
 describe("app browser entry previousNextUrl helpers", () => {
+  it("marks external history entries while preserving app-owned metadata", () => {
+    const state = createExternalHistoryStatePreservingMetadata(
+      { caller: "state" },
+      createHistoryStateWithNavigationMetadata(
+        { __vinext_treeSnapshotId: 9 },
+        {
+          bfcacheIds: { "page:/feed": "_b_1_" },
+          bfcacheVersion: 2,
+          previousNextUrl: "/feed",
+          traversalIndex: 4,
+        },
+      ),
+    );
+
+    expect(state).toEqual({
+      __vinext_bfcacheIds: { "page:/feed": "_b_1_" },
+      __vinext_bfcacheVersion: 2,
+      __vinext_externalHistoryState: true,
+      __vinext_historyIndex: 4,
+      __vinext_previousNextUrl: "/feed",
+      __vinext_treeSnapshotClaimed: true,
+      __vinext_treeSnapshotId: 9,
+      caller: "state",
+    });
+    expect(isExternalHistoryState(state)).toBe(true);
+  });
+
+  it("removes the external marker when an app-owned history entry commits", () => {
+    expect(
+      createAppOwnedHistoryState({
+        __vinext_externalHistoryState: true,
+        __vinext_historyIndex: 4,
+        caller: "state",
+      }),
+    ).toEqual({
+      __vinext_historyIndex: 4,
+      caller: "state",
+    });
+  });
+
+  it("clears stale claim metadata when assigning a different tree snapshot id", () => {
+    expect(
+      createHistoryStateWithTreeSnapshotId(
+        { __vinext_treeSnapshotClaimed: true, __vinext_treeSnapshotId: 9 },
+        10,
+      ),
+    ).toEqual({ __vinext_treeSnapshotId: 10 });
+  });
+
   it("stores previousNextUrl alongside existing history state", () => {
     expect(
       createHistoryStateWithPreviousNextUrl(
@@ -5434,6 +5901,34 @@ describe("app browser entry previousNextUrl helpers", () => {
       __vinext_scrollY: 120,
     });
     expect(readHistoryStateTraversalIndex(state)).toBe(4);
+  });
+
+  it("stores canonical active route evidence for the history entry", () => {
+    const state = createHistoryStateWithNavigationMetadata(null, {
+      activeRoutePaths: ["/detail-page", "/detail-page", "/dashboard/settings"],
+      previousNextUrl: null,
+    });
+
+    expect(readHistoryStateActiveRoutePaths(state)).toEqual([
+      "/detail-page",
+      "/dashboard/settings",
+    ]);
+  });
+
+  it("rejects malformed active route evidence from history state", () => {
+    for (const activeRoutePaths of [
+      ["detail-page"],
+      ["//other-origin.example/detail-page"],
+      ["/detail-page?stale=1"],
+      ["/detail-page#stale"],
+      ["/detail-page\\stale"],
+      ["/detail-page\0stale"],
+      ["/detail-page", 42],
+    ]) {
+      expect(
+        readHistoryStateActiveRoutePaths({ __vinext_activeRoutePaths: activeRoutePaths }),
+      ).toBeNull();
+    }
   });
 
   it("resolves back, forward, and unknown traversal intent from history state", () => {
@@ -5569,6 +6064,68 @@ describe("app browser entry previousNextUrl helpers", () => {
     ]);
   });
 
+  // Ported from Next.js: test/e2e/app-dir/app/index.test.ts
+  // https://github.com/vercel/next.js/blob/v16.2.6/test/e2e/app-dir/app/index.test.ts
+  it("reuses a matching server template seed when its child state identity changes", async () => {
+    const previousTemplate = React.createElement("h1", null, "template seed 1");
+    const nextTemplate = React.createElement("h1", null, "template seed 2");
+    const templateId = "template:/template/servercomponent";
+    const state = createState({
+      bfcacheIds: { [templateId]: "_b_1_" },
+      elements: createResolvedElements("route:/template/page", "/", null, {
+        [APP_BFCACHE_SEGMENT_IDENTITIES_KEY]: {
+          [templateId]: '["template","template-graph","root","index"]',
+        },
+        [templateId]: previousTemplate,
+      }),
+      routeId: "route:/template/page",
+    });
+
+    const nextState = await applyApprovedTestCommit(state, {
+      extraEntries: {
+        [APP_BFCACHE_SEGMENT_IDENTITIES_KEY]: {
+          [templateId]: '["template","template-graph","root","other"]',
+        },
+        [templateId]: nextTemplate,
+        "page:/template/other": React.createElement("main", null, "other"),
+      },
+      rootLayoutTreePath: "/",
+      routeId: "route:/template/other",
+    });
+
+    expect(nextState.bfcacheIds[templateId]).not.toBe(state.bfcacheIds[templateId]);
+    expect(nextState.elements[templateId]).toBe(previousTemplate);
+  });
+
+  it("installs fresh server template output when its own dynamic param changes", async () => {
+    const templateId = "template:/template/[section]";
+    const previousTemplate = React.createElement("h1", null, "alpha template");
+    const nextTemplate = React.createElement("h1", null, "beta template");
+    const state = createState({
+      elements: createResolvedElements("route:/template/[section]", "/", null, {
+        [templateId]: previousTemplate,
+      }),
+      navigationSnapshot: createClientNavigationRenderSnapshot(
+        "https://example.com/template/alpha",
+        { section: "alpha" },
+      ),
+      routeId: "route:/template/[section]",
+    });
+
+    const nextState = await applyApprovedTestCommit(state, {
+      extraEntries: { [templateId]: nextTemplate },
+      navigationSnapshot: createClientNavigationRenderSnapshot(
+        "https://example.com/template/beta",
+        { section: "beta" },
+      ),
+      rootLayoutTreePath: "/",
+      routeId: "route:/template/[section]",
+      targetHref: "https://example.com/template/beta",
+    });
+
+    expect(nextState.elements[templateId]).toBe(nextTemplate);
+  });
+
   it("installs fresh same-layout output on refresh commits", async () => {
     const previousLayout = React.createElement("div", null, "previous layout");
     const nextLayout = React.createElement("div", null, "refreshed layout");
@@ -5661,6 +6218,10 @@ describe("app browser entry previousNextUrl helpers", () => {
         {
           "layout:/": React.createElement("div", null, "root layout"),
           "layout:/blog/[slug]": previousLayout,
+          [APP_BFCACHE_SEGMENT_IDENTITIES_KEY]: {
+            "layout:/": "/",
+            "layout:/blog/[slug]": "/blog/[slug]?slug=hello-world",
+          },
         },
         ["layout:/", "layout:/blog/[slug]"],
       ),
@@ -5676,6 +6237,11 @@ describe("app browser entry previousNextUrl helpers", () => {
       extraEntries: {
         "layout:/blog/[slug]": nextLayout,
         "page:/blog/[slug]": React.createElement("main", null, "getting-started"),
+        [APP_BFCACHE_SEGMENT_IDENTITIES_KEY]: {
+          "layout:/": "/",
+          "layout:/blog/[slug]": "/blog/[slug]?slug=getting-started",
+          "page:/blog/[slug]": "/blog/[slug]?slug=getting-started",
+        },
       },
       layoutIds: ["layout:/", "layout:/blog/[slug]"],
       navigationSnapshot: createClientNavigationRenderSnapshot(
@@ -6050,6 +6616,31 @@ describe("app browser entry previousNextUrl helpers", () => {
     const nextState = applyApprovedVisibleCommit(currentState, approval.approvedCommit);
     expect(nextState.elements["layout:/dashboard"]).toBe(dashboardLayout);
     expect(nextState.elements[modalSlotId]).toBe(modalSlot);
+    expect(
+      AppElementsWire.readMetadata(nextState.elements).bfcacheSegmentIdentities[modalSlotId],
+    ).toBe(`test-identity:${modalSlotId}`);
+    expect(nextState.bfcacheIds[modalSlotId]).toBe("_b_5_");
+
+    const followingElements = createResolvedElements(
+      "route:/dashboard/profile",
+      "/",
+      null,
+      {
+        "layout:/": rootLayout,
+        "layout:/dashboard": dashboardLayout,
+        [modalSlotId]: modalSlot,
+        "page:/dashboard/profile": React.createElement("main", null, "profile"),
+      },
+      ["layout:/", "layout:/dashboard"],
+      [currentModalBinding],
+    );
+    const followingBfcacheIds = createNextBfcacheIdMap({
+      current: nextState.bfcacheIds,
+      currentElements: nextState.elements,
+      elements: followingElements,
+    });
+
+    expect(followingBfcacheIds[modalSlotId]).toBe("_b_5_");
   });
 
   it("clears stale parallel slots on approved traverse commits", async () => {
@@ -6163,6 +6754,14 @@ describe("app browser entry previousNextUrl helpers", () => {
       slotId: modalSlotId,
       state: "active",
     } satisfies AppElementsSlotBinding;
+    const currentIdentities = {
+      "layout:/": "/",
+      "layout:/feed": "/feed",
+    };
+    const nextIdentities = {
+      ...currentIdentities,
+      "page:/feed/comments": "/feed/comments",
+    };
     const state = createState({
       bfcacheIds: {
         "layout:/": "0",
@@ -6177,6 +6776,7 @@ describe("app browser entry previousNextUrl helpers", () => {
           "layout:/": React.createElement("div", null, "root layout"),
           "layout:/feed": feedLayout,
           [modalSlotId]: React.createElement("div", null, "modal"),
+          [APP_BFCACHE_SEGMENT_IDENTITIES_KEY]: currentIdentities,
         },
         ["layout:/", "layout:/feed"],
         [modalSlotBinding],
@@ -6196,6 +6796,7 @@ describe("app browser entry previousNextUrl helpers", () => {
           null,
           {
             "page:/feed/comments": React.createElement("main", null, "comments"),
+            [APP_BFCACHE_SEGMENT_IDENTITIES_KEY]: nextIdentities,
           },
           ["layout:/", "layout:/feed", "layout:/feed/comments"],
           [
@@ -6310,6 +6911,55 @@ describe("app browser entry previousNextUrl helpers", () => {
     expect(nextState.slotBindings).toEqual([modalSlotBinding]);
   });
 
+  it("preserves an active children branch omitted by a nested parallel route payload", async () => {
+    const childrenSlotId = AppElementsWire.encodeSlotId("children", "/");
+    const childrenSlot = React.createElement("main", null, "underlying page");
+    const childrenBinding = {
+      activeRouteId: "route:/nested",
+      ownerLayoutId: "layout:/",
+      slotId: childrenSlotId,
+      state: "active",
+    } satisfies AppElementsSlotBinding;
+    const state = createState({
+      bfcacheIds: {
+        "layout:/": "0",
+        [childrenSlotId]: "_b_5_",
+      },
+      elements: createResolvedElements(
+        "route:/nested",
+        "/",
+        null,
+        {
+          "layout:/": React.createElement("div", null, "root layout"),
+          [childrenSlotId]: childrenSlot,
+        },
+        ["layout:/"],
+        [childrenBinding],
+      ),
+      layoutIds: ["layout:/"],
+      routeId: "route:/nested",
+      slotBindings: [childrenBinding],
+    });
+
+    const nextState = await applyApprovedTestCommit(state, {
+      extraEntries: {
+        "page:/nested/modal": React.createElement("aside", null, "modal"),
+      },
+      layoutIds: ["layout:/"],
+      navigationSnapshot: createClientNavigationRenderSnapshot(
+        "https://example.com/nested/modal",
+        {},
+      ),
+      rootLayoutTreePath: "/",
+      routeId: "route:/nested/modal",
+      slotBindings: [],
+      targetHref: "https://example.com/nested/modal",
+    });
+
+    expect(nextState.elements[childrenSlotId]).toBe(childrenSlot);
+    expect(nextState.slotBindings).toEqual([childrenBinding]);
+  });
+
   it("preserves bfcache ids for planner-approved default parallel slots", async () => {
     const modalSlotId = AppElementsWire.encodeSlotId("modal", "/feed");
     const mountedSlot = React.createElement("div", null, "modal");
@@ -6362,9 +7012,15 @@ describe("app browser entry previousNextUrl helpers", () => {
 
   it("keeps previous slot binding proof when the target marks a preserved slot unmatched", async () => {
     const mountedSlot = React.createElement("div", null, "modal");
+    const modalSlotId = "slot:modal:/feed";
+    const currentIdentities = {
+      "layout:/": "identity:layout:/",
+      "layout:/feed": "identity:layout:/feed",
+      [modalSlotId]: "identity:modal:active",
+    };
     const modalSlotBinding = {
       ownerLayoutId: "layout:/feed",
-      slotId: "slot:modal:/feed",
+      slotId: modalSlotId,
       state: "active",
     } satisfies AppElementsSlotBinding;
     const state = createState({
@@ -6378,9 +7034,10 @@ describe("app browser entry previousNextUrl helpers", () => {
         "/",
         null,
         {
+          [APP_BFCACHE_SEGMENT_IDENTITIES_KEY]: currentIdentities,
           "layout:/": React.createElement("div", null, "root layout"),
           "layout:/feed": React.createElement("div", null, "feed layout"),
-          "slot:modal:/feed": mountedSlot,
+          [modalSlotId]: mountedSlot,
         },
         ["layout:/", "layout:/feed"],
         [modalSlotBinding],
@@ -6391,7 +7048,13 @@ describe("app browser entry previousNextUrl helpers", () => {
 
     const nextState = await applyApprovedTestCommit(state, {
       extraEntries: {
+        [APP_BFCACHE_SEGMENT_IDENTITIES_KEY]: {
+          ...currentIdentities,
+          [modalSlotId]: "identity:modal:unmatched",
+          "page:/feed/comments": "identity:page:/feed/comments",
+        },
         "page:/feed/comments": React.createElement("main", null, "comments"),
+        [modalSlotId]: UNMATCHED_SLOT,
       },
       layoutIds: ["layout:/", "layout:/feed", "layout:/feed/comments"],
       rootLayoutTreePath: "/",
@@ -6399,14 +7062,83 @@ describe("app browser entry previousNextUrl helpers", () => {
       slotBindings: [
         {
           ownerLayoutId: "layout:/feed",
-          slotId: "slot:modal:/feed",
+          slotId: modalSlotId,
           state: "unmatched",
         },
       ],
     });
 
-    expect(nextState.elements["slot:modal:/feed"]).toBe(mountedSlot);
+    expect(nextState.elements[modalSlotId]).toBe(mountedSlot);
+    expect(
+      AppElementsWire.readMetadata(nextState.elements).bfcacheSegmentIdentities[modalSlotId],
+    ).toBe("identity:modal:active");
+    expect(nextState.bfcacheIds[modalSlotId]).toBe("_b_5_");
     expect(nextState.slotBindings).toEqual([modalSlotBinding]);
+  });
+
+  it("remints a preserved slot when its previous payload had no identity proof", async () => {
+    const modalSlotId = "slot:modal:/feed";
+    const mountedSlot = React.createElement("div", null, "modal");
+    const layoutIdentities = {
+      "layout:/": "identity:layout:/",
+      "layout:/feed": "identity:layout:/feed",
+    };
+    const modalSlotBinding = {
+      ownerLayoutId: "layout:/feed",
+      slotId: modalSlotId,
+      state: "active",
+    } satisfies AppElementsSlotBinding;
+    const state = createState({
+      bfcacheIds: {
+        "layout:/": "0",
+        "layout:/feed": "_b_4_",
+        [modalSlotId]: "_b_5_",
+      },
+      elements: createResolvedElements(
+        "route:/feed",
+        "/",
+        null,
+        {
+          [APP_BFCACHE_SEGMENT_IDENTITIES_KEY]: layoutIdentities,
+          "layout:/": React.createElement("div", null, "root layout"),
+          "layout:/feed": React.createElement("div", null, "feed layout"),
+          [modalSlotId]: mountedSlot,
+        },
+        ["layout:/", "layout:/feed"],
+        [modalSlotBinding],
+      ),
+      layoutIds: ["layout:/", "layout:/feed"],
+      slotBindings: [modalSlotBinding],
+    });
+
+    const nextState = await applyApprovedTestCommit(state, {
+      extraEntries: {
+        [APP_BFCACHE_SEGMENT_IDENTITIES_KEY]: {
+          ...layoutIdentities,
+          [modalSlotId]: "identity:modal:unmatched",
+          "page:/feed/comments": "identity:page:/feed/comments",
+        },
+        "page:/feed/comments": React.createElement("main", null, "comments"),
+        [modalSlotId]: UNMATCHED_SLOT,
+      },
+      layoutIds: ["layout:/", "layout:/feed", "layout:/feed/comments"],
+      rootLayoutTreePath: "/",
+      routeId: "route:/feed/comments",
+      slotBindings: [
+        {
+          ownerLayoutId: "layout:/feed",
+          slotId: modalSlotId,
+          state: "unmatched",
+        },
+      ],
+    });
+
+    expect(nextState.elements[modalSlotId]).toBe(mountedSlot);
+    expect(
+      AppElementsWire.readMetadata(nextState.elements).bfcacheSegmentIdentities[modalSlotId],
+    ).toBeUndefined();
+    expect(nextState.bfcacheIds[modalSlotId]).toMatch(/^_b_\d+_$/);
+    expect(nextState.bfcacheIds[modalSlotId]).not.toBe("_b_5_");
   });
 
   it("does not infer default slot preservation from previous wire entries", async () => {
@@ -6486,15 +7218,38 @@ describe("app browser entry bfcacheId helpers", () => {
   const nestedGroupLayoutId = AppElementsWire.encodeLayoutId(
     "/nextjs-compat/use-router-bfcache-id/[group]",
   );
-  const catchAllLayoutId = AppElementsWire.encodeLayoutId("/docs/[...slug]");
-  const optionalCatchAllTemplateId = AppElementsWire.encodeTemplateId("/docs/[[...slug]]");
   const pageX1Id = AppElementsWire.encodePageId("/x/1", null);
   const pageX2Id = AppElementsWire.encodePageId("/x/2", null);
   const pageY1Id = AppElementsWire.encodePageId("/y/1", null);
-  const docsCatchAllPageId = AppElementsWire.encodePageId("/docs/[...slug]", null);
-  const docsOptionalCatchAllPageId = AppElementsWire.encodePageId("/docs/[[...slug]]", null);
 
-  function createBfcacheElements(pageId: string): AppElements {
+  function createDefaultBfcacheSegmentIdentities(pageId: string): Record<string, string> {
+    return {
+      [rootLayoutId]: `identity:${rootLayoutId}`,
+      [groupLayoutId]: `identity:${groupLayoutId}`,
+      [pageId]: `identity:${pageId}`,
+    };
+  }
+
+  function createBfcacheElements(
+    pageId: string,
+    options: {
+      graphVersion?: string | null;
+      bfcacheSegmentIdentities?: Record<string, string> | null;
+    } = {},
+  ): AppElements {
+    const extraEntries: Record<string, unknown> = {};
+    if (options.bfcacheSegmentIdentities !== null) {
+      extraEntries[APP_BFCACHE_SEGMENT_IDENTITIES_KEY] =
+        options.bfcacheSegmentIdentities ?? createDefaultBfcacheSegmentIdentities(pageId);
+    } else {
+      extraEntries[APP_BFCACHE_SEGMENT_IDENTITIES_KEY] = undefined;
+    }
+    if (options.graphVersion !== undefined) {
+      extraEntries[APP_ARTIFACT_COMPATIBILITY_KEY] = createArtifactCompatibilityEnvelope({
+        graphVersion: options.graphVersion,
+      });
+    }
+
     return createResolvedElements(
       `route:${pageId.slice("page:".length)}`,
       "/",
@@ -6503,6 +7258,7 @@ describe("app browser entry bfcacheId helpers", () => {
         [rootLayoutId]: React.createElement("div", null),
         [groupLayoutId]: React.createElement("div", null),
         [pageId]: React.createElement("main", null),
+        ...extraEntries,
       },
       [rootLayoutId, groupLayoutId],
     );
@@ -6522,14 +7278,12 @@ describe("app browser entry bfcacheId helpers", () => {
     const maps = createInitialBfcacheMaps({
       elements,
       metadata,
-      pathname: "/x/1",
     });
 
     expect(maps.bfcacheIds).toEqual(createInitialBfcacheIdMap(elements));
-    expect(maps.stateKeys).toEqual(
-      createBfcacheSegmentStateKeyMap({
+    expect(maps.identities).toEqual(
+      createBfcacheSegmentIdentityMap({
         elements,
-        pathname: "/x/1",
       }),
     );
   });
@@ -6545,7 +7299,6 @@ describe("app browser entry bfcacheId helpers", () => {
     const maps = createInitialBfcacheMaps({
       elements,
       metadata,
-      pathname: "/x/1",
     });
     const state = createHistoryStateWithNavigationMetadata(null, {
       bfcacheIds: maps.bfcacheIds,
@@ -6560,73 +7313,116 @@ describe("app browser entry bfcacheId helpers", () => {
     expect(readHistoryStateBfcacheIds(state)).toEqual(maps.bfcacheIds);
   });
 
-  it("derives page segment state keys from pathname, not history bfcache ids", () => {
+  it("preserves segment ids when carried BFCache identities match", () => {
     const dynamicPageId = AppElementsWire.encodePageId("/page/[n]", null);
-    const pageOneKeys = createBfcacheSegmentStateKeyMap({
-      elements: createBfcacheElements(dynamicPageId),
-      pathname: "/page/1",
-    });
-    const pageTwoKeys = createBfcacheSegmentStateKeyMap({
-      elements: createBfcacheElements(dynamicPageId),
-      pathname: "/page/2",
-    });
-
-    expect(pageOneKeys[dynamicPageId]).toBe(`${dynamicPageId}@/page/1`);
-    expect(pageTwoKeys[dynamicPageId]).toBe(`${dynamicPageId}@/page/2`);
-    expect(pageOneKeys[dynamicPageId]).not.toBe(pageTwoKeys[dynamicPageId]);
-  });
-
-  it("preserves encoded path delimiters when deriving segment state keys", () => {
-    const pageId = AppElementsWire.encodePageId("/files/[...slug]", null);
-    const encodedKeys = createBfcacheSegmentStateKeyMap({
-      elements: createBfcacheElements(pageId),
-      pathname: "/files/a%2Fb",
-    });
-    const nestedKeys = createBfcacheSegmentStateKeyMap({
-      elements: createBfcacheElements(pageId),
-      pathname: "/files/a/b",
-    });
-
-    expect(encodedKeys[pageId]).toBe(`${pageId}@/files/a%2Fb`);
-    expect(nestedKeys[pageId]).toBe(`${pageId}@/files/a/b`);
-    expect(encodedKeys[pageId]).not.toBe(nestedKeys[pageId]);
-  });
-
-  it("uses route-safe pathname normalization when preserving bfcache ids", () => {
-    const pageId = AppElementsWire.encodePageId("/files/[...slug]", null);
-    const current = {
-      [rootLayoutId]: "0",
-      [groupLayoutId]: "_b_4_",
-      [pageId]: "_b_5_",
+    const bfcacheSegmentIdentities = {
+      [rootLayoutId]: "identity:root:page-1",
+      [groupLayoutId]: "identity:group:page-1",
+      [dynamicPageId]: "identity:page-1",
     };
-
-    const equivalentEncoding = createNextBfcacheIdMap({
-      current,
-      currentElements: createBfcacheElements(pageId),
-      currentPathname: "/files/%61",
-      elements: createBfcacheElements(pageId),
-      nextPathname: "/files/a",
-    });
-    const encodedDelimiter = createNextBfcacheIdMap({
-      current,
-      currentElements: createBfcacheElements(pageId),
-      currentPathname: "/files/a%2Fb",
-      elements: createBfcacheElements(pageId),
-      nextPathname: "/files/a/b",
+    const next = createNextBfcacheIdMap({
+      current: {
+        [rootLayoutId]: "0",
+        [groupLayoutId]: "_b_4_",
+        [dynamicPageId]: "_b_5_",
+      },
+      currentElements: createBfcacheElements(dynamicPageId, { bfcacheSegmentIdentities }),
+      elements: createBfcacheElements(dynamicPageId, { bfcacheSegmentIdentities }),
     });
 
-    expect(equivalentEncoding[pageId]).toBe("_b_5_");
-    expect(encodedDelimiter[pageId]).not.toBe("_b_5_");
+    expect(next[dynamicPageId]).toBe("_b_5_");
   });
 
-  it("falls back to raw pathname for malformed encoded state-key paths", () => {
+  it("mints fresh segment ids when carried BFCache identities are absent", () => {
     const dynamicPageId = AppElementsWire.encodePageId("/page/[n]", null);
-    const keys = createBfcacheSegmentStateKeyMap({
-      elements: createBfcacheElements(dynamicPageId),
-      pathname: "/page/%",
+    const next = createNextBfcacheIdMap({
+      current: {
+        [rootLayoutId]: "0",
+        [groupLayoutId]: "_b_4_",
+        [dynamicPageId]: "_b_5_",
+      },
+      currentElements: createBfcacheElements(dynamicPageId, { bfcacheSegmentIdentities: null }),
+      elements: createBfcacheElements(dynamicPageId, { bfcacheSegmentIdentities: null }),
     });
 
-    expect(keys[dynamicPageId]).toBe(`${dynamicPageId}@/page/%`);
+    expect(next[rootLayoutId]).toMatch(/^_b_\d+_$/);
+    expect(next[rootLayoutId]).not.toBe("0");
+    expect(next[groupLayoutId]).toMatch(/^_b_\d+_$/);
+    expect(next[groupLayoutId]).not.toBe("_b_4_");
+    expect(next[dynamicPageId]).toMatch(/^_b_\d+_$/);
+    expect(next[dynamicPageId]).not.toBe("_b_5_");
+  });
+
+  it("does not restore history ids without destination identity proof", () => {
+    const dynamicPageId = AppElementsWire.encodePageId("/page/[n]", null);
+    const next = createNextBfcacheIdMap({
+      current: { [dynamicPageId]: "_b_5_" },
+      currentElements: createBfcacheElements(dynamicPageId),
+      elements: createBfcacheElements(dynamicPageId, { bfcacheSegmentIdentities: null }),
+      restored: { [dynamicPageId]: "_b_9_" },
+    });
+
+    expect(next[dynamicPageId]).toMatch(/^_b_\d+_$/);
+    expect(next[dynamicPageId]).not.toBe("_b_9_");
+  });
+
+  it("mints a fresh segment id when a carried BFCache identity changes", () => {
+    const dynamicPageId = AppElementsWire.encodePageId("/page/[n]", null);
+    const currentIdentities = {
+      [rootLayoutId]: "identity:root:page-1",
+      [groupLayoutId]: "identity:group:page-1",
+      [dynamicPageId]: "identity:page-1",
+    };
+    const nextIdentities = {
+      [rootLayoutId]: "identity:root:page-1",
+      [groupLayoutId]: "identity:group:page-1",
+      [dynamicPageId]: "identity:page-2",
+    };
+    const next = createNextBfcacheIdMap({
+      current: {
+        [rootLayoutId]: "0",
+        [groupLayoutId]: "_b_4_",
+        [dynamicPageId]: "_b_5_",
+      },
+      currentElements: createBfcacheElements(dynamicPageId, {
+        bfcacheSegmentIdentities: currentIdentities,
+      }),
+      elements: createBfcacheElements(dynamicPageId, {
+        bfcacheSegmentIdentities: nextIdentities,
+      }),
+    });
+
+    expect(next[groupLayoutId]).toBe("_b_4_");
+    expect(next[dynamicPageId]).toMatch(/^_b_\d+_$/);
+    expect(next[dynamicPageId]).not.toBe("_b_5_");
+  });
+
+  it("preserves segment ids when only unrelated artifact metadata changes", () => {
+    const dynamicPageId = AppElementsWire.encodePageId("/page/[n]", null);
+    const bfcacheSegmentIdentities = {
+      [rootLayoutId]: "identity:root:page-1",
+      [groupLayoutId]: "identity:group:page-1",
+      [dynamicPageId]: "identity:page-1",
+    };
+    const next = createNextBfcacheIdMap({
+      current: {
+        [rootLayoutId]: "0",
+        [groupLayoutId]: "_b_4_",
+        [dynamicPageId]: "_b_5_",
+      },
+      currentElements: createBfcacheElements(dynamicPageId, {
+        graphVersion: "graph:one",
+        bfcacheSegmentIdentities,
+      }),
+      elements: createBfcacheElements(dynamicPageId, {
+        graphVersion: "graph:two",
+        bfcacheSegmentIdentities,
+      }),
+    });
+
+    expect(next[rootLayoutId]).toBe("0");
+    expect(next[groupLayoutId]).toBe("_b_4_");
+    expect(next[dynamicPageId]).toBe("_b_5_");
   });
 
   it("does not seed hydration bfcache ids from previously minted ids", () => {
@@ -6646,9 +7442,7 @@ describe("app browser entry bfcacheId helpers", () => {
         [pageX2Id]: "_b_5_",
       },
       currentElements: createBfcacheElements(pageX2Id),
-      currentPathname: "/x/2",
       elements: createBfcacheElements(pageX1Id),
-      nextPathname: "/x/1",
     });
     expect(minted[pageX1Id]).toMatch(/^_b_\d+_$/);
 
@@ -6672,9 +7466,7 @@ describe("app browser entry bfcacheId helpers", () => {
     const next = createNextBfcacheIdMap({
       current,
       currentElements: createBfcacheElements(pageX1Id),
-      currentPathname: "/x/1",
       elements: createBfcacheElements(pageX2Id),
-      nextPathname: "/x/2",
     });
 
     expect(next[rootLayoutId]).toBe("0");
@@ -6684,7 +7476,7 @@ describe("app browser entry bfcacheId helpers", () => {
     expect(next[pageX2Id]).not.toBe("_b_5_");
   });
 
-  it("mints a fresh layout id when a dynamic layout segment changes", () => {
+  it("mints a fresh layout id when its carried identity changes", () => {
     const current = {
       [rootLayoutId]: "0",
       [groupLayoutId]: "_b_4_",
@@ -6693,10 +7485,20 @@ describe("app browser entry bfcacheId helpers", () => {
 
     const next = createNextBfcacheIdMap({
       current,
-      currentElements: createBfcacheElements(pageX1Id),
-      currentPathname: "/x/1",
-      elements: createBfcacheElements(pageY1Id),
-      nextPathname: "/y/1",
+      currentElements: createBfcacheElements(pageX1Id, {
+        bfcacheSegmentIdentities: {
+          [rootLayoutId]: "identity:root",
+          [groupLayoutId]: "identity:group:x",
+          [pageX1Id]: "identity:page:x",
+        },
+      }),
+      elements: createBfcacheElements(pageY1Id, {
+        bfcacheSegmentIdentities: {
+          [rootLayoutId]: "identity:root",
+          [groupLayoutId]: "identity:group:y",
+          [pageY1Id]: "identity:page:y",
+        },
+      }),
     });
 
     expect(next[rootLayoutId]).toBe("0");
@@ -6719,202 +7521,32 @@ describe("app browser entry bfcacheId helpers", () => {
         null,
         {
           [pageX1Id]: React.createElement("main", null),
+          [APP_BFCACHE_SEGMENT_IDENTITIES_KEY]: {
+            [rootLayoutId]: "identity:root:x",
+            [nestedGroupLayoutId]: "identity:nested-layout:x",
+            [pageX1Id]: "identity:page:x",
+          },
         },
         [rootLayoutId, nestedGroupLayoutId],
       ),
-      currentPathname: "/nextjs-compat/use-router-bfcache-id/x/1",
       elements: createResolvedElements(
         "route:/nextjs-compat/use-router-bfcache-id/y/1",
         "/",
         null,
         {
           [pageY1Id]: React.createElement("main", null),
+          [APP_BFCACHE_SEGMENT_IDENTITIES_KEY]: {
+            [rootLayoutId]: "identity:root:y",
+            [nestedGroupLayoutId]: "identity:nested-layout:y",
+            [pageY1Id]: "identity:page:y",
+          },
         },
         [rootLayoutId, nestedGroupLayoutId],
       ),
-      nextPathname: "/nextjs-compat/use-router-bfcache-id/y/1",
     });
 
     expect(next[nestedGroupLayoutId]).toMatch(/^_b_\d+_$/);
     expect(next[nestedGroupLayoutId]).not.toBe("0");
-  });
-
-  it("preserves a parallel-slot layout id when its visible URL prefix is unchanged", () => {
-    // Regression: a layout nested under a parallel slot has a tree path that
-    // contains an invisible "@slot" segment before its visible URL segments
-    // (e.g. app/feed/@modal/photos/layout.tsx -> "/feed/@modal/photos", which
-    // maps to the URL prefix "/feed/photos"). Deriving the identity prefix must
-    // skip the "@modal" segment; otherwise it over-counts consumed pathname
-    // segments and re-mints the layout id on every navigation that keeps the
-    // layout mounted (a divergence from Next.js bfcacheId semantics).
-    const modalPhotosLayoutId = AppElementsWire.encodeLayoutId("/feed/@modal/photos");
-    const photo1Id = AppElementsWire.encodePageId("/feed/photos/1", null);
-    const photo2Id = AppElementsWire.encodePageId("/feed/photos/2", null);
-
-    const next = createNextBfcacheIdMap({
-      current: {
-        [rootLayoutId]: "0",
-        [modalPhotosLayoutId]: "_b_4_",
-        [photo1Id]: "_b_5_",
-      },
-      currentElements: createResolvedElements(
-        "route:/feed/@modal/photos/[id]",
-        "/",
-        null,
-        {
-          [modalPhotosLayoutId]: React.createElement("div", null),
-          [photo1Id]: React.createElement("main", null),
-        },
-        [rootLayoutId, modalPhotosLayoutId],
-      ),
-      currentPathname: "/feed/photos/1",
-      elements: createResolvedElements(
-        "route:/feed/@modal/photos/[id]",
-        "/",
-        null,
-        {
-          [modalPhotosLayoutId]: React.createElement("div", null),
-          [photo2Id]: React.createElement("main", null),
-        },
-        [rootLayoutId, modalPhotosLayoutId],
-      ),
-      nextPathname: "/feed/photos/2",
-    });
-
-    // The layout persists across the navigation, so its id must be preserved.
-    expect(next[modalPhotosLayoutId]).toBe("_b_4_");
-    // The leaf page changes, so it mints a fresh id (sanity check).
-    expect(next[photo2Id]).toMatch(/^_b_\d+_$/);
-    expect(next[photo2Id]).not.toBe("_b_5_");
-  });
-
-  it("mints a fresh layout id when a catch-all segment value changes", () => {
-    const current = {
-      [rootLayoutId]: "0",
-      [catchAllLayoutId]: "_b_4_",
-      [docsCatchAllPageId]: "_b_5_",
-    };
-
-    const next = createNextBfcacheIdMap({
-      current,
-      currentElements: createResolvedElements(
-        "route:/docs/[...slug]",
-        "/",
-        null,
-        {
-          [catchAllLayoutId]: React.createElement("div", null),
-          [docsCatchAllPageId]: React.createElement("main", null),
-        },
-        [rootLayoutId, catchAllLayoutId],
-      ),
-      currentPathname: "/docs/a/b",
-      elements: createResolvedElements(
-        "route:/docs/[...slug]",
-        "/",
-        null,
-        {
-          [catchAllLayoutId]: React.createElement("div", null),
-          [docsCatchAllPageId]: React.createElement("main", null),
-        },
-        [rootLayoutId, catchAllLayoutId],
-      ),
-      nextPathname: "/docs/a/c",
-    });
-
-    expect(next[rootLayoutId]).toBe("0");
-    expect(next[catchAllLayoutId]).toMatch(/^_b_\d+_$/);
-    expect(next[catchAllLayoutId]).not.toBe("_b_4_");
-  });
-
-  it("mints a fresh template id when an optional catch-all segment value changes", () => {
-    const current = {
-      [rootLayoutId]: "0",
-      [optionalCatchAllTemplateId]: "_b_8_",
-      [docsOptionalCatchAllPageId]: "_b_9_",
-    };
-
-    const next = createNextBfcacheIdMap({
-      current,
-      currentElements: createResolvedElements(
-        "route:/docs/[[...slug]]",
-        "/",
-        null,
-        {
-          [optionalCatchAllTemplateId]: React.createElement("div", null),
-          [docsOptionalCatchAllPageId]: React.createElement("main", null),
-        },
-        [rootLayoutId],
-      ),
-      currentPathname: "/docs/a/b",
-      elements: createResolvedElements(
-        "route:/docs/[[...slug]]",
-        "/",
-        null,
-        {
-          [optionalCatchAllTemplateId]: React.createElement("div", null),
-          [docsOptionalCatchAllPageId]: React.createElement("main", null),
-        },
-        [rootLayoutId],
-      ),
-      nextPathname: "/docs/a/c",
-    });
-
-    expect(next[rootLayoutId]).toBe("0");
-    expect(next[optionalCatchAllTemplateId]).toMatch(/^_b_\d+_$/);
-    expect(next[optionalCatchAllTemplateId]).not.toBe("_b_8_");
-  });
-
-  it("mints a fresh intercepted slot id when the active slot target changes", () => {
-    const feedLayoutId = AppElementsWire.encodeLayoutId("/feed");
-    const modalSlotId = AppElementsWire.encodeSlotId("modal", "/feed");
-    const modalSlotBinding = {
-      ownerLayoutId: feedLayoutId,
-      slotId: modalSlotId,
-      state: "active",
-    } satisfies AppElementsSlotBinding;
-    const currentElements = createResolvedElements(
-      "route:/photos/42",
-      "/",
-      "/feed",
-      {
-        [rootLayoutId]: React.createElement("div", null),
-        [feedLayoutId]: React.createElement("div", null),
-        [modalSlotId]: React.createElement("aside", null),
-      },
-      [rootLayoutId, feedLayoutId],
-      [modalSlotBinding],
-      createInterceptionProof("/feed", "/photos/42", modalSlotId),
-    );
-    const nextElements = createResolvedElements(
-      "route:/photos/43",
-      "/",
-      "/feed",
-      {
-        [rootLayoutId]: React.createElement("div", null),
-        [feedLayoutId]: React.createElement("div", null),
-        [modalSlotId]: React.createElement("aside", null),
-      },
-      [rootLayoutId, feedLayoutId],
-      [modalSlotBinding],
-      createInterceptionProof("/feed", "/photos/43", modalSlotId),
-    );
-
-    const next = createNextBfcacheIdMap({
-      current: {
-        [rootLayoutId]: "0",
-        [feedLayoutId]: "_b_4_",
-        [modalSlotId]: "_b_5_",
-      },
-      currentElements,
-      currentPathname: "/photos/42",
-      elements: nextElements,
-      nextPathname: "/photos/43",
-    });
-
-    expect(next[rootLayoutId]).toBe("0");
-    expect(next[feedLayoutId]).toBe("_b_4_");
-    expect(next[modalSlotId]).toMatch(/^_b_\d+_$/);
-    expect(next[modalSlotId]).not.toBe("_b_5_");
   });
 
   it("serializes and restores bfcache ids through history state", () => {
@@ -7268,7 +7900,15 @@ describe("app browser entry bfcacheId helpers", () => {
     const pending = await createPendingNavigationCommit({
       payloadOrigin: FRESH_APP_NAVIGATION_PAYLOAD_ORIGIN,
       currentState,
-      nextElements: Promise.resolve(createBfcacheElements(pageY1Id)),
+      nextElements: Promise.resolve(
+        createBfcacheElements(pageY1Id, {
+          bfcacheSegmentIdentities: {
+            [rootLayoutId]: `identity:${rootLayoutId}`,
+            [groupLayoutId]: "identity:group:y",
+            [pageY1Id]: "identity:page:y",
+          },
+        }),
+      ),
       navigationSnapshot: createClientNavigationRenderSnapshot("https://example.com/y/1", {}),
       operationLane: "navigation",
       renderId: 1,
@@ -7288,9 +7928,7 @@ describe("app browser entry bfcacheId helpers", () => {
     const next = createNextBfcacheIdMap({
       current: createInitialBfcacheIdMap(createBfcacheElements(pageX1Id)),
       currentElements: createBfcacheElements(pageX1Id),
-      currentPathname: "/x/1",
       elements: createBfcacheElements(pageX2Id),
-      nextPathname: "/x/2",
       restored: {
         [pageX1Id]: "_b_900000_",
       },
@@ -7302,6 +7940,51 @@ describe("app browser entry bfcacheId helpers", () => {
 });
 
 describe("createPopstateRestoreHandler", () => {
+  it("commits copied external entries without navigation while they share the visible tree", () => {
+    expect(
+      shouldCommitPopstateUrlWithoutNavigation({
+        historyState: {
+          __vinext_externalHistoryState: true,
+          __vinext_historyIndex: 4,
+        },
+        isCurrentExternalHistoryTree: true,
+        isSameAppRouteTarget: false,
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldCommitPopstateUrlWithoutNavigation({
+        historyState: {
+          __vinext_externalHistoryState: true,
+          __vinext_historyIndex: 4,
+        },
+        isCurrentExternalHistoryTree: false,
+        isSameAppRouteTarget: false,
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldCommitPopstateUrlWithoutNavigation({
+        historyState: {
+          __vinext_externalHistoryState: true,
+          __vinext_historyIndex: 4,
+        },
+        isCurrentExternalHistoryTree: false,
+        isSameAppRouteTarget: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps same-route hash traversals on the no-navigation path", () => {
+    expect(
+      shouldCommitPopstateUrlWithoutNavigation({
+        historyState: { __vinext_historyIndex: 4 },
+        isCurrentExternalHistoryTree: false,
+        isSameAppRouteTarget: true,
+      }),
+    ).toBe(true);
+  });
+
   it("guards synchronous popstate scroll retry to the active navigation", () => {
     const scrollState = { __vinext_scrollY: 10 };
     let activeNavigationId = 3;
@@ -8460,6 +9143,8 @@ describe("app navigation failure handling", () => {
 });
 
 describe("prodOnCaughtError (hydrateRoot prod handler)", () => {
+  const prodOnCaughtError = createProdOnCaughtError(() => {});
+
   it("ignores redirect sentinels handled by RedirectBoundary", () => {
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
