@@ -62,7 +62,11 @@ import {
 } from "./app-rsc-cache-busting.js";
 import { applyAppRscConfigHeaders, finalizeAppRscResponse } from "./app-rsc-response-finalizer.js";
 import { normalizeRscRequest } from "./app-rsc-request-normalization.js";
-import { buildNextDataNotFoundResponse, normalizePagesDataRequest } from "./pages-data-route.js";
+import {
+  buildNextDataNotFoundResponse,
+  isNextDataPathname,
+  normalizePagesDataRequest,
+} from "./pages-data-route.js";
 import { normalizeDefaultLocalePathname } from "./pages-i18n.js";
 import { badRequestResponse, notFoundResponse } from "./http-error-responses.js";
 import { isOnDemandRevalidateRequest, PRERENDER_REVALIDATE_HEADER } from "./isr-cache.js";
@@ -86,6 +90,8 @@ import type { ClientReuseManifestParseResult } from "./client-reuse-manifest.js"
 import { applyCdnResponseHeaders, NEVER_CACHE_CONTROL } from "./cache-control.js";
 import {
   bufferRequestBodyForHeaderClone,
+  cancelRequestBody,
+  cloneRequestIfBodyReadable,
   cloneRequestWithHeaders,
   cloneRequestWithUrl,
   filterInternalHeaders,
@@ -794,8 +800,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   // Branch the exact downstream body owner before creating URL aliases. URL
   // reconstruction shares a stream; cloning an alias would lock the body still
   // referenced by `request` and break the subsequent action/route-handler read.
-  const isolatedMiddlewareSource =
-    runMiddleware && request.body && !request.bodyUsed ? request.clone() : null;
+  const isolatedMiddlewareSource = runMiddleware ? cloneRequestIfBodyReadable(request) : null;
 
   // Keep cache-busting validation on the real request above, then hide the
   // internal `_rsc` transport query from userland middleware and post-middleware
@@ -819,10 +824,14 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       request: userlandRequest,
       validateExternalRewriteRequest: () => validateClaimedOutsideBasePathRsc(true),
     });
+    // applyAppMiddleware clones again to strip Flight headers. Release the
+    // App Router isolation tee so cancelled action streams can abort.
+    if (isolatedMiddlewareRequest) cancelRequestBody(isolatedMiddlewareRequest);
+    if (isolatedMiddlewareSource && isolatedMiddlewareSource !== isolatedMiddlewareRequest) {
+      cancelRequestBody(isolatedMiddlewareSource);
+    }
     if (middlewareResult.kind === "response") {
-      if (request.body && !request.body.locked) {
-        void request.body.cancel().catch(() => {});
-      }
+      cancelRequestBody(request);
       return applyConfigHeadersToMiddlewareRedirect(middlewareResult.response, {
         basePathState,
         configHeaders: options.configHeaders,
@@ -1098,8 +1107,10 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     // Clone before rebuilding the URL so runtimes that transfer Request bodies
     // cannot disturb the original Server Action branch. Release the temporary
     // clone when reconstruction leaves it readable.
-    const sourceRequest = userlandRequest.body ? userlandRequest.clone() : userlandRequest;
-    const sourceMiddlewareRequest = cloneRequestWithUrl(sourceRequest, sourceUrl.href);
+    const sourceRequest = cloneRequestIfBodyReadable(userlandRequest) ?? userlandRequest;
+    const sourceMiddlewareRequest = cloneRequestWithUrl(sourceRequest, sourceUrl.href, {
+      transferBody: sourceRequest !== userlandRequest,
+    });
     // Hybrid dev attaches the target route's middleware result so the RSC
     // entry does not execute it twice. This is a distinct source route and
     // must run middleware itself rather than replaying the target's decision.
@@ -1156,23 +1167,9 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       // Release every temporary branch owned by source authorization. Some
       // runtimes transfer sourceRequest into sourceMiddlewareRequest; the
       // body-state checks make the cleanup safe in both transfer and tee cases.
-      if (
-        sourceMiddlewareRequest.body &&
-        !sourceMiddlewareRequest.bodyUsed &&
-        !sourceMiddlewareRequest.body.locked
-      ) {
-        // Cancellation marks this throwaway branch as released immediately,
-        // but its promise may not settle until another tee branch finishes.
-        // Do not delay Server Action dispatch on a streaming request body.
-        void sourceMiddlewareRequest.body.cancel().catch(() => {});
-      }
-      if (
-        sourceRequest !== userlandRequest &&
-        sourceRequest.body &&
-        !sourceRequest.bodyUsed &&
-        !sourceRequest.body.locked
-      ) {
-        void sourceRequest.body.cancel().catch(() => {});
+      cancelRequestBody(sourceMiddlewareRequest);
+      if (sourceRequest !== userlandRequest) {
+        cancelRequestBody(sourceRequest);
       }
     }
     if (sourceMiddlewareResult.kind === "response") {
@@ -1313,20 +1310,20 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   let sourceConfigHeaders: Headers | null = null;
   if (filesystemRouteEligible && isPostRequest && actionId && options.handleServerActionRequest) {
     sourceConfigHeaders = new Headers();
-    const sourceConfigUrl = new URL(request.url);
-    sourceConfigUrl.pathname = hadBasePath
-      ? addBasePathToPathname(requestCleanPathname, options.basePath)
-      : requestCleanPathname;
-    await applyAppRscConfigHeaders(
-      sourceConfigHeaders,
-      cloneRequestWithUrl(request, sourceConfigUrl.toString()),
-      {
+    if (options.configHeaders.length > 0) {
+      const sourceConfigUrl = new URL(request.url);
+      sourceConfigUrl.pathname = hadBasePath
+        ? addBasePathToPathname(requestCleanPathname, options.basePath)
+        : requestCleanPathname;
+      const sourceConfigRequest = cloneRequestWithUrl(request, sourceConfigUrl.toString());
+      await applyAppRscConfigHeaders(sourceConfigHeaders, sourceConfigRequest, {
         basePath: options.basePath,
         configHeaders: options.configHeaders,
         i18nConfig: options.i18nConfig,
         requestContext: preMiddlewareRequestContext,
-      },
-    );
+      });
+      cancelRequestBody(sourceConfigRequest);
+    }
   }
   const serverActionResponse =
     filesystemRouteEligible && isPostRequest && actionId && options.handleServerActionRequest
@@ -1756,7 +1753,7 @@ export function createAppRscHandler<TRoute extends AppRscHandlerRoute>(
       return pagesDataUrl.pathname === current.pathname && pagesDataUrl.search === current.search;
     })();
     const pagesDataCandidate = pagesDataInScope
-      ? pagesDataUrlUnchanged
+      ? pagesDataUrlUnchanged || !isNextDataPathname(pagesDataUrl.pathname)
         ? rawRequest
         : cloneRequestWithUrl(rawRequest, pagesDataUrl.toString())
       : null;
@@ -1818,6 +1815,12 @@ export function createAppRscHandler<TRoute extends AppRscHandlerRoute>(
     const pagesDataRequest = pagesDataNormalization?.isDataReq
       ? cloneRequestWithHeaders(pagesDataCandidate!, filteredHeaders)
       : null;
+    // cloneRequestWithHeaders tees when a body is present. The filtered
+    // `request` owns the downstream branch; release the source so cancelled
+    // Server Action streams can actually abort the producer.
+    if (request !== appRequest && !isPagesDataRequest) {
+      cancelRequestBody(appRequest);
+    }
 
     const headersContext = headersContextFromRequest(request, {
       draftModeSecret: options.draftModeSecret,

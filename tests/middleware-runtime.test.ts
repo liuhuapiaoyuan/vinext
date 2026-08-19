@@ -736,6 +736,26 @@ describe("middleware nextUrl basePath", () => {
     await expect(request.text()).resolves.toBe("action-body");
   });
 
+  it("transfers an already-isolated body when restoring basePath", async () => {
+    const { module } = captureModule();
+    const request = new Request("http://localhost:3000/action", {
+      body: "isolated-body",
+      method: "POST",
+    });
+
+    await executeMiddleware({
+      basePath: "/app",
+      hadBasePath: true,
+      isProxy: false,
+      module,
+      normalizedPathname: "/action",
+      request,
+      requestBodyAlreadyIsolated: true,
+    });
+
+    await expect(request.text()).rejects.toThrow();
+  });
+
   it("keeps basePath active for Pages flow requests whose URL carries the prefix", async () => {
     const { captured, module } = captureModule();
 

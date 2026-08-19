@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vite-plus/test";
 import {
   bufferRequestBodyForHeaderClone,
+  cancelRequestBody,
   canonicalizeRequestPathname,
   canonicalizeRequestUrlPathname,
   cloneRequestWithHeaders,
@@ -1224,6 +1225,89 @@ describe("bufferRequestBodyForHeaderClone", () => {
 
     expect(buffered).not.toBe(original);
     expect(await buffered.text()).toBe('{"via":"node"}');
+  });
+
+  it("does not await unbounded streams that lack Content-Length", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("partial"));
+      },
+    });
+    const original = new Request("http://localhost/action", {
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body,
+      // @ts-expect-error — duplex needed for streaming request bodies
+      duplex: "half",
+    });
+
+    const buffered = await Promise.race([
+      bufferRequestBodyForHeaderClone(original),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 200)),
+    ]);
+
+    expect(buffered).toBe(original);
+  });
+
+  it("keeps a completing stream without Content-Length readable across header clones", async () => {
+    const payload = "chunked-json";
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(payload));
+        controller.close();
+      },
+    });
+    const original = new Request("http://localhost/action", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+      // @ts-expect-error — duplex needed for streaming request bodies
+      duplex: "half",
+    });
+
+    const buffered = await bufferRequestBodyForHeaderClone(original);
+    const cloned = cloneRequestWithHeaders(buffered, new Headers(buffered.headers));
+    expect(await cloned.text()).toBe(payload);
+  });
+});
+
+describe("cancelRequestBody", () => {
+  it("does not throw when the body getter throws", () => {
+    const original = new Request("http://localhost/action", {
+      method: "POST",
+      body: "keep",
+    });
+    Object.defineProperty(original, "body", {
+      configurable: true,
+      get() {
+        throw new TypeError("Response body object should not be disturbed or locked");
+      },
+    });
+
+    expect(() => cancelRequestBody(original)).not.toThrow();
+  });
+
+  it("cancels a readable body stream", async () => {
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("x"));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const request = new Request("http://localhost/action", {
+      method: "POST",
+      body,
+      // @ts-expect-error — duplex needed for streaming request bodies
+      duplex: "half",
+    });
+
+    cancelRequestBody(request);
+    await vi.waitFor(() => {
+      expect(cancelled).toBe(true);
+    });
   });
 });
 

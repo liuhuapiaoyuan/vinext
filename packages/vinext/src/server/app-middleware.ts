@@ -10,7 +10,13 @@ import {
   type MiddlewareModule,
   type MiddlewareResult,
 } from "./middleware-runtime.js";
-import { cloneRequestWithHeaders, processMiddlewareHeaders } from "./request-pipeline.js";
+import {
+  cancelRequestBody,
+  cloneRequestIfBodyReadable,
+  cloneRequestWithHeaders,
+  peekRequestBody,
+  processMiddlewareHeaders,
+} from "./request-pipeline.js";
 import { internalServerErrorResponse } from "./http-error-responses.js";
 
 export type AppMiddlewareContext = {
@@ -90,22 +96,11 @@ function requestWithoutFlightHeaders(request: Request, isolateBody = false): Req
 
   if (!hasFlightHeader) {
     if (!isolateBody) return request;
-    try {
-      if (request.body && !request.bodyUsed) return request.clone();
-    } catch {
-      // srvx may throw on bodyUsed/clone when the Node stream is locked.
-    }
-    return request;
+    return cloneRequestIfBodyReadable(request) ?? request;
   }
   // Do not pre-clone: `cloneRequestWithHeaders` already branches the body, and
   // a pre-clone can lock srvx streams so the follow-up clone throws.
   return cloneRequestWithHeaders(request, headers);
-}
-
-function cancelRequestBody(request: Request): void {
-  if (request.body && !request.body.locked) {
-    void request.body.cancel().catch(() => {});
-  }
 }
 
 function appendForwardedHeader(headers: Headers, value: unknown): void {
@@ -149,12 +144,13 @@ function requestWithMiddlewareRequestHeaders(
     : null;
   if (!nextHeaders) return request;
 
+  const body = peekRequestBody(request);
   const init: RequestInit = {
     method: request.method,
     headers: nextHeaders,
-    body: request.body,
+    body,
   };
-  if (request.body) {
+  if (body) {
     Object.defineProperty(init, "duplex", { value: "half", enumerable: true });
   }
 

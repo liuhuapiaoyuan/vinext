@@ -659,9 +659,52 @@ const METHODS_THAT_MAY_HAVE_BODY = new Set(["POST", "PUT", "PATCH", "DELETE"]);
  * Read `request.body` without throwing. srvx adapters can throw while
  * materializing the Web body from a locked Node stream.
  */
-function peekRequestBody(request: Request): ReadableStream<Uint8Array> | null {
+export function peekRequestBody(request: Request): ReadableStream<Uint8Array> | null {
   try {
     return request.body;
+  } catch {
+    return null;
+  }
+}
+
+function isRequestBodyLocked(body: ReadableStream<Uint8Array>): boolean {
+  try {
+    return body.locked;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Cancel a request body stream without throwing. srvx may throw from `body`,
+ * `bodyUsed`, or `locked` after an earlier clone; callers in `finally` must
+ * not let that replace a successful middleware/handler result.
+ */
+export function cancelRequestBody(request: Request): void {
+  const body = peekRequestBody(request);
+  if (!body || isRequestBodyLocked(body)) return;
+  try {
+    if (request.bodyUsed) return;
+  } catch {
+    // srvx may throw on bodyUsed; still attempt cancel.
+  }
+  void body.cancel().catch(() => {});
+}
+
+/**
+ * Tee a readable request body. Returns null when there is no body or clone()
+ * fails, so callers can keep the original request instead of throwing.
+ */
+export function cloneRequestIfBodyReadable(request: Request): Request | null {
+  const body = peekRequestBody(request);
+  if (!body) return null;
+  try {
+    if (request.bodyUsed) return null;
+  } catch {
+    // srvx may throw on bodyUsed; still attempt clone().
+  }
+  try {
+    return request.clone();
   } catch {
     return null;
   }
@@ -774,15 +817,12 @@ export async function bufferRequestBodyForHeaderClone(request: Request): Promise
   const contentLength = Number(request.headers.get("content-length") ?? "0");
   const peekedBody = peekRequestBody(request);
   const hasRawNodeBody = getRawNodeRequest(request) !== undefined;
-  // srvx can throw from the body getter even when a Node body exists. Still
-  // attempt materialization when content-length or `_request` says there is one.
-  if (peekedBody === null && contentLength <= 0 && !hasRawNodeBody) {
-    return request;
-  }
+  const hasKnownLength = contentLength > 0;
   // Unbounded web streams (no Content-Length, no srvx `_request`) must stay
-  // streaming. Awaiting `arrayBuffer()` would stall Server Actions that cancel
-  // an unused interception tee before the producer closes.
-  if (contentLength <= 0 && !hasRawNodeBody) {
+  // streaming. Awaiting `arrayBuffer()` hangs Server Actions that cancel an
+  // unused interception tee before the producer closes. Chunked/srvx bodies
+  // still recover from `_request` below.
+  if (!hasKnownLength && !hasRawNodeBody) {
     return request;
   }
 
@@ -792,7 +832,7 @@ export async function bufferRequestBodyForHeaderClone(request: Request): Promise
 
     // Prefer the raw Node stream when available — srvx's Web body may already
     // be locked by the adapter. Track consumption so we do not iterate twice.
-    if (contentLength > 0 || (peekedBody === null && hasRawNodeBody)) {
+    if (hasKnownLength || (peekedBody === null && hasRawNodeBody)) {
       const rawBytes = await readRawNodeRequestBytes(request);
       consumedRawNode = hasRawNodeBody;
       if (rawBytes && rawBytes.byteLength > 0) {

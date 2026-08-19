@@ -1600,11 +1600,7 @@ describe("createAppRscHandler", () => {
     expect(responseBeforeBodyClose).not.toBeNull();
     expect(response.status).toBe(200);
     await expect(response.text()).resolves.toBe("dispatched");
-    // Upstream also asserts the original stream cancel() fires. Fork clone
-    // helpers keep the source readable via extra tees (srvx/Bun), so producer
-    // cancel may not run until every branch is released. The regression this
-    // test guards is the handler blocking on that unused branch.
-    void bodyCancelled;
+    await expect(bodyCancelled).resolves.toBeUndefined();
   });
 
   it("does not re-run middleware when no interception context is supplied", async () => {

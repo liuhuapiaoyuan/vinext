@@ -21,7 +21,11 @@ import {
   type MiddlewareLocaleMatchContext,
 } from "./middleware-matcher.js";
 import { shouldKeepMiddlewareHeader } from "../utils/middleware-request-headers.js";
-import { processMiddlewareHeaders, cloneRequestWithUrl } from "./request-pipeline.js";
+import {
+  processMiddlewareHeaders,
+  cloneRequestIfBodyReadable,
+  cloneRequestWithUrl,
+} from "./request-pipeline.js";
 import { badRequestResponse, internalServerErrorResponse } from "./http-error-responses.js";
 import { isOpenRedirectShaped } from "./open-redirect.js";
 import {
@@ -242,23 +246,7 @@ function resolveMiddlewarePathname(request: Request): string | Response {
 }
 
 function tryCloneRequestForMiddleware(request: Request): Request {
-  try {
-    let body: ReadableStream<Uint8Array> | null;
-    try {
-      body = request.body;
-    } catch {
-      return request;
-    }
-    if (!body) return request;
-    try {
-      if (request.bodyUsed) return request;
-    } catch {
-      // srvx may throw on bodyUsed when the Node stream is locked.
-    }
-    return request.clone();
-  } catch {
-    return request;
-  }
+  return cloneRequestIfBodyReadable(request) ?? request;
 }
 
 function createNextRequest(
@@ -289,7 +277,14 @@ function createNextRequest(
   if (mwPathname !== url.pathname) {
     const mwUrl = new URL(url);
     mwUrl.pathname = mwPathname;
-    mwRequest = cloneRequestWithUrl(mwRequest, mwUrl.toString());
+    // `mwRequest` is either the App Router's isolated middleware branch or a
+    // clone from tryCloneRequestForMiddleware. The original downstream request
+    // is never this object, so transfer instead of teeing an unread leftover.
+    // If isolation/clone failed, mwRequest is still the source — tee so we
+    // cannot steal the body the rest of the pipeline still owns.
+    mwRequest = cloneRequestWithUrl(mwRequest, mwUrl.toString(), {
+      transferBody: requestBodyAlreadyIsolated || mwRequest !== request,
+    });
   }
 
   const hasNextConfig = basePath || i18nConfig || trailingSlash;
