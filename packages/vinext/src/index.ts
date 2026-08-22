@@ -182,6 +182,7 @@ import { createOptimizeImportsPlugin } from "./plugins/optimize-imports.js";
 import { createDynamicPreloadMetadataPlugin } from "./plugins/dynamic-preload-metadata.js";
 import { createOgInlineFetchAssetsPlugin, createOgAssetsPlugin } from "./plugins/og-assets.js";
 import { createUseCacheCallablePlugin } from "./plugins/use-cache-callable.js";
+import { wrapRscHotUpdatePlugins } from "./plugins/rsc-client-owned-hmr.js";
 import { generateRouteTypes } from "./typegen.js";
 import {
   mergeOptimizeDepsInclude,
@@ -1780,7 +1781,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           throw new Error("vinext: Failed to locate @vitejs/plugin-rsc use-server plugin.");
         }
         plugins.splice(useServerIndex, 0, useCachePlugin);
-        return plugins;
+        return wrapRscHotUpdatePlugins(plugins);
       })
       .catch((cause) => {
         throw new Error("vinext: Failed to load @vitejs/plugin-rsc.", {
