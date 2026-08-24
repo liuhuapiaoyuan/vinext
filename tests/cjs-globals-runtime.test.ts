@@ -555,28 +555,37 @@ async function includeAdditionalWorkerModules(configPath: string): Promise<void>
   await fs.writeFile(configPath, JSON.stringify(config));
 }
 
-async function readJavaScriptTree(root: string): Promise<string> {
+async function listJavaScriptFiles(root: string): Promise<string[]> {
   const files = await fs.readdir(root, { recursive: true });
-  return (
-    await Promise.all(
-      files
-        .filter((file) => /\.[cm]?js$/.test(file))
-        .map((file) => fs.readFile(path.join(root, file), "utf8")),
-    )
-  ).join("\n");
+  const matches: string[] = [];
+  for (const file of files) {
+    if (!/\.[cm]?js$/.test(file)) continue;
+    const absolutePath = path.join(root, file);
+    // Nitro whole-package copy can place directories whose names end in `.js`
+    // (e.g. `node_modules/@resvg/resvg-js`) next to real modules.
+    const stat = await fs.stat(absolutePath);
+    if (!stat.isFile()) continue;
+    matches.push(file);
+  }
+  return matches;
+}
+
+async function readJavaScriptTree(root: string): Promise<string> {
+  const files = await listJavaScriptFiles(root);
+  return (await Promise.all(files.map((file) => fs.readFile(path.join(root, file), "utf8")))).join(
+    "\n",
+  );
 }
 
 async function findJavaScriptFilesContaining(root: string, needle: string): Promise<string[]> {
-  const files = await fs.readdir(root, { recursive: true });
+  const files = await listJavaScriptFiles(root);
   const matches = await Promise.all(
-    files
-      .filter((file) => /\.[cm]?js$/.test(file))
-      .map(async (file) => {
-        const absolutePath = path.join(root, file);
-        return (await fs.readFile(absolutePath, "utf8")).includes(needle)
-          ? await fs.realpath(absolutePath)
-          : null;
-      }),
+    files.map(async (file) => {
+      const absolutePath = path.join(root, file);
+      return (await fs.readFile(absolutePath, "utf8")).includes(needle)
+        ? await fs.realpath(absolutePath)
+        : null;
+    }),
   );
   return matches.filter((file): file is string => file !== null);
 }
@@ -595,17 +604,15 @@ type DirectIdentityName = keyof typeof DIRECT_IDENTITY_FIELDS;
 type EmittedIdentityFiles = Record<DirectIdentityName, string[]>;
 
 async function findEmittedIdentityFiles(root: string): Promise<EmittedIdentityFiles> {
-  const files = await fs.readdir(root, { recursive: true });
+  const files = await listJavaScriptFiles(root);
   const javascriptFiles = await Promise.all(
-    files
-      .filter((file) => /\.[cm]?js$/.test(file))
-      .map(async (file) => {
-        const absolutePath = path.join(root, file);
-        return {
-          path: await fs.realpath(absolutePath),
-          source: await fs.readFile(absolutePath, "utf8"),
-        };
-      }),
+    files.map(async (file) => {
+      const absolutePath = path.join(root, file);
+      return {
+        path: await fs.realpath(absolutePath),
+        source: await fs.readFile(absolutePath, "utf8"),
+      };
+    }),
   );
   return Object.fromEntries(
     Object.entries(DIRECT_IDENTITY_FIELDS).map(([name, marker]) => [
