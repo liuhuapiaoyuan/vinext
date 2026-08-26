@@ -184,6 +184,8 @@ import {
 } from "../client/app-nav-failure-handler.js";
 import { createClientReuseManifestHeaderFromVisibleAppState } from "./app-browser-client-reuse-manifest.js";
 import {
+  canonicalizePrewarmableRscRequestHeaders,
+  createCanonicalRscRequestUrl,
   createRscRequestHeaders,
   createRscRequestUrl,
   getVinextRscCompatibilityId,
@@ -2099,6 +2101,15 @@ function bootstrapHydration(
           navigationKind,
           targetPathAndSearch,
         });
+        const canUseCanonicalSharedRequest =
+          process.env.__VINEXT_CANONICAL_RSC_REQUESTS === "1" &&
+          navigationKind === "navigate" &&
+          settledPrefetchedResponse === null &&
+          requestInterceptionContext === null &&
+          mountedSlotsHeader === null &&
+          (rewrittenNavigationHref === null || rewrittenNavigationHref === currentHref);
+        const usesCanonicalPrewarmedRequest =
+          canUseCanonicalSharedRequest && canonicalizePrewarmableRscRequestHeaders(requestHeaders);
         const rscUrl = settledPrefetchedResponse
           ? resolvePrefetchNavigationResponseUrl({
               additionalRscUrls: additionalPrefetchPathAndSearch,
@@ -2106,7 +2117,9 @@ function bootstrapHydration(
               responseUrl: settledPrefetchedResponse.url,
               visibleRscUrl: targetPathAndSearch,
             })
-          : await createRscRequestUrl(targetPathAndSearch, requestHeaders);
+          : usesCanonicalPrewarmedRequest
+            ? createCanonicalRscRequestUrl(targetPathAndSearch)
+            : await createRscRequestUrl(targetPathAndSearch, requestHeaders);
         const additionalPrefetchRscUrls = settledPrefetchedResponse
           ? additionalPrefetchPathAndSearch
           : await Promise.all(
@@ -2396,7 +2409,7 @@ function bootstrapHydration(
           // paths did not satisfy the navigation and a real request is required.
           // Computed from the nav-start router state so it matches the snapshot
           // the request would have carried if produced earlier.
-          if (navigationKind === "navigate") {
+          if (navigationKind === "navigate" && !usesCanonicalPrewarmedRequest) {
             const clientReuseManifestHeader =
               createClientReuseManifestHeaderFromVisibleAppState(navigationInitiationState);
             if (clientReuseManifestHeader !== null) {
