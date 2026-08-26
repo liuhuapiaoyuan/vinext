@@ -4,6 +4,7 @@ export { parseWorkersDevUrl } from "./workers-dev-url.js";
 export type WranglerVersionUploadResult = {
   versionId: string;
   previewUrl: string | null;
+  workerName: string | null;
   output: string;
 };
 export type WranglerVersionDeployResult = {
@@ -23,6 +24,7 @@ type WranglerVersionArgs = {
   env: string | undefined;
 };
 export declare function parseVersionId(output: string): string | null;
+export declare function parseUploadedWorkerName(output: string): string | null;
 export declare function parseWranglerVersionUploadOutput(
   output: string,
 ): WranglerVersionUploadResult;

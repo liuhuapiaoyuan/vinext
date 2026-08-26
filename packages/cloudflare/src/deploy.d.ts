@@ -9,8 +9,10 @@
  */
 import { spawn } from "node:child_process";
 import { parseWranglerConfig } from "./tpr.js";
+import { type CdnWarmOptions, type CdnWarmRequestPlan } from "./cdn-warm.js";
 import { type WranglerDeploymentStatus, type WranglerVersionTraffic } from "./version-deploy.js";
 import { type KVBulkPair } from "./prerender-kv-populate.js";
+export declare const DEFAULT_CDN_WARM_PROMOTION_DELAY_MS = 15000;
 export type DeployOptions = {
   /** Project root directory */
   root: string;
@@ -38,8 +40,16 @@ export type DeployOptions = {
   warmCdnTimeout?: number;
   /** Number of CDN warmup retries for transient failures */
   warmCdnRetries?: number;
-  /** Fail deployment if any CDN warmup request fails */
-  warmCdnStrict?: boolean;
+  /** Consecutive successful probes required before warming the staged Worker */
+  warmCdnReadinessProbes?: number;
+  /** Delay between staged Worker readiness probes in milliseconds */
+  warmCdnReadinessProbeDelay?: number;
+  /** Promote even when staged CDN warmup cannot be completed */
+  dangerouslyPromoteOnCdnWarmError?: boolean;
+  /** Promote the warmed Worker version to 100% traffic (default: true) */
+  warmCdnPromote?: boolean;
+  /** Delay between successful warmup and promotion in milliseconds */
+  warmCdnPromotionDelay?: number;
   /** Include PPR fallback-shell placeholder paths during CDN warmup */
   warmCdnIncludeFallbacks?: boolean;
   /** Enable experimental TPR (Traffic-aware Pre-Rendering) */
@@ -65,7 +75,11 @@ export declare function parseDeployArgs(args: string[]): {
   warmCdnConcurrency: number | undefined;
   warmCdnTimeout: number | undefined;
   warmCdnRetries: number | undefined;
-  warmCdnStrict: boolean;
+  warmCdnReadinessProbes: number | undefined;
+  warmCdnReadinessProbeDelay: number | undefined;
+  dangerouslyPromoteOnCdnWarmError: boolean;
+  warmCdnPromote: boolean;
+  warmCdnPromotionDelay: number | undefined;
   warmCdnIncludeFallbacks: boolean;
   experimentalTPR: boolean;
   tprCoverage: number | undefined;
@@ -148,6 +162,7 @@ export declare function runWranglerDeploy(
   options: Pick<DeployOptions, "preview" | "env" | "name" | "config">,
   execute?: typeof spawn,
 ): Promise<string>;
+export declare function hasCdnWarmRequests(plan: CdnWarmRequestPlan): boolean;
 export declare function deployWithCdnWarmup(
   root: string,
   paths: readonly string[],
@@ -160,8 +175,16 @@ export declare function deployWithCdnWarmup(
     | "warmCdnConcurrency"
     | "warmCdnTimeout"
     | "warmCdnRetries"
-    | "warmCdnStrict"
-  >,
+    | "warmCdnReadinessProbes"
+    | "warmCdnReadinessProbeDelay"
+    | "dangerouslyPromoteOnCdnWarmError"
+    | "warmCdnPromote"
+    | "warmCdnPromotionDelay"
+  > &
+    Pick<
+      CdnWarmOptions,
+      "deploymentId" | "expectedBuildId" | "expectedRscBuildId" | "loadingShellPaths" | "rscPaths"
+    >,
 ): Promise<string>;
 export declare function resolveCdnWarmupTargetUrl(
   root: string,
