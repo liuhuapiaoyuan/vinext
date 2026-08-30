@@ -4856,6 +4856,23 @@ describe("next/headers phase-aware cookies", () => {
     }
   });
 
+  it("restoring the render phase after an action does not throw when cookies() was never called", async () => {
+    const { setHeadersContext, setHeadersAccessPhase } =
+      await import("../packages/vinext/src/shims/headers.js");
+    setHeadersContext({
+      headers: new Headers(),
+      cookies: new Map(),
+    });
+
+    const previousPhase = setHeadersAccessPhase("action");
+    try {
+      expect(() => setHeadersAccessPhase("render")).not.toThrow();
+    } finally {
+      setHeadersAccessPhase(previousPhase);
+      setHeadersContext(null);
+    }
+  });
+
   it("mutable cookie references stop accepting writes after the phase returns to render", async () => {
     // Ported from Next.js:
     // packages/next/src/server/web/spec-extension/adapters/request-cookies.test.ts

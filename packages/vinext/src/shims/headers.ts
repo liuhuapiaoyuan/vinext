@@ -520,7 +520,10 @@ function _setStatePhase(
 ): HeadersAccessPhase {
   const previous = state.phase;
   if (previous === "action" && phase === "render") {
-    state.headersContext?.mutableCookies?.[SYNCHRONIZE_REQUEST_COOKIES]();
+    // `?.[sym]()` is not an optional call — if mutableCookies exists but the
+    // method is missing (never created, or a second headers-shim instance
+    // with a different Symbol identity), the `()` still runs and throws.
+    state.headersContext?.mutableCookies?.[SYNCHRONIZE_REQUEST_COOKIES]?.();
   }
   state.phase = phase;
   return previous;
@@ -1224,8 +1227,8 @@ export async function draftMode(): Promise<DraftModeResult> {
 // RequestCookies implementation
 // ---------------------------------------------------------------------------
 
-const APPLY_RESPONSE_COOKIE = Symbol("vinext.apply-response-cookie");
-const SYNCHRONIZE_REQUEST_COOKIES = Symbol("vinext.synchronize-request-cookies");
+const APPLY_RESPONSE_COOKIE = Symbol.for("vinext.apply-response-cookie");
+const SYNCHRONIZE_REQUEST_COOKIES = Symbol.for("vinext.synchronize-request-cookies");
 
 class RequestCookies {
   private _cookies: Map<string, string>;
