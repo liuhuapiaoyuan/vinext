@@ -1,5 +1,11 @@
 import { hasBasePath, stripBasePath, removeTrailingSlash } from "../utils/base-path.js";
-import { INTERNAL_HEADERS, MIDDLEWARE_HEADER_PREFIX, VINEXT_INTERNAL_HEADERS } from "./headers.js";
+import {
+  INTERNAL_HEADERS,
+  MIDDLEWARE_HEADER_PREFIX,
+  NEXT_ACTION_HEADER,
+  RSC_ACTION_HEADER,
+  VINEXT_INTERNAL_HEADERS,
+} from "./headers.js";
 import { MIDDLEWARE_CACHE_HEADER } from "../utils/protocol-headers.js";
 import { getUnconsumedMiddlewareRequestHeaders } from "../utils/middleware-request-headers.js";
 import {
@@ -792,11 +798,19 @@ export async function bufferRequestBodyForHeaderClone(request: Request): Promise
   const peekedBody = peekRequestBody(request);
   const hasRawNodeBody = getRawNodeRequest(request) !== undefined;
   const hasKnownLength = contentLength > 0;
+  // Flight Server Action POSTs are always finite (`encodeReply` produces a
+  // complete string). Vite/workerd/srvx adapters often forward them as chunked
+  // streams with no Content-Length and no srvx `_request`. If we leave those
+  // streaming, later `Request.clone()` drops the body and decodeReply sees
+  // `JSON Parse error: Unexpected EOF`. The 6KB `x-vinext-action-body` header
+  // cannot cover large actions, so we must snapshot the POST stream here.
+  const isServerActionRequest =
+    request.headers.has(RSC_ACTION_HEADER) || request.headers.has(NEXT_ACTION_HEADER);
   // Unbounded web streams (no Content-Length, no srvx `_request`) must stay
-  // streaming. Awaiting `arrayBuffer()` hangs Server Actions that cancel an
+  // streaming. Awaiting `arrayBuffer()` hangs SSE/chat POSTs that cancel an
   // unused interception tee before the producer closes. Chunked/srvx bodies
-  // still recover from `_request` below.
-  if (!hasKnownLength && !hasRawNodeBody) {
+  // still recover from `_request` below. Server Actions are exempt: they close.
+  if (!hasKnownLength && !hasRawNodeBody && !isServerActionRequest) {
     return request;
   }
 
@@ -804,13 +818,21 @@ export async function bufferRequestBodyForHeaderClone(request: Request): Promise
     let bytes: Uint8Array | null = null;
     let consumedRawNode = false;
 
-    // Prefer the raw Node stream when available — srvx's Web body may already
-    // be locked by the adapter. Track consumption so we do not iterate twice.
-    if (hasKnownLength || (peekedBody === null && hasRawNodeBody)) {
+    // Prefer the raw Node stream when the Web body is missing — srvx's Web
+    // body may already be locked by the adapter. If `_request` yields nothing,
+    // do not skip the Web body: some adapters already copied bytes onto the
+    // Request and left an empty Node iterator attached.
+    if (hasRawNodeBody && peekedBody === null) {
       const rawBytes = await readRawNodeRequestBytes(request);
-      consumedRawNode = hasRawNodeBody;
+      consumedRawNode = true;
       if (rawBytes && rawBytes.byteLength > 0) {
         bytes = rawBytes;
+      }
+    } else if (hasRawNodeBody && (hasKnownLength || isServerActionRequest)) {
+      const rawBytes = await readRawNodeRequestBytes(request);
+      if (rawBytes && rawBytes.byteLength > 0) {
+        bytes = rawBytes;
+        consumedRawNode = true;
       }
     }
 
@@ -824,6 +846,7 @@ export async function bufferRequestBodyForHeaderClone(request: Request): Promise
           const rawBytes = await readRawNodeRequestBytes(request);
           if (rawBytes && rawBytes.byteLength > 0) {
             bytes = rawBytes;
+            consumedRawNode = true;
           }
         }
       }

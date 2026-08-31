@@ -40,7 +40,7 @@ export const VINEXT_EXPECTED_WORKER_VERSION_HEADER = "X-Vinext-Expected-Worker-V
 /** Dev-only server action log payload (JSON). Stripped before the response reaches the client. */
 export const VINEXT_ACTION_LOG_HEADER = "x-vinext-action-log";
 
-/** Small string Server Action body side-channel used when dev Request cloning drops the stream. */
+/** Dev-only small-body fallback when Request cloning drops the POST stream. Large actions must use the buffered POST body. */
 export const VINEXT_ACTION_BODY_HEADER = "x-vinext-action-body";
 
 export {

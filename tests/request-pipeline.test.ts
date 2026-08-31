@@ -1162,6 +1162,72 @@ describe("bufferRequestBodyForHeaderClone", () => {
     expect(await buffered.text()).toBe("[]");
   });
 
+  it("buffers Server Action POSTs without Content-Length when clone drops the body", async () => {
+    // Dev/workerd adapters often forward encodeReply payloads as chunked
+    // streams. The 6KB action-body header cannot cover these, so the POST
+    // stream itself must be snapshotted before header cloning.
+    const payload = JSON.stringify(["arg", { nested: "x".repeat(8000) }]);
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(payload));
+        controller.close();
+      },
+    });
+    const original = new Request("http://localhost/action", {
+      method: "POST",
+      headers: {
+        "content-type": "text/plain;charset=UTF-8",
+        "next-action": "/app/actions.ts#getData",
+        "x-rsc-action": "/app/actions.ts#getData",
+      },
+      body,
+      // @ts-expect-error — duplex needed for streaming request bodies
+      duplex: "half",
+    });
+    Object.defineProperty(original, "clone", {
+      configurable: true,
+      value: () =>
+        new Request("http://localhost/action", {
+          method: "POST",
+          headers: original.headers,
+          body: "",
+        }),
+    });
+
+    const buffered = await bufferRequestBodyForHeaderClone(original);
+    const cloned = cloneRequestWithHeaders(buffered, new Headers(buffered.headers));
+
+    expect(buffered).not.toBe(original);
+    expect(await cloned.text()).toBe(payload);
+  });
+
+  it("uses the Web body when srvx _request is already drained", async () => {
+    const payload = JSON.stringify(["from-web-body"]);
+    const original = new Request("http://localhost/action", {
+      method: "POST",
+      headers: {
+        "content-length": String(payload.length),
+        "content-type": "text/plain;charset=UTF-8",
+        "next-action": "/app/actions.ts#getData",
+      },
+      body: payload,
+    });
+    Object.defineProperty(original, "_request", {
+      value: {
+        async *[Symbol.asyncIterator]() {
+          // Adapter already materialized the body onto the Web Request.
+        },
+      },
+      enumerable: true,
+      configurable: true,
+    });
+
+    const buffered = await bufferRequestBodyForHeaderClone(original);
+    const cloned = cloneRequestWithHeaders(buffered, new Headers(buffered.headers));
+
+    expect(await cloned.text()).toBe(payload);
+  });
+
   it("leaves GET requests untouched", async () => {
     const original = new Request("http://localhost/page", { method: "GET" });
     const buffered = await bufferRequestBodyForHeaderClone(original);
