@@ -28,6 +28,7 @@ import {
   matchAppRoute,
 } from "./routing/app-router.js";
 import type { NitroRouteRuleConfig } from "./build/nitro-route-rules.js";
+import { applyVinextNitroErrorHandler } from "./server/nitro-error-handler-setup.js";
 import {
   buildViteResolveExtensions,
   normalizeViteResolveExtensions,
@@ -1486,6 +1487,8 @@ type NitroSetupContext = {
     dev?: boolean;
     preset?: string;
     routeRules?: Record<string, NitroRouteRuleConfig>;
+    /** User or vinext-installed Nitro error handler path / function. */
+    errorHandler?: unknown;
     traceDeps?: string[];
     /** Nitro's Rolldown bundler options (final `nitro` environment build). */
     rolldownConfig?: {
@@ -7024,6 +7027,11 @@ export const loadServerActionClient = ${
       name: "vinext:nitro-route-rules",
       nitro: {
         setup: async (nitro: NitroSetupContext) => {
+          // Replace Nitro's default `{ error: true, status: 500, unhandled: true }`
+          // JSON with Next.js's `_error` HTML page. Skip when the app already
+          // set `errorHandler` / `nitro.errorHandler`.
+          applyVinextNitroErrorHandler(nitro.options);
+
           if (!nextConfig) return;
           if (!hasAppDir && !hasPagesDir) return;
 

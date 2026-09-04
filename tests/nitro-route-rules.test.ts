@@ -19,6 +19,7 @@ type NitroSetupTarget = {
     dev?: boolean;
     preset?: string;
     routeRules?: Record<string, NitroRouteRuleConfig>;
+    errorHandler?: unknown;
     traceDeps?: string[];
     rolldownConfig?: {
       external?: string | RegExp | Array<string | RegExp>;
@@ -304,6 +305,40 @@ describe("collectNitroRouteRules", () => {
 });
 
 describe("vinext Nitro setup integration", () => {
+  it("installs the built-in HTML error handler when unset", async () => {
+    const root = createAppProject();
+    const nitroPlugin = await initializeNitroSetupPlugin(root);
+    const nitro = {
+      options: {
+        dev: false,
+        routeRules: {},
+        errorHandler: undefined as unknown,
+      },
+    };
+
+    await nitroPlugin.nitro!.setup!(nitro);
+
+    expect(typeof nitro.options.errorHandler).toBe("string");
+    expect(fs.existsSync(nitro.options.errorHandler as string)).toBe(true);
+    expect(nitro.options.errorHandler).toMatch(/nitro-error-handler\.(js|ts)$/);
+  });
+
+  it("does not override a user-supplied Nitro errorHandler", async () => {
+    const root = createAppProject();
+    const nitroPlugin = await initializeNitroSetupPlugin(root);
+    const nitro = {
+      options: {
+        dev: false,
+        routeRules: {},
+        errorHandler: "./error.ts",
+      },
+    };
+
+    await nitroPlugin.nitro!.setup!(nitro);
+
+    expect(nitro.options.errorHandler).toBe("./error.ts");
+  });
+
   it("propagates server externals to Nitro traceDeps", async () => {
     const root = createAppProject();
     writeProjectFile(
