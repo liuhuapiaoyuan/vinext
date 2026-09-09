@@ -39,6 +39,12 @@ export async function waitUntilPidExits(pid: number, timeoutMs: number): Promise
   return !isPidAlive(pid);
 }
 
+function closeAllServerConnections(server: net.Server): void {
+  const closeAll = (server as net.Server & { closeAllConnections?: () => void })
+    .closeAllConnections;
+  if (typeof closeAll === "function") closeAll.call(server);
+}
+
 function normalizeDevListenHost(hostname: string | boolean | undefined): string[] {
   if (typeof hostname !== "string") {
     return ["127.0.0.1", "0.0.0.0"];
@@ -52,21 +58,56 @@ function normalizeDevListenHost(hostname: string | boolean | undefined): string[
   return [hostname.includes(":") ? `[${hostname}]` : hostname];
 }
 
-async function isPortAvailableOnHost(port: number, host: string): Promise<boolean> {
+/**
+ * Temporary bind probe. `server.close()` waits for accepted connections, so a
+ * leftover browser tab can make this hang forever (especially under Bun).
+ * Reject inbound sockets immediately and time out the close.
+ */
+export async function isPortAvailableOnHost(port: number, host: string): Promise<boolean> {
   return new Promise((resolve) => {
-    const server = net.createServer();
-    server.once("error", () => resolve(false));
+    let settled = false;
+    const finish = (available: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(available);
+    };
+
+    const server = net.createServer((socket) => {
+      socket.destroy();
+    });
+
+    const timeout = setTimeout(() => {
+      try {
+        closeAllServerConnections(server);
+        server.close();
+      } catch {
+        // Best effort — the bind already succeeded.
+      }
+      finish(true);
+    }, 250);
+
+    server.once("error", () => {
+      clearTimeout(timeout);
+      finish(false);
+    });
     server.once("listening", () => {
-      server.close(() => resolve(true));
+      closeAllServerConnections(server);
+      server.close(() => {
+        clearTimeout(timeout);
+        finish(true);
+      });
     });
     server.listen(port, host);
   });
 }
 
-async function isPortAvailable(
+export async function isPortAvailable(
   port: number,
   hostname: string | boolean | undefined,
 ): Promise<boolean> {
+  // A listen() probe can accept leftover browser connections and then hang in
+  // close(). Prefer OS LISTEN pids; only bind-probe when nothing is listening.
+  if (findListeningPids(port).some((pid) => pid !== process.pid)) return false;
   for (const host of normalizeDevListenHost(hostname)) {
     if (!(await isPortAvailableOnHost(port, host))) return false;
   }
