@@ -133,6 +133,7 @@ import { validateDevRequest } from "./server/dev-origin-check.js";
 import { readTrustedRevalidationHostname } from "./server/revalidation-host.js";
 import { installDevStackSourcemapMiddleware } from "./server/dev-stack-sourcemap.js";
 import { applyDevServerRestartPolicy } from "./server/dev-server-restart.js";
+import { getVinextDevWatchIgnored } from "./server/dev-watch-ignore.js";
 import {
   handleNodeWebSocketUpgrade,
   isViteHmrWebSocketUpgrade,
@@ -3181,6 +3182,19 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             },
             hmr: devHmrConfig,
             ...(isDevServe ? { open: serverOpenForVite } : {}),
+            // Vite 8 watches the whole root and full-reloads on tsconfig.json.
+            // Keep source (src/app or app/), public/, and config files; drop
+            // the rest. Skip when the user disabled watching with `watch: null`.
+            ...(isDevServe && config.server?.watch !== null
+              ? {
+                  watch: {
+                    ignored: getVinextDevWatchIgnored({
+                      root,
+                      sourceDir: baseDir,
+                    }),
+                  },
+                }
+              : {}),
           },
           // Configure SSR transform behaviour for Node targets.
           // - `external`: React packages are loaded natively by Node (CJS)
