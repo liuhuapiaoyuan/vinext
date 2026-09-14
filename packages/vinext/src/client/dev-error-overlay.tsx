@@ -15,6 +15,7 @@ import { createRoot, type Root } from "react-dom/client";
 
 import { VINEXT_DEV_ERROR_RECOVERY_EVENT } from "../utils/dev-error-recovery-event.js";
 import { isNavigationSignalError } from "../utils/navigation-signal.js";
+import { shouldIgnoreWindowErrorEvent } from "./benign-browser-error.js";
 import {
   type OverlayState,
   type OverlayCodeFrame,
@@ -73,14 +74,18 @@ export function installDevErrorOverlay(): void {
   installed = true;
 
   window.addEventListener("error", (event: ErrorEvent) => {
+    // Next.js overlay only reports when `event.error` is present. Chromium
+    // ResizeObserver loop notifications arrive as message-only window.error
+    // events and must not open the dialog. See benign-browser-error.ts.
+    if (shouldIgnoreWindowErrorEvent(event)) return;
     const err = event.error;
     if (isNavigationSignalError(err)) return;
     if (err instanceof Error) {
       if (alreadyReported(err)) return;
       reportDevError(err, { source: "window-error" });
-    } else if (event.message) {
-      reportDevError(new Error(event.message), { source: "window-error" });
+      return;
     }
+    reportDevError(new Error(event.message || String(err)), { source: "window-error" });
   });
 
   window.addEventListener("unhandledrejection", (event: PromiseRejectionEvent) => {
