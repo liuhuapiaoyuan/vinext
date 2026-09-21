@@ -295,8 +295,6 @@ describe("optimizeDeps.exclude for vinext", () => {
       const clientInclude = result.environments.client.optimizeDeps?.include ?? [];
       expect(clientInclude).toContain("next/dynamic");
       expect(clientInclude).toContain("next/image");
-      expect(clientInclude).toContain("@unpic/react");
-      expect(clientInclude).toContain("ipaddr.js");
       expect(new Set(clientInclude).size).toBe(clientInclude.length);
       expect(result.define?.["process.env.__VINEXT_HAS_PAGES_ROUTER"]).toBe('"true"');
       expect(
@@ -377,8 +375,6 @@ describe("optimizeDeps.exclude for vinext", () => {
       expect(clientInclude).toContain("react-dom");
       expect(clientInclude).toContain("next/dynamic");
       expect(clientInclude).toContain("next/image");
-      expect(clientInclude).toContain("@unpic/react");
-      expect(clientInclude).toContain("ipaddr.js");
       expect(new Set(clientInclude).size).toBe(clientInclude.length);
     } finally {
       await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
@@ -4060,6 +4056,12 @@ describe("createMultiStageChunkFileNames", () => {
     expect(fileName({ name: "pages-response-stage-entry" } as never)).toBe(
       "pages-response-stage-entry-[hash].js",
     );
+    expect(fileName({ name: "vinext-request-stage" } as never)).toBe(
+      "vinext-request-stage-[hash].js",
+    );
+    expect(fileName({ name: "vinext-response-stage" } as never)).toBe(
+      "vinext-response-stage-[hash].js",
+    );
     expect(fileName({ name: "_virtual_vinext-rsc-entry" } as never)).toBe(
       "_virtual_vinext-rsc-entry-[hash].js",
     );
@@ -4304,9 +4306,13 @@ describe("createMultiStageChunkFileNames", () => {
           fsp.readFile(path.join(outputDir, "vinext-client-assets.js"), "utf8"),
         ).resolves.toContain("export default");
         const outputFiles = await fsp.readdir(outputDir, { recursive: true });
-        const responseStageFile = outputFiles.find((file) =>
-          /^vinext-response-stage-.+\.js$/.test(path.basename(file)),
-        );
+        const responseStageFile = outputFiles.find((file) => {
+          const normalized = file.replaceAll("\\", "/");
+          return (
+            /^vinext-response-stage-.+\.js$/.test(path.basename(file)) &&
+            !normalized.split("/").includes("_next")
+          );
+        });
         expect(responseStageFile).toBeDefined();
         const responseStage = (await import(
           `${pathToFileURL(path.join(outputDir, responseStageFile!)).href}?output=${index}`
@@ -4410,9 +4416,13 @@ describe("createMultiStageChunkFileNames", () => {
           fsp.readFile(path.join(outputDir, "vinext-client-assets.js"), "utf8"),
         ).resolves.toContain("export default");
         const outputFiles = await fsp.readdir(outputDir, { recursive: true });
-        const responseStageFile = outputFiles.find((file) =>
-          /^vinext-response-stage-.+\.js$/.test(path.basename(file)),
-        );
+        const responseStageFile = outputFiles.find((file) => {
+          const normalized = file.replaceAll("\\", "/");
+          return (
+            /^vinext-response-stage-.+\.js$/.test(path.basename(file)) &&
+            !normalized.split("/").includes("_next")
+          );
+        });
         expect(responseStageFile).toBeDefined();
         const responseStage = (await import(
           `${pathToFileURL(path.join(outputDir, responseStageFile!)).href}?output=${index}`

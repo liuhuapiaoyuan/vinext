@@ -358,6 +358,8 @@ export function createMultiStageChunkFileNames(
         "app-response-stage-entry",
         "pages-request-stage-entry",
         "pages-response-stage-entry",
+        "vinext-request-stage",
+        "vinext-response-stage",
         "virtual_vinext-rsc-entry",
         "virtual_vinext-response-stage",
       ].some((entryName) => name.includes(entryName))

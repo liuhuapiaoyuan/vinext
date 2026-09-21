@@ -2424,7 +2424,12 @@ export function createAppRscRequestHandler<TRoute extends AppRscHandlerRoute>(
     // Materialize POST bodies before internal header/url cloning. Without this,
     // server actions can fall through to page render with empty args when the
     // body stream is lost on Node/undici (see bufferRequestBodyForHeaderClone).
-    rawRequest = await bufferRequestBodyForHeaderClone(rawRequest);
+    // Skip unbounded streams (no Content-Length, no srvx `_request`): awaiting
+    // them hangs interception tees that cancel before the producer closes.
+    const contentLength = Number(rawRequest.headers.get("content-length") ?? "0");
+    if (contentLength > 0 || Reflect.get(rawRequest, "_request") !== undefined) {
+      rawRequest = await bufferRequestBodyForHeaderClone(rawRequest);
+    }
 
     // Strip forged internal headers at the App Router request boundary.
     // Must happen BEFORE headersContextFromRequest() and

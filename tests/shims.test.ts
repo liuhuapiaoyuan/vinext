@@ -25399,7 +25399,9 @@ describe("image optimization request parsing", () => {
     const request = (width: number) =>
       new URL(`http://localhost/_next/image?url=%2Fimg.jpg&w=${width}&q=75`);
 
-    expect(parseImageParams(request(16))).toBeNull();
+    // Widths outside the Next.js default allowlist snap to the nearest
+    // allowed size rather than 400ing. 16 is closer to 32 than to 48.
+    expect(parseImageParams(request(16))?.width).toBe(32);
     expect(parseImageParams(request(32))?.width).toBe(32);
     expect(parseImageParams(request(640))?.width).toBe(640);
   });

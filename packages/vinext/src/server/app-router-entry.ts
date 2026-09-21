@@ -261,7 +261,10 @@ async function handleRequest(
   // middleware sees them. Must happen before the RSC handler runs.
   // Builds a new Headers — Request.headers is immutable in Workers.
   {
-    request = await bufferRequestBodyForHeaderClone(request);
+    const contentLength = Number(request.headers.get("content-length") ?? "0");
+    if (contentLength > 0 || Reflect.get(request, "_request") !== undefined) {
+      request = await bufferRequestBodyForHeaderClone(request);
+    }
     // Only prod-server's `createNodeExecutionContext` sets `hostRuntime: "node"`,
     // and it runs after `nodeToWebRequest` verified the payload against the build
     // secret, so that payload is trusted and must survive filtering. A request
