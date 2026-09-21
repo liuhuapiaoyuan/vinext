@@ -1,4 +1,5 @@
 import type { NextI18nConfig } from "../config/next-config.js";
+import { patternToNextFormat } from "../routing/route-validation.js";
 import {
   isDraftModeRequest,
   setHeadersContext,
@@ -9,7 +10,12 @@ import type { CachedRouteValue } from "vinext/shims/cache-handler";
 import type { NextRequest } from "vinext/shims/server";
 import { _drainPendingRevalidations } from "vinext/shims/cache-request-state";
 import { runWithRootParamsUsage } from "vinext/shims/root-params";
-import { applyCdnResponseHeaders, NEVER_CACHE_CONTROL } from "./cache-control.js";
+import {
+  applyCdnResponseHeaders,
+  hasCdnResponsePolicy,
+  hasExplicitNonCacheableResponsePolicy,
+  NEVER_CACHE_CONTROL,
+} from "./cache-control.js";
 import { isrCacheControl, type IsrWritePolicy } from "./isr-cache.js";
 import {
   createStaticGenerationHeadersContext,
@@ -19,6 +25,7 @@ import {
   isPossibleAppRouteActionRequest,
   resolveAppRouteHandlerSpecialError,
   shouldApplyAppRouteHandlerRevalidateHeader,
+  shouldCompleteAppRouteHandlerResponse,
   shouldWriteAppRouteHandlerCache,
   type AppRouteHandlerModule,
 } from "./app-route-handler-policy.js";
@@ -36,6 +43,19 @@ import {
   createTrackedAppRouteRequest,
   markKnownDynamicAppRoute,
 } from "./app-route-handler-runtime.js";
+import {
+  getRouteCacheabilityCaptureOptions,
+  getRouteCacheabilityDynamicReason,
+  isRouteCacheabilityEvaluation,
+  markRouteCacheabilityExplicitResponsePolicy,
+  markRouteCacheabilityResponseBodyComplete,
+} from "vinext/shims/cacheability-classification";
+import {
+  CACHEABILITY_ADMISSION_RESPONSE_BODY_LIMIT,
+  CACHEABILITY_PROBE_TIMEOUT_MS,
+} from "./cacheability-limits.js";
+import { frameworkTracer } from "./tracer.js";
+import type { FrameworkSpan } from "./framework-tracer.js";
 
 export type AppRouteParams = Record<string, string | string[]>;
 export type AppRouteDynamicUsageFn = () => boolean;
@@ -61,10 +81,15 @@ export type RouteHandlerCacheSetter = (
   policy: IsrWritePolicy,
 ) => Promise<void>;
 type AppRouteErrorReporter = (
-  error: Error,
+  error: unknown,
   request: { path: string; method: string; headers: Record<string, string> },
-  route: { routerKind: "App Router"; routePath: string; routeType: "route" },
-) => void;
+  route: {
+    routerKind: "App Router";
+    routePath: string;
+    routeType: "route";
+    revalidateReason: "on-demand" | "stale" | undefined;
+  },
+) => void | Promise<void>;
 export type AppRouteDebugLogger = (event: string, detail: string) => void;
 
 type RunAppRouteHandlerOptions = {
@@ -89,9 +114,95 @@ type RunAppRouteHandlerOptions = {
 };
 
 type RunAppRouteHandlerResult = {
+  didAccessDynamicRequest: () => boolean;
   dynamicUsedInHandler: boolean;
   response: Response;
 };
+
+type CompletedAppRouteHandlerResponse = {
+  completed: boolean;
+  response: Response;
+};
+
+function hasExplicitCacheableResponsePolicy(headers: Headers): boolean {
+  return !hasExplicitNonCacheableResponsePolicy(headers) && hasCdnResponsePolicy(headers);
+}
+
+async function completeAppRouteHandlerResponse(
+  response: Response,
+): Promise<CompletedAppRouteHandlerResponse> {
+  // Match Next.js static App Route generation: resolve only after clean EOF,
+  // then rebuild the response from the completed body. Besides making the ISR
+  // artifact deterministic, this keeps request tracking active for stream
+  // pulls and turns a late body failure into the normal Route Handler error
+  // path before cacheable response headers are applied.
+  // Reuse admission's bounded capture envelope and fall back to private
+  // streaming when the response exceeds the memory or completion deadline.
+  const { captureCacheabilityAdmissionBody } = await import("./cacheability-request.js");
+  const captureOptions = getRouteCacheabilityCaptureOptions();
+  const captured = await captureCacheabilityAdmissionBody(
+    response.body,
+    captureOptions?.captureDeadlineAt ?? Date.now() + CACHEABILITY_PROBE_TIMEOUT_MS,
+    CACHEABILITY_ADMISSION_RESPONSE_BODY_LIMIT,
+    captureOptions?.captureBudget,
+  );
+  const completed = new Response(captured.body, {
+    headers: response.headers,
+    status: response.status,
+    statusText: response.statusText,
+  });
+  copyLinkHeaderProvenance(response.headers, completed.headers);
+  return { completed: captured.kind === "captured", response: completed };
+}
+
+function deferAppRouteHandlerCleanup(response: Response, cleanup: () => Promise<void>): Response {
+  if (!response.body) {
+    void cleanup();
+    return response;
+  }
+
+  const reader = response.body.getReader();
+  let cleaned = false;
+  const cleanOnce = async () => {
+    if (cleaned) return;
+    cleaned = true;
+    reader.releaseLock();
+    await cleanup();
+  };
+  const body = new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        try {
+          const result = await reader.read();
+          if (result.done) {
+            await cleanOnce();
+            controller.close();
+          } else {
+            controller.enqueue(result.value);
+          }
+        } catch (error) {
+          await cleanOnce();
+          controller.error(error);
+        }
+      },
+      async cancel(reason) {
+        try {
+          await reader.cancel(reason);
+        } finally {
+          await cleanOnce();
+        }
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  const deferred = new Response(body, {
+    headers: response.headers,
+    status: response.status,
+    statusText: response.statusText,
+  });
+  copyLinkHeaderProvenance(response.headers, deferred.headers);
+  return deferred;
+}
 
 export function applyDraftModeCachePolicy(response: Response, isDraftMode: boolean): Response {
   if (!isDraftMode) return response;
@@ -129,6 +240,7 @@ type ExecuteAppRouteHandlerOptions = {
   reportRequestError: AppRouteErrorReporter;
   expireSeconds?: number;
   revalidateSeconds: number | null;
+  revalidateReason?: "on-demand" | "stale";
   routePattern: string;
   setHeadersAccessPhase: (phase: HeadersAccessPhase) => HeadersAccessPhase;
 } & RunAppRouteHandlerOptions;
@@ -173,10 +285,11 @@ export async function runAppRouteHandler(
       return getAppRouteStaticGenerationErrorMessage(options.routePattern, expression);
     },
   });
+  const routePattern = options.routePattern ?? new URL(options.request.url).pathname;
   const response = await runWithRootParamsUsage(
     {
       kind: "route-handler",
-      routePattern: options.routePattern ?? new URL(options.request.url).pathname,
+      routePattern,
     },
     () =>
       options.handlerFn(trackedRequest.request, {
@@ -184,8 +297,10 @@ export async function runAppRouteHandler(
       }),
   );
 
+  const dynamicUsedInContext = options.consumeDynamicUsage();
   return {
-    dynamicUsedInHandler: options.consumeDynamicUsage(),
+    didAccessDynamicRequest: () => trackedRequest.didAccessDynamicRequest(),
+    dynamicUsedInHandler: trackedRequest.didAccessDynamicRequest() || dynamicUsedInContext,
     response,
   };
 }
@@ -193,35 +308,138 @@ export async function runAppRouteHandler(
 export async function executeAppRouteHandler(
   options: ExecuteAppRouteHandlerOptions,
 ): Promise<Response> {
+  return executeAppRouteHandlerImpl(options);
+}
+
+export function traceAppRouteHandlerExecution<T>(
+  routePattern: string,
+  callback: (span: FrameworkSpan) => T,
+): T {
+  const route = patternToNextFormat(routePattern);
+  return frameworkTracer.trace(
+    {
+      attributes: { "next.route": route },
+      name: `executing api route (app) ${route}`,
+      type: "AppRouteRouteHandlers.runHandler",
+    },
+    callback,
+  );
+}
+
+async function executeAppRouteHandlerImpl(
+  options: ExecuteAppRouteHandlerOptions,
+): Promise<Response> {
   const previousHeadersPhase = options.setHeadersAccessPhase("route-handler");
+  let cleanupDeferredToBody = false;
   const middlewareMergeOptions = {
     appendResponseLink:
       options.handler.runtime === "edge" || options.handler.runtime === "experimental-edge",
   };
 
   try {
-    let handlerResult: RunAppRouteHandlerResult;
+    type TracedHandlerOutcome =
+      | { kind: "handler"; handlerResult: RunAppRouteHandlerResult }
+      | { kind: "special"; error: unknown };
+    let tracedResult: TracedHandlerOutcome | undefined;
+    let traceError: unknown;
+    let traceFailed = false;
+    let pendingRevalidations = Promise.resolve();
     try {
-      handlerResult = await runAppRouteHandler({
-        ...options,
-        dynamicConfig: options.handler.dynamic,
+      tracedResult = await traceAppRouteHandlerExecution(options.routePattern, async () => {
+        try {
+          try {
+            return {
+              kind: "handler" as const,
+              handlerResult: await runAppRouteHandler({
+                ...options,
+                dynamicConfig: options.handler.dynamic,
+              }),
+            };
+          } catch (error) {
+            if (
+              resolveAppRouteHandlerSpecialError(error, options.request.url, {
+                isAction: isPossibleAppRouteActionRequest(options.request),
+              })
+            ) {
+              return { kind: "special" as const, error };
+            }
+            throw error;
+          }
+        } finally {
+          // Capture the request-scoped batch before leaving the handler's async
+          // context, but do not charge its durable work to runHandler.
+          pendingRevalidations = _drainPendingRevalidations();
+          void pendingRevalidations.catch(() => {});
+        }
       });
-    } finally {
-      // Route Handlers expose synchronous revalidation APIs; their async cache
-      // work belongs to the request lifecycle and must settle before response
-      // finalization clears the request context.
-      await _drainPendingRevalidations();
+    } catch (error) {
+      traceFailed = true;
+      traceError = error;
     }
-    const { dynamicUsedInHandler, response } = handlerResult;
+    let revalidationError: unknown;
+    let revalidationFailed = false;
+    try {
+      await pendingRevalidations;
+    } catch (error) {
+      revalidationFailed = true;
+      revalidationError = error;
+    }
+    if (traceFailed) throw traceError;
+    if (revalidationFailed) throw revalidationError;
+    if (!tracedResult) throw new Error("App Route Handler tracing completed without a result");
+    if (tracedResult.kind === "special") throw tracedResult.error;
+    const handlerResult = tracedResult.handlerResult;
+    let { dynamicUsedInHandler, response } = handlerResult;
     assertSupportedAppRouteHandlerResponse(response);
-    const handlerSetCacheControl = response.headers.has("cache-control");
+    const handlerSetCachePolicy = hasCdnResponsePolicy(response.headers);
+    const hasExplicitCacheablePolicy = hasExplicitCacheableResponsePolicy(response.headers);
+    if (hasExplicitCacheablePolicy) {
+      markRouteCacheabilityExplicitResponsePolicy();
+    }
 
+    const draftModeBeforeCompletion =
+      options.getActiveDraftModeState?.() ?? options.isDraftMode === true;
+    const handlerDraftCookieBeforeCompletion =
+      options.getDraftModeCookieHeader() ?? options.initialDraftModeCookie;
+    if (
+      shouldCompleteAppRouteHandlerResponse({
+        dynamicConfig: options.handler.dynamic,
+        dynamicUsedInHandler,
+        hasExplicitCacheablePolicy,
+        handlerSetCachePolicy,
+        isAutoHead: options.isAutoHead,
+        isDraftMode: draftModeBeforeCompletion || handlerDraftCookieBeforeCompletion != null,
+        isProduction: options.isProduction,
+        method: options.method,
+        revalidateSeconds: options.revalidateSeconds,
+        requiresCompletedResponseAdmission: isRouteCacheabilityEvaluation(),
+      })
+    ) {
+      const completed = await completeAppRouteHandlerResponse(response);
+      response = completed.response;
+      cleanupDeferredToBody = !completed.completed;
+      if (completed.completed) markRouteCacheabilityResponseBodyComplete();
+      const dynamicUsedDuringCompletion = options.consumeDynamicUsage();
+      dynamicUsedInHandler =
+        handlerResult.didAccessDynamicRequest() ||
+        dynamicUsedDuringCompletion ||
+        dynamicUsedInHandler;
+    }
+
+    const requestCacheabilityVeto = getRouteCacheabilityDynamicReason();
+    const responseMustStayPrivate = Boolean(
+      options.handler.dynamic === "force-dynamic" ||
+      dynamicUsedInHandler ||
+      requestCacheabilityVeto ||
+      cleanupDeferredToBody,
+    );
     if (dynamicUsedInHandler) {
       markKnownDynamicAppRoute(options.routePattern);
     }
 
     const pendingCookies = options.getAndClearPendingCookies();
-    const handlerDraftCookie = options.getDraftModeCookieHeader();
+    const handlerDraftCookie =
+      options.getDraftModeCookieHeader() ?? handlerDraftCookieBeforeCompletion;
     const draftCookie = handlerDraftCookie ?? options.initialDraftModeCookie;
     const activeDraftMode = options.getActiveDraftModeState?.() ?? options.isDraftMode === true;
     const shouldApplyDraftPolicy = activeDraftMode || draftCookie != null;
@@ -242,8 +460,8 @@ export async function executeAppRouteHandler(
 
     if (
       shouldApplyAppRouteHandlerRevalidateHeader({
-        dynamicUsedInHandler,
-        handlerSetCacheControl,
+        dynamicUsedInHandler: responseMustStayPrivate,
+        handlerSetCachePolicy,
         isAutoHead: options.isAutoHead,
         isDraftMode: shouldApplyDraftPolicy,
         method: options.method,
@@ -265,8 +483,8 @@ export async function executeAppRouteHandler(
     if (
       shouldWriteAppRouteHandlerCache({
         dynamicConfig: options.handler.dynamic,
-        dynamicUsedInHandler,
-        handlerSetCacheControl,
+        dynamicUsedInHandler: responseMustStayPrivate,
+        handlerSetCachePolicy,
         isAutoHead: options.isAutoHead,
         isDraftMode: shouldApplyDraftPolicy,
         isProduction: options.isProduction,
@@ -298,9 +516,7 @@ export async function executeAppRouteHandler(
       options.executionContext?.waitUntil(routeWritePromise);
     }
 
-    options.clearRequestContext();
-
-    return applyDraftModeCachePolicy(
+    let finalized = applyDraftModeCachePolicy(
       applyRouteHandlerMiddlewareContext(
         finalizeRouteHandlerResponse(response, {
           pendingCookies,
@@ -312,6 +528,37 @@ export async function executeAppRouteHandler(
       ),
       shouldApplyDraftPolicy,
     );
+    // Next.js preserves a Route Handler's explicit Cache-Control even when the
+    // handler used request data. During CDN probe/admission the adapter still
+    // owns fail-closed policy until the completed response is authorized.
+    const preserveHandlerPolicy = isRouteCacheabilityEvaluation()
+      ? hasExplicitCacheablePolicy
+      : handlerSetCachePolicy;
+    if (responseMustStayPrivate && !preserveHandlerPolicy) {
+      const headers = new Headers(finalized.headers);
+      applyCdnResponseHeaders(headers, { cacheControl: NEVER_CACHE_CONTROL });
+      finalized = new Response(finalized.body, {
+        headers,
+        status: finalized.status,
+        statusText: finalized.statusText,
+      });
+      copyLinkHeaderProvenance(response.headers, finalized.headers);
+    }
+
+    if (!cleanupDeferredToBody) {
+      options.clearRequestContext();
+      return finalized;
+    }
+
+    return deferAppRouteHandlerCleanup(finalized, async () => {
+      try {
+        await _drainPendingRevalidations();
+        options.consumeDynamicUsage();
+      } finally {
+        options.clearRequestContext();
+        options.setHeadersAccessPhase(previousHeadersPhase);
+      }
+    });
   } catch (error) {
     const pendingCookies = options.getAndClearPendingCookies();
     const handlerDraftCookie = options.getDraftModeCookieHeader();
@@ -359,8 +606,8 @@ export async function executeAppRouteHandler(
     }
 
     console.error("[vinext] Route handler error:", error);
-    options.reportRequestError(
-      error instanceof Error ? error : new Error(String(error)),
+    await options.reportRequestError(
+      error,
       {
         path: options.cleanPathname,
         method: options.request.method,
@@ -370,6 +617,7 @@ export async function executeAppRouteHandler(
         routerKind: "App Router",
         routePath: options.routePattern,
         routeType: "route",
+        revalidateReason: options.revalidateReason,
       },
     );
 
@@ -382,6 +630,6 @@ export async function executeAppRouteHandler(
       shouldApplyDraftPolicy,
     );
   } finally {
-    options.setHeadersAccessPhase(previousHeadersPhase);
+    if (!cleanupDeferredToBody) options.setHeadersAccessPhase(previousHeadersPhase);
   }
 }

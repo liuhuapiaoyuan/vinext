@@ -916,6 +916,11 @@ export async function bufferRequestBodyForHeaderClone(request: Request): Promise
  * must restore it explicitly.
  */
 export function attachRequestCfMetadata(target: Request, source: Request): Request {
+  const ownDescriptor = Object.getOwnPropertyDescriptor(source, "cf");
+  if (ownDescriptor) {
+    Object.defineProperty(target, "cf", ownDescriptor);
+    return target;
+  }
   const cf = getRequestCf(source);
   if (cf !== undefined) {
     Object.defineProperty(target, "cf", {

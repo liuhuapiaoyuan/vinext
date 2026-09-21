@@ -31,6 +31,8 @@ export default {
     ".": {
       entry: [
         "scripts/*.{js,ts,mjs,mts}",
+        // Loaded by Oxlint from the string paths in vite.config.ts.
+        "oxlint-plugins/*.ts",
         "tests/**/*.test.ts",
         "tests/helpers.ts",
         // Filesystem route entries in the standalone Vite/Worker fixture.
@@ -41,6 +43,7 @@ export default {
         // Vite's filesystem route/worker discovery rather than static imports.
         "tests/e2e/web-worker/fixtures/**/{vite.config.ts,*.worker.ts}",
         "tests/e2e/nextjs-worker/fixture/**/*.{js,ts,tsx}",
+        "tests/e2e/cacheability-components/fixture/{next.config.ts,vite.config.ts,app/**/{page,route}.{ts,tsx}}",
       ],
       project: ["tests/**/*.{js,ts}", "!tests/fixtures/**"],
       ignoreDependencies: [
@@ -91,6 +94,9 @@ export default {
         "src/server/app-page-element-builder.ts",
         "src/server/app-hook-warning-suppression.ts",
         "src/server/app-post-middleware-context.ts",
+        "src/server/app-route-handler-middleware-context.ts",
+        "src/server/app-request-stage-context.ts",
+        "src/server/app-request-stage-independent-entry.ts",
         "src/server/app-request-context.ts",
         "src/server/app-rsc-error-handler.ts",
         "src/server/isr-cache.ts",
@@ -112,6 +118,19 @@ export default {
       entry: [...entriesFromPackageJson("packages/cloudflare/package.json")],
       project: ["src/**/*.{ts,tsx}"],
     },
+    "packages/workers-response-store": {
+      entry: [
+        ...entriesFromPackageJson("packages/workers-response-store/package.json"),
+        "example/service-binding/{cache-worker,user-worker}.ts",
+      ],
+      project: ["src/**/*.{ts,tsx}", "example/**/*.ts"],
+    },
+    "apps/web": {
+      ignoreDependencies: [
+        // Referenced by path from wrangler.response-store.jsonc.
+        "@cloudflare/workers-response-store",
+      ],
+    },
     "packages/create-vinext-app": {
       entry: [...entriesFromPackageJson("packages/create-vinext-app/package.json")],
       project: ["src/**/*.{ts,tsx}"],
@@ -125,7 +144,7 @@ export default {
       ],
     },
   },
-  ignoreWorkspaces: ["examples/**", "tests/fixtures/**", "benchmarks/**"],
+  ignoreWorkspaces: ["examples/**", "tests/fixtures/**", "tests/e2e/**/fixture", "benchmarks/**"],
   ignoreDependencies: [
     // Imported only by declarations vendored from Next.js. @next/env and
     // sharp are covered by ambient stubs in @vinext/types; server-only is a
@@ -168,6 +187,7 @@ export default {
     "jq",
   ],
   ignoreFiles: [
+    "apps/web/dist/**",
     "tests/e2e/app-router/nextjs-compat/playwright.nextjs-compat.config.ts",
     "tests/e2e/app-front-redirect-issue/fixture/**/*.{js,ts,tsx}",
     // stub module loaded via `path.resolve()` as a Vite alias target

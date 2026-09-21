@@ -1,11 +1,16 @@
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { VinextCacheConfig } from "vinext/internal/cache-adapters";
 import { findViteConfigPath } from "vinext/internal/utils/project";
 import {
   DEFAULT_KV_DATA_CACHE_BINDING,
   type KvDataAdapterOptions,
 } from "./cache/kv-data-adapter.js";
+import {
+  DEFAULT_CDN_VERSION_METADATA_BINDING,
+  type CdnAdapterOptions,
+} from "./cache/cdn-adapter.js";
 
 function escapeRegExp(value: string): string {
   return value.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
@@ -106,7 +111,10 @@ export function viteConfigHasCacheAdapter(root: string): boolean {
     return true;
   }
   const block = extractCacheBlock(content);
-  if (!block) return false; // no cache config at all
+  if (!block) {
+    const assigned = /\bcache\s*:\s*([^,}\n]+)/.exec(content)?.[1].trim();
+    return Boolean(assigned && assigned !== "undefined" && assigned !== "null");
+  }
   return cacheFieldAssigned(block, "cdn") || cacheFieldAssigned(block, "data");
 }
 
@@ -115,6 +123,41 @@ export type ResolvedKvDataAdapterConfig = {
   appPrefix?: string;
   ttlSeconds?: number;
 };
+
+export type ResolvedCdnAdapterConfig = {
+  versionMetadataBinding: string;
+};
+
+function isCloudflareCdnAdapterPath(adapter: string): boolean {
+  const normalized = adapter.replace(/\\/g, "/");
+  return ["cdn-adapter.runtime", "response-store-cdn.runtime"].some((runtime) => {
+    const bundledRuntime = fileURLToPath(new URL(`./cache/${runtime}.js`, import.meta.url)).replace(
+      /\\/g,
+      "/",
+    );
+    return (
+      normalized === `@vinext/cloudflare/cache/${runtime}` ||
+      normalized === `@vinext/cloudflare/cache/${runtime}.js` ||
+      normalized === bundledRuntime
+    );
+  });
+}
+
+export function resolveCdnAdapterConfig(
+  cache: VinextCacheConfig | null | undefined,
+): ResolvedCdnAdapterConfig | null {
+  const cdn = cache?.cdn;
+  if (!cdn?.adapter || !isCloudflareCdnAdapterPath(cdn.adapter)) return null;
+
+  const options = cdn.options as CdnAdapterOptions | undefined;
+  return {
+    versionMetadataBinding:
+      typeof options?.versionMetadataBinding === "string" &&
+      options.versionMetadataBinding.length > 0
+        ? options.versionMetadataBinding
+        : DEFAULT_CDN_VERSION_METADATA_BINDING,
+  };
+}
 
 function isCloudflareKvDataAdapterPath(adapter: string): boolean {
   const normalized = adapter.replace(/\\/g, "/");

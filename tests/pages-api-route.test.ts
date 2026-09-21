@@ -11,6 +11,35 @@ import {
   type PagesApiRouteMatch,
 } from "../packages/vinext/src/server/pages-api-route.js";
 import { isVinextStreamedApiResponse } from "../packages/vinext/src/server/pages-node-compat.js";
+import { registerFrameworkTracingIntegration } from "../packages/vinext/src/server/tracer.js";
+import type {
+  FrameworkTracingBackendSpan,
+  ResolvedFrameworkSpanDescriptor,
+} from "../packages/vinext/src/server/framework-tracer.js";
+
+const recordedApiHandlerErrors: unknown[] = [];
+let recordedApiHandlerErrorStatus = false;
+let captureApiHandlerErrors = false;
+registerFrameworkTracingIntegration({
+  id: "pages-api-route-error-status-test",
+  enterSpan<T>(
+    descriptor: ResolvedFrameworkSpanDescriptor,
+    callback: (span: FrameworkTracingBackendSpan) => T,
+  ): T {
+    if (!captureApiHandlerErrors || descriptor.type !== "Node.runHandler") {
+      return callback({ setAttribute() {} });
+    }
+    return callback({
+      recordException(error) {
+        recordedApiHandlerErrors.push(error);
+      },
+      setAttribute() {},
+      setErrorStatus() {
+        recordedApiHandlerErrorStatus = true;
+      },
+    });
+  },
+});
 
 type PagesApiRouteModule = PagesApiRouteMatch["route"]["module"];
 
@@ -32,6 +61,51 @@ function createMatch(
 }
 
 describe("pages api route", () => {
+  it("lets a handler override response headers installed before user code", async () => {
+    const response = await handlePagesApiRoute({
+      initialResponseHeaders: new Headers({
+        "Cache-Control": "public, s-maxage=60",
+        Vary: "x-visitor",
+        "x-config-variant": "preview",
+        "x-from-middleware": "present",
+      }),
+      match: createMatch((_req, res) => {
+        expect(res.getHeader("x-config-variant")).toBe("preview");
+        expect(res.getHeader("x-from-middleware")).toBe("present");
+        res.setHeader("Cache-Control", "private, no-store");
+        res.json({ ok: true });
+      }),
+      request: new Request("https://example.com/api/policy"),
+      url: "/api/policy",
+    });
+
+    expect(response.headers.get("Cache-Control")).toBe("private, no-store");
+    expect(response.headers.get("Vary")).toBe("x-visitor");
+    expect(response.headers.get("x-config-variant")).toBe("preview");
+    expect(response.headers.get("x-from-middleware")).toBe("present");
+  });
+
+  it("exposes all staged cookies to Node API handlers without collapsing them", async () => {
+    const initialResponseHeaders = new Headers();
+    initialResponseHeaders.append("Set-Cookie", "middleware=one; Path=/");
+    initialResponseHeaders.append(
+      "Set-Cookie",
+      "config=two; Expires=Wed, 21 Oct 2037 07:28:00 GMT; Path=/",
+    );
+
+    const response = await handlePagesApiRoute({
+      initialResponseHeaders,
+      match: createMatch((_req, res) => {
+        expect(res.getHeader("Set-Cookie")).toEqual(initialResponseHeaders.getSetCookie());
+        res.end("ok");
+      }),
+      request: new Request("https://example.com/api/cookies"),
+      url: "/api/cookies",
+    });
+
+    expect(response.headers.getSetCookie()).toEqual(initialResponseHeaders.getSetCookie());
+  });
+
   it("does not expose process environment variables on the request", async () => {
     const previousValue = process.env.VINEXT_API_REQUEST_ENV_TEST;
     process.env.VINEXT_API_REQUEST_ENV_TEST = "secret";
@@ -155,22 +229,40 @@ describe("pages api route", () => {
     expect(Buffer.from(await response.arrayBuffer()).equals(Buffer.from([1, 2, 3]))).toBe(true);
   });
 
-  it("reports thrown handler errors and returns a 500 response", async () => {
-    const reportRequestError = vi.fn();
+  // Ported from Next.js: test/e2e/opentelemetry/instrumentation/opentelemetry.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/opentelemetry/instrumentation/opentelemetry.test.ts
+  it.each([
+    { edgeRuntime: "node" as const, marksHandlerSpanFailed: false },
+    { edgeRuntime: "worker" as const, marksHandlerSpanFailed: true },
+  ])(
+    "reports thrown $edgeRuntime handler errors with runtime-specific span status",
+    async ({ edgeRuntime, marksHandlerSpanFailed }) => {
+      const reportRequestError = vi.fn();
+      recordedApiHandlerErrors.length = 0;
+      recordedApiHandlerErrorStatus = false;
+      captureApiHandlerErrors = true;
 
-    const response = await handlePagesApiRoute({
-      match: createMatch(() => {
-        throw new Error("boom");
-      }),
-      reportRequestError,
-      request: new Request("https://example.com/api/fail"),
-      url: "/api/fail",
-    });
+      try {
+        const response = await handlePagesApiRoute({
+          edgeRuntime,
+          match: createMatch(() => {
+            throw new Error("boom");
+          }),
+          reportRequestError,
+          request: new Request("https://example.com/api/fail"),
+          url: "/api/fail",
+        });
 
-    expect(response.status).toBe(500);
-    await expect(response.text()).resolves.toBe("Internal Server Error");
-    expect(reportRequestError).toHaveBeenCalledWith(expect.any(Error), "/api/test");
-  });
+        expect(response.status).toBe(500);
+        await expect(response.text()).resolves.toBe("Internal Server Error");
+        expect(reportRequestError).toHaveBeenCalledWith(expect.any(Error), "/api/test");
+        expect(recordedApiHandlerErrors).toHaveLength(marksHandlerSpanFailed ? 1 : 0);
+        expect(recordedApiHandlerErrorStatus).toBe(marksHandlerSpanFailed);
+      } finally {
+        captureApiHandlerErrors = false;
+      }
+    },
+  );
 
   it("returns 413 when the API body exceeds the default size limit", async () => {
     const response = await handlePagesApiRoute({
@@ -448,6 +540,37 @@ describe("pages api route", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({ id: "req-42" });
+  });
+
+  it("preserves multiple cookies returned by a staged edge API handler", async () => {
+    const initialResponseHeaders = new Headers();
+    initialResponseHeaders.append("Set-Cookie", "middleware=one; Path=/");
+    const response = await handlePagesApiRoute({
+      initialResponseHeaders,
+      match: createMatch(
+        () => {
+          const headers = new Headers();
+          headers.append("Set-Cookie", "middleware=one; Path=/");
+          headers.append("Set-Cookie", "handler=one; Path=/");
+          headers.append(
+            "Set-Cookie",
+            "handler=two; Expires=Wed, 21 Oct 2037 07:28:00 GMT; Path=/",
+          );
+          return new Response("edge", { headers });
+        },
+        {},
+        { runtime: "edge" },
+      ),
+      request: new Request("https://example.com/api/cookies"),
+      url: "/api/cookies",
+    });
+
+    expect(response.headers.getSetCookie()).toEqual([
+      "middleware=one; Path=/",
+      "middleware=one; Path=/",
+      "handler=one; Path=/",
+      "handler=two; Expires=Wed, 21 Oct 2037 07:28:00 GMT; Path=/",
+    ]);
   });
 
   it("removes stale encoding headers after Node fetch decodes an edge API response", async () => {
@@ -834,9 +957,14 @@ describe("pages api route", () => {
   });
 
   it("returns a 500 when the response stream is destroyed with an error before any body has been written", async () => {
-    const reportRequestError = vi.fn();
+    let finishReporting!: () => void;
+    const reportingFinished = new Promise<void>((resolve) => {
+      finishReporting = resolve;
+    });
+    const reportRequestError = vi.fn(() => reportingFinished);
+    let responseSettled = false;
 
-    const response = await handlePagesApiRoute({
+    const responsePromise = handlePagesApiRoute({
       match: createMatch(
         (_req, res) => {
           // Simulate a proxy handler where the upstream errors and the
@@ -856,8 +984,17 @@ describe("pages api route", () => {
         body: "some-body",
       }),
       url: "/api/stream-error",
+    }).then((response) => {
+      responseSettled = true;
+      return response;
     });
 
+    // Ported from Next.js: packages/next/src/server/api-utils/node/api-resolver.ts
+    // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/api-utils/node/api-resolver.ts
+    await vi.waitFor(() => expect(reportRequestError).toHaveBeenCalledOnce());
+    expect(responseSettled).toBe(false);
+    finishReporting();
+    const response = await responsePromise;
     expect(response.status).toBe(500);
     await expect(response.text()).resolves.toBe("Internal Server Error");
     expect(reportRequestError).toHaveBeenCalledWith(expect.any(Error), "/api/test");
@@ -1041,11 +1178,21 @@ describe("pages api route", () => {
   });
 
   it("unwinds a parked write when an active streaming handler rejects", async () => {
-    const reportRequestError = vi.fn();
+    let finishReporting!: () => void;
+    const reportingFinished = new Promise<void>((resolve) => {
+      finishReporting = resolve;
+    });
+    const reportRequestError = vi.fn(() => reportingFinished);
     const failure = new Error("handler failed after writing");
     let writeError: Error | null | undefined;
+    const waitUntilPromises: Promise<unknown>[] = [];
 
     const response = await handlePagesApiRoute({
+      ctx: {
+        waitUntil(promise) {
+          waitUntilPromises.push(promise);
+        },
+      },
       match: createMatch(async (_req, res) => {
         res.write(Buffer.alloc(64 * 1024), (error: Error | null | undefined) => {
           writeError = error;
@@ -1059,8 +1206,20 @@ describe("pages api route", () => {
 
     expect(response.status).toBe(200);
     await expect(response.text()).rejects.toThrow(failure.message);
-    await vi.waitFor(() => expect(writeError).toBe(failure));
-    expect(reportRequestError).toHaveBeenCalledWith(failure, "/api/test");
+    await vi.waitFor(() => {
+      expect(writeError).toBe(failure);
+      expect(reportRequestError).toHaveBeenCalledWith(failure, "/api/test");
+    });
+    expect(waitUntilPromises).toHaveLength(1);
+    let lifecycleSettled = false;
+    void waitUntilPromises[0].then(() => {
+      lifecycleSettled = true;
+    });
+    await Promise.resolve();
+    expect(lifecycleSettled).toBe(false);
+    finishReporting();
+    await waitUntilPromises[0];
+    expect(lifecycleSettled).toBe(true);
   });
 
   it("passes cancellation errors to a parked write callback", async () => {

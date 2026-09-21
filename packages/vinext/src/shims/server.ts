@@ -138,13 +138,18 @@ export class NextRequest extends Request {
       // the source request to stay readable must branch it themselves and
       // cancel the branch they do not consume.
       super(input, requestInit);
-      const cf = Reflect.get(input, "cf");
-      if (cf !== undefined) {
-        Object.defineProperty(this, "cf", {
-          value: cf,
-          enumerable: true,
-          configurable: true,
-        });
+      const cfDescriptor = Reflect.getOwnPropertyDescriptor(input, "cf");
+      if (cfDescriptor) {
+        Object.defineProperty(this, "cf", cfDescriptor);
+      } else {
+        const cf = Reflect.get(input, "cf");
+        if (cf !== undefined) {
+          Object.defineProperty(this, "cf", {
+            value: cf,
+            enumerable: true,
+            configurable: true,
+          });
+        }
       }
     } else {
       super(input, requestInit);
@@ -1183,36 +1188,8 @@ export class NextFetchEvent {
 // Utility exports
 // ---------------------------------------------------------------------------
 
-/**
- * Parse user agent string. Minimal implementation — for full UA parsing,
- * apps should use a dedicated library like `ua-parser-js`.
- */
-export function userAgentFromString(ua: string | undefined): UserAgent {
-  const input = ua ?? "";
-  return {
-    isBot: /bot|crawler|spider|crawling/i.test(input),
-    ua: input,
-    browser: {},
-    device: {},
-    engine: {},
-    os: {},
-    cpu: {},
-  };
-}
-
-export function userAgent({ headers }: { headers: Headers }): UserAgent {
-  return userAgentFromString(headers.get("user-agent") ?? undefined);
-}
-
-export type UserAgent = {
-  isBot: boolean;
-  ua: string;
-  browser: { name?: string; version?: string; major?: string };
-  device: { model?: string; type?: string; vendor?: string };
-  engine: { name?: string; version?: string };
-  os: { name?: string; version?: string };
-  cpu: { architecture?: string };
-};
+export { userAgent, userAgentFromString } from "./user-agent.js";
+export type { UserAgent } from "./user-agent.js";
 
 /**
  * after() — schedule work after the response is sent.

@@ -74,13 +74,20 @@ import {
   type ServerActionLogInfo,
 } from "./server-action-logger.js";
 import { markAppRscResponseConfigHeadersApplied } from "./app-rsc-response-finalizer.js";
+import type { AppRenderErrorContextOverrides } from "./app-rsc-error-handler.js";
 
 type AppPageParams = Record<string, string | string[]>;
 
 type AppServerActionErrorReporter = (
-  error: Error,
+  error: unknown,
   request: { path: string; method: string; headers: Record<string, string> },
-  route: { routerKind: "App Router"; routePath: string; routeType: "action" },
+  route: {
+    routerKind: "App Router";
+    routePath: string;
+    routeType: "action";
+    renderSource: "react-server-components-payload";
+    revalidateReason: undefined;
+  },
 ) => void;
 
 type AppServerActionDecoder = (body: FormData) => Promise<unknown>;
@@ -249,6 +256,7 @@ export type HandleProgressiveServerActionRequestOptions = {
   readFormDataWithLimit: ReadFormDataWithLimit;
   reportRequestError: AppServerActionErrorReporter;
   request: Request;
+  routePattern: string;
   setHeadersAccessPhase: (phase: HeadersAccessPhase) => HeadersAccessPhase;
 };
 
@@ -344,6 +352,7 @@ export type HandleServerActionRscRequestOptions<
     request: Request,
     pathname: string,
     pattern: string,
+    overrides?: AppRenderErrorContextOverrides,
   ) => (error: unknown) => unknown;
   createTemporaryReferenceSet: () => TTemporaryReferences;
   decodeReply: (
@@ -851,10 +860,6 @@ function isAppServerActionFunction(action: unknown): action is AppServerActionFu
   return typeof action === "function";
 }
 
-function normalizeError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
-}
-
 function getServerActionFailureMessage(error: unknown): string {
   return error instanceof Error && error.message ? error.message : String(error);
 }
@@ -1106,18 +1111,25 @@ function createServerActionErrorResponse(
     getAndClearPendingCookies: () => string[];
     reportRequestError: AppServerActionErrorReporter;
     request: Request;
+    routePattern: string;
   },
 ): Response {
   options.getAndClearPendingCookies();
   console.error("[vinext] Server action error:", error);
   options.reportRequestError(
-    normalizeError(error),
+    error,
     {
       path: options.cleanPathname,
       method: options.request.method,
       headers: Object.fromEntries(options.request.headers.entries()),
     },
-    { routerKind: "App Router", routePath: options.cleanPathname, routeType: "action" },
+    {
+      routerKind: "App Router",
+      routePath: options.routePattern,
+      routeType: "action",
+      renderSource: "react-server-components-payload",
+      revalidateReason: undefined,
+    },
   );
   options.clearRequestContext();
   return internalServerErrorResponse(
@@ -1290,13 +1302,19 @@ export async function handleProgressiveServerActionRequest(
         if (!isControlFlow) {
           console.error("[vinext] Server action error:", error);
           options.reportRequestError(
-            normalizeError(error),
+            error,
             {
               path: options.cleanPathname,
               method: options.request.method,
               headers: Object.fromEntries(options.request.headers.entries()),
             },
-            { routerKind: "App Router", routePath: options.cleanPathname, routeType: "action" },
+            {
+              routerKind: "App Router",
+              routePath: options.routePattern,
+              routeType: "action",
+              renderSource: "react-server-components-payload",
+              revalidateReason: undefined,
+            },
           );
         }
       }
@@ -1393,13 +1411,19 @@ export async function handleProgressiveServerActionRequest(
     options.getAndClearPendingCookies();
     console.error("[vinext] Server action payload parsing error:", error);
     options.reportRequestError(
-      normalizeError(error),
+      error,
       {
         path: options.cleanPathname,
         method: options.request.method,
         headers: Object.fromEntries(options.request.headers.entries()),
       },
-      { routerKind: "App Router", routePath: options.cleanPathname, routeType: "action" },
+      {
+        routerKind: "App Router",
+        routePath: options.routePattern,
+        routeType: "action",
+        renderSource: "react-server-components-payload",
+        revalidateReason: undefined,
+      },
     );
     options.clearRequestContext();
     return internalServerErrorResponse(
@@ -1441,13 +1465,19 @@ async function renderFetchActionBodyExceededResponse<
   const error = createBodyExceededError(options.maxActionBodySizeLabel);
   console.error("[vinext] Server action error:", error);
   options.reportRequestError(
-    normalizeError(error),
+    error,
     {
       path: options.cleanPathname,
       method: options.request.method,
       headers: Object.fromEntries(options.request.headers.entries()),
     },
-    { routerKind: "App Router", routePath: options.cleanPathname, routeType: "action" },
+    {
+      routerKind: "App Router",
+      routePath: options.currentRouteMatch?.route.pattern ?? options.cleanPathname,
+      routeType: "action",
+      renderSource: "react-server-components-payload",
+      revalidateReason: undefined,
+    },
   );
   // Discard any side effects accumulated before the limit was hit.
   getAndClearActionRevalidationKind();
@@ -1461,7 +1491,8 @@ async function renderFetchActionBodyExceededResponse<
   const onRenderError = options.createRscOnErrorHandler(
     options.request,
     options.cleanPathname,
-    options.cleanPathname,
+    options.currentRouteMatch?.route.pattern ?? options.cleanPathname,
+    { renderSource: "react-server-components-payload", routeType: "action" },
   );
   const rscStream = await options.renderToReadableStream(
     { returnValue },
@@ -1768,7 +1799,8 @@ export async function handleServerActionRscRequest<
       const onRenderError = options.createRscOnErrorHandler(
         options.request,
         options.cleanPathname,
-        options.cleanPathname,
+        options.currentRouteMatch?.route.pattern ?? options.cleanPathname,
+        { renderSource: "react-server-components-payload", routeType: "action" },
       );
       const rscStream = await options.renderToReadableStream(
         { returnValue },
@@ -1888,6 +1920,7 @@ export async function handleServerActionRscRequest<
       options.request,
       options.cleanPathname,
       errorPattern,
+      { renderSource: "react-server-components-payload", routeType: "action" },
     );
     const renderActionRerender = () =>
       options.renderToReadableStream(
@@ -1930,6 +1963,7 @@ export async function handleServerActionRscRequest<
       getAndClearPendingCookies: options.getAndClearPendingCookies,
       reportRequestError: options.reportRequestError,
       request: options.request,
+      routePattern: options.currentRouteMatch?.route.pattern ?? options.cleanPathname,
     });
   }
 }

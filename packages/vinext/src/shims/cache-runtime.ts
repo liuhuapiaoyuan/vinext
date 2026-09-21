@@ -50,9 +50,19 @@ import {
   runWithUnifiedStateMutation,
 } from "./unified-request-context.js";
 import { isDraftModeEnabled, markDynamicUsage } from "./headers.js";
-import { trackPprFallbackShellCacheTask } from "./ppr-fallback-shell.js";
+import {
+  createPprFallbackShellSuspensePromise,
+  trackPprFallbackShellCacheTask,
+} from "./ppr-fallback-shell.js";
 import { isMarkedAppPagePropsObject } from "./internal/app-page-props-cache-key.js";
 import { getCurrentRootParams, type RootParams } from "./root-params.js";
+import {
+  isRouteCacheabilityProbe,
+  recordRouteCacheabilityProbeBailout,
+} from "./cacheability-classification.js";
+import { workUnitAsyncStorage } from "./internal/work-unit-async-storage.js";
+import { suppressHangingPromiseAbortRejections } from "./internal/make-hanging-promise.js";
+import type { VinextCacheFunctionInvocation } from "../server/multi-stage.js";
 
 export { markAppPagePropsForUseCache } from "./internal/app-page-props-cache-key.js";
 
@@ -153,6 +163,10 @@ export type CacheContext = {
 // Store on globalThis via Symbol so headers.ts can detect "use cache" scope
 // without a direct import (avoiding circular dependencies).
 export const cacheContextStorage = getOrCreateAls<CacheContext>("vinext.cacheRuntime.contextAls");
+// `unstable_cache()` owns a separate scope in cache.ts. Use the shared ALS
+// registry directly here so checking the parent does not pull the full
+// `next/cache` implementation into the use-cache runtime chunk.
+const unstableCacheContextStorage = getOrCreateAls<boolean>("vinext.unstableCache.als");
 
 // Register the context accessor so cacheLife()/cacheTag() in cache.ts can
 // access the context without a circular import.
@@ -564,6 +578,8 @@ export type RegisterCachedFunctionOptions = {
   /** Number of declared arguments supplied by the directive transform. */
   argumentCount?: number;
   decryptCaptures?: (value: unknown) => Promise<unknown[] | undefined>;
+  encodeInvocationArgs?: (args: unknown[]) => Promise<string>;
+  serverReferenceId?: string;
 };
 
 /**
@@ -592,8 +608,50 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
   // it's scoped to a single request and doesn't persist across HMR.
   const isDev = typeof process !== "undefined" && process.env.NODE_ENV === "development";
 
-  const cachedFn = (...args: TArgs): Promise<TResult> =>
-    trackPprFallbackShellCacheTask(async (): Promise<TResult> => {
+  const cachedFn = (...args: TArgs): Promise<TResult> => {
+    if (cacheVariant === "private") {
+      const parentCtx = cacheContextStorage.getStore();
+      if (parentCtx && parentCtx.variant !== "private") {
+        throwPrivateUseCacheInsidePublicUseCacheError();
+      }
+      if (unstableCacheContextStorage.getStore() === true) {
+        throwPrivateUseCacheInsideUnstableCacheError();
+      }
+      // Next.js decides that a private cache requires request-time execution at
+      // the cache boundary, before key serialization or any private user code.
+      markDynamicUsage();
+      const expression = '"use cache: private"';
+      const workUnit = workUnitAsyncStorage.getStore();
+      const isPrerenderWorkUnit =
+        workUnit?.type === "prerender" ||
+        workUnit?.type === "prerender-client" ||
+        workUnit?.type === "prerender-runtime";
+      if (isPrerenderWorkUnit) {
+        if (isRouteCacheabilityProbe()) {
+          recordRouteCacheabilityProbeBailout("private-cache", {
+            cacheable: false,
+            dynamicUsage: true,
+            reason: `${expression} requires request-time execution`,
+          });
+        }
+        suppressHangingPromiseAbortRejections(workUnit.renderSignal);
+        workUnit.signalPrerenderBailout?.(expression);
+        return new Promise<TResult>(() => {});
+      }
+      const fallbackShellPromise = createPprFallbackShellSuspensePromise<TResult>(expression);
+      if (fallbackShellPromise) return fallbackShellPromise;
+      if (isRouteCacheabilityProbe()) {
+        recordRouteCacheabilityProbeBailout("private-cache", {
+          cacheable: false,
+          dynamicUsage: true,
+          classificationFailure: true,
+          reason: `${expression} probe was not running in a prerender work unit`,
+        });
+        return new Promise<TResult>(() => {});
+      }
+    }
+
+    return trackPprFallbackShellCacheTask(async (): Promise<TResult> => {
       const rsc = await getRscModule();
       const keySeed = getUseCacheKeySeed();
       const captures = options.decryptCaptures ? await options.decryptCaptures(args[0]) : undefined;
@@ -640,23 +698,11 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
         }
       } catch {
         // Non-serializable arguments — run without caching
-        return fn(...callArgs);
+        return (await executeWithContext(fn, callArgs, cacheVariant)).result;
       }
 
       // "use cache: private" uses per-request in-memory cache
       if (cacheVariant === "private") {
-        const parentCtx = cacheContextStorage.getStore();
-        if (parentCtx && parentCtx.variant !== "private") {
-          throwPrivateUseCacheInsidePublicUseCacheError();
-        }
-
-        if (typeof process !== "undefined" && process.env.VINEXT_PRERENDER === "1") {
-          // Next.js treats "use cache: private" as dynamic during prerendering:
-          // it is excluded from the static artifact and resolved per request.
-          // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/use-cache/use-cache-wrapper.ts
-          markDynamicUsage();
-        }
-
         const privateCache = _getPrivateState()._privateCache!;
         const privateHit = privateCache.get(cacheKey);
         if (privateHit !== undefined) {
@@ -784,6 +830,21 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
       // Component work is reflected in `ctx` before selecting the final key.
       if (collectedResult?.cacheEntry) {
         try {
+          let cacheFunctionInvocation: VinextCacheFunctionInvocation | undefined;
+          if (options.serverReferenceId && options.encodeInvocationArgs) {
+            try {
+              cacheFunctionInvocation = {
+                encryptedArgs: await options.encodeInvocationArgs(admittedArgs),
+                referenceId: options.serverReferenceId,
+                rootParams: Object.fromEntries(
+                  Object.entries(rootParams ?? {}).filter((entry) => entry[1] !== undefined),
+                ) as Record<string, string | string[]>,
+                softTags,
+              };
+            } catch {
+              // Some request-local values cannot be replayed after this render.
+            }
+          }
           const serialized = collectedResult.cacheEntry;
           const cacheValue = {
             kind: "FETCH",
@@ -798,6 +859,7 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
           const cacheContext = {
             fetchCache: true,
             tags: ctx.tags,
+            ...(cacheFunctionInvocation ? { cacheFunctionInvocation } : {}),
             cacheControl: {
               revalidate: revalidateSeconds,
               expire: effectiveLife.expire,
@@ -842,6 +904,7 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
 
       return collectedResult ? collectedResult.result : result;
     }, cacheVariant);
+  };
 
   // Preserve the original function's arity on the wrapper. The wrapper is
   // declared as `(...args)` (arity 0), which hides the original signature.
@@ -871,10 +934,24 @@ const USE_CACHE_FUNCTION_SYMBOL = Symbol.for("vinext.useCacheFunction");
 /** @internal Symbol carrying transform-derived cached function argument metadata. */
 const USE_CACHE_ACCEPTS_SECOND_ARGUMENT_SYMBOL = Symbol.for("vinext.useCacheAcceptsSecondArgument");
 
+/** Whether a loaded server reference is a transformed `"use cache"` function. */
+export function isUseCacheFunction(
+  value: unknown,
+): value is (...args: unknown[]) => Promise<unknown> {
+  return typeof value === "function" && Reflect.get(value, USE_CACHE_FUNCTION_SYMBOL) === true;
+}
+
 function throwPrivateUseCacheInsidePublicUseCacheError(): never {
   const error = new Error(
     '"use cache: private" must not be used within "use cache". It can only be nested inside of another "use cache: private".',
   );
+  const ctx = getRequestContext();
+  if (ctx) ctx.invalidDynamicUsageError = error;
+  throw error;
+}
+
+function throwPrivateUseCacheInsideUnstableCacheError(): never {
+  const error = new Error('"use cache: private" must not be used within `unstable_cache()`.');
   const ctx = getRequestContext();
   if (ctx) ctx.invalidDynamicUsageError = error;
   throw error;
@@ -1068,13 +1145,16 @@ async function runCachedFunctionWithContext<
   };
 
   let collectedResult: TCollected | undefined;
-  const result = await cacheContextStorage.run(ctx, async () => {
-    const value = await fn(...args);
-    if (collectResult) {
-      collectedResult = await collectResult(value, ctx);
-    }
-    return value;
-  });
+  const workUnitType: "cache" | "private-cache" = variant === "private" ? "private-cache" : "cache";
+  const result = await workUnitAsyncStorage.run({ type: workUnitType }, () =>
+    cacheContextStorage.run(ctx, async () => {
+      const value = await fn(...args);
+      if (collectResult) {
+        collectedResult = await collectResult(value, ctx);
+      }
+      return value;
+    }),
+  );
 
   if (ctx.invalidDynamicUsageError) {
     throw ctx.invalidDynamicUsageError;

@@ -166,6 +166,7 @@ const projectServers = {
     testDir: "./tests/e2e",
     testMatch: [
       "**/cloudflare-workers/**/*.spec.ts",
+      "**/cloudflare-response-store.spec.ts",
       "**/app-router/instrumentation.spec.ts",
       "**/og-image.spec.ts",
     ],
@@ -175,7 +176,7 @@ const projectServers = {
       : {
           // Build app-router-cloudflare with Vite, then serve with wrangler dev (miniflare)
           command:
-            "npx vp build && npx wrangler dev --config dist/server/wrangler.json --port 4176",
+            "VINEXT_RESPONSE_STORE_E2E=1 npx vp build && npx wrangler dev --config dist/server/wrangler.json --port 4176",
           cwd: "./examples/app-router-cloudflare",
           port: 4176,
           reuseExistingServer: !process.env.CI,
@@ -195,6 +196,20 @@ const projectServers = {
       timeout: 60_000,
     },
   },
+  "cloudflare-sentry-app-workers-cache": {
+    testDir: "./tests/e2e",
+    testMatch: ["**/cloudflare-sentry-app/**/*.spec.ts"],
+    grep: /cached RSC payload|response start for an App Page cache hit|trace metadata from static HTML/,
+    use: { baseURL: "http://localhost:4210" },
+    server: {
+      command:
+        "VINEXT_SENTRY_CACHE=workers NEXT_PUBLIC_VINEXT_TEST_SENTRY_DSN=http://public@localhost:4210/1 npx vp build && npx wrangler dev --config .vinext/workers-cache/server/wrangler.json --port 4210",
+      cwd: "./tests/fixtures/cf-sentry-app",
+      port: 4210,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+  },
   "cloudflare-sentry-pages": {
     testDir: "./tests/e2e",
     testMatch: ["**/cloudflare-sentry-pages/**/*.spec.ts"],
@@ -208,10 +223,37 @@ const projectServers = {
       timeout: 60_000,
     },
   },
+  "sentry-nextjs-16-static": {
+    testDir: "./tests/e2e/sentry-nextjs-16-static/fixture/tests",
+    use: { baseURL: "http://localhost:3030" },
+    server: {
+      command:
+        "test -e node_modules && npx vp run vinext#build && node ../../../../packages/vinext/dist/cli.js build && node ../../../../packages/vinext/dist/cli.js start --port 3030 --hostname ::",
+      cwd: "./tests/e2e/sentry-nextjs-16-static/fixture",
+      port: 3030,
+      reuseExistingServer: false,
+      timeout: 120_000,
+      env: {
+        NEXT_PUBLIC_E2E_TEST_DSN: "http://public@localhost:3031/1",
+        PORT: "3030",
+        TEST_ENV: "production",
+      },
+    },
+    additionalServers: [
+      {
+        command: "node event-proxy.mjs",
+        cwd: "./tests/e2e/sentry-nextjs-16-static/fixture",
+        port: 3031,
+        reuseExistingServer: false,
+        timeout: 30_000,
+      },
+    ],
+  },
   "cloudflare-dev": {
     testDir: "./tests/e2e",
     testMatch: [
       "**/cloudflare-dev/**/*.spec.ts",
+      "**/cloudflare-response-store.spec.ts",
       "**/app-router/instrumentation.spec.ts",
       "**/og-image.spec.ts",
     ],
@@ -219,7 +261,7 @@ const projectServers = {
     server: {
       // Run vite dev (not wrangler) against the cloudflare example so that
       // configureServer() is exercised with @cloudflare/vite-plugin loaded.
-      command: "npx vp dev --port 4178",
+      command: "VINEXT_RESPONSE_STORE_E2E=1 npx vp dev --port 4178",
       cwd: "./examples/app-router-cloudflare",
       port: 4178,
       reuseExistingServer: !process.env.CI,
@@ -252,6 +294,18 @@ const projectServers = {
         "npx vp run vinext#build && node ../../../packages/vinext/dist/cli.js build && node ../../../tests/e2e/static-export/serve-static.mjs dist/client 4180",
       cwd: "./tests/fixtures/static-export",
       port: 4180,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+  },
+  "static-export-basepath": {
+    testDir: "./tests/e2e/static-export-basepath",
+    use: { baseURL: "http://localhost:4203/docs" },
+    server: {
+      command:
+        "npx vp run vinext#build && node ../../../packages/vinext/dist/cli.js build && node ../../../tests/e2e/static-export/serve-static.mjs dist/client 4203",
+      cwd: "./tests/fixtures/static-export-basepath",
+      port: 4203,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
@@ -316,11 +370,23 @@ const projectServers = {
     use: { baseURL: "http://localhost:4187" },
     server: {
       command:
-        "npx vp run vinext#build && node ../../../packages/vinext/dist/cli.js build && node ../../../packages/vinext/dist/cli.js start --port 4187",
+        "npx vp run vinext#build && npx vp build && node embed-cacheability-manifest.mjs && npx wrangler dev --config dist/server/wrangler.json --port 4187",
       cwd: "./tests/fixtures/ppr-impact-demo",
       port: 4187,
       reuseExistingServer: !process.env.CI,
-      timeout: 90_000,
+      timeout: 120_000,
+    },
+  },
+  "cacheability-components": {
+    testDir: "./tests/e2e/cacheability-components",
+    use: { baseURL: "http://localhost:4209" },
+    server: {
+      command:
+        "(test -e node_modules || test -L node_modules || ln -s ../../../fixtures/ppr-impact-demo/node_modules node_modules) && npx vp run vinext#build && node ../../../../packages/vinext/dist/cli.js build && npx wrangler dev --config dist/server/wrangler.json --port 4209",
+      cwd: "./tests/e2e/cacheability-components/fixture",
+      port: 4209,
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
     },
   },
   "app-front-redirect-issue": {
@@ -478,6 +544,10 @@ const activeProjects: ProjectName[] = selected
   ? [selected as ProjectName]
   : (Object.keys(projectServers) as ProjectName[]);
 
+if (activeProjects.includes("sentry-nextjs-16-static")) {
+  process.env.TEST_ENV = "production";
+}
+
 export default defineConfig({
   testDir: "./tests/e2e",
   timeout: 30_000,
@@ -496,13 +566,20 @@ export default defineConfig({
       testDir: p.testDir,
       ...("testMatch" in p ? { testMatch: p.testMatch } : {}),
       ...("testIgnore" in p ? { testIgnore: p.testIgnore } : {}),
+      ...("grep" in p ? { grep: p.grep } : {}),
       ...("use" in p ? { use: p.use } : {}),
     };
   }),
   webServer: [
     ...new Map(
       activeProjects
-        .map((name) => projectServers[name].server)
+        .flatMap((name) => {
+          const project = projectServers[name];
+          return [
+            project.server,
+            ...("additionalServers" in project ? project.additionalServers : []),
+          ];
+        })
         .filter(
           (server): server is NonNullable<(typeof projectServers)[ProjectName]["server"]> =>
             server != null,

@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vite-plus/test";
-import { executeMiddleware } from "../packages/vinext/src/server/middleware-runtime.js";
+import {
+  executeMiddleware,
+  runGeneratedMiddleware,
+} from "../packages/vinext/src/server/middleware-runtime.js";
 import type { NextRequest } from "../packages/vinext/src/shims/server.js";
 
 describe("middleware pathname matching", () => {
@@ -431,6 +434,238 @@ describe("middleware redirect protocol", () => {
     });
 
     expect((capturedRequest as NextRequest & { __isData?: boolean }).__isData).toBeUndefined();
+  });
+
+  it("reports whether the configured matcher accepted the request", async () => {
+    const onMatch = vi.fn();
+    const module = {
+      config: { matcher: "/matched/:path*" },
+      default: () => undefined,
+    };
+
+    await executeMiddleware({
+      isProxy: false,
+      module,
+      onMatch,
+      request: new Request("http://localhost:3000/not-matched"),
+    });
+    expect(onMatch).not.toHaveBeenCalled();
+
+    await executeMiddleware({
+      isProxy: false,
+      module,
+      onMatch,
+      request: new Request("http://localhost:3000/matched/page"),
+    });
+    expect(onMatch).toHaveBeenCalledOnce();
+  });
+
+  it("reports pathname eligibility before request matcher conditions", async () => {
+    const onMatch = vi.fn();
+    const onPathMatch = vi.fn();
+    const module = {
+      config: {
+        matcher: [
+          {
+            source: "/conditional/:path*",
+            has: [{ type: "cookie", key: "middleware-user" }],
+          },
+        ],
+      },
+      default: () => undefined,
+    };
+
+    await executeMiddleware({
+      isProxy: false,
+      module,
+      onMatch,
+      onPathMatch,
+      request: new Request("http://localhost:3000/not-conditional"),
+    });
+    expect(onPathMatch).not.toHaveBeenCalled();
+    expect(onMatch).not.toHaveBeenCalled();
+
+    await executeMiddleware({
+      isProxy: false,
+      module,
+      onMatch,
+      onPathMatch,
+      request: new Request("http://localhost:3000/conditional/page"),
+    });
+    expect(onPathMatch).toHaveBeenCalledOnce();
+    expect(onMatch).not.toHaveBeenCalled();
+
+    await executeMiddleware({
+      isProxy: false,
+      module,
+      onMatch,
+      onPathMatch,
+      request: new Request("http://localhost:3000/conditional/page", {
+        headers: { Cookie: "middleware-user=1" },
+      }),
+    });
+    expect(onPathMatch).toHaveBeenCalledTimes(2);
+    expect(onMatch).toHaveBeenCalledOnce();
+  });
+
+  it("returns pathname eligibility from the generated middleware boundary", async () => {
+    const result = await runGeneratedMiddleware({
+      isProxy: false,
+      module: {
+        config: {
+          matcher: [
+            {
+              source: "/conditional/:path*",
+              has: [{ type: "header", key: "x-middleware-user" }],
+            },
+          ],
+        },
+        default: () => undefined,
+      },
+      request: new Request("http://localhost:3000/conditional/page"),
+    });
+
+    expect(result.continue).toBe(true);
+    expect(result.pathnameEligible).toBe(true);
+  });
+
+  // Ported from Next.js: packages/next/src/build/templates/middleware.ts
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/build/templates/middleware.ts
+  it("reports proxy failures with the current Next.js error context", async () => {
+    const onRequestError = vi.fn();
+    const thrown = { reason: "proxy failed" };
+    globalThis.__VINEXT_onRequestErrorHandler__ = onRequestError;
+
+    try {
+      const result = await runGeneratedMiddleware({
+        isProxy: true,
+        module: {
+          proxy() {
+            throw thrown;
+          },
+        },
+        request: new Request("https://example.com/proxy-error?source=test", {
+          headers: { "x-request-id": "request-1" },
+        }),
+      });
+
+      expect(result.response?.status).toBe(500);
+      expect(onRequestError).toHaveBeenCalledWith(
+        thrown,
+        {
+          path: "/proxy-error?source=test",
+          method: "GET",
+          headers: { "x-request-id": "request-1" },
+        },
+        {
+          routerKind: "Pages Router",
+          routePath: "/proxy",
+          routeType: "proxy",
+          revalidateReason: undefined,
+        },
+      );
+    } finally {
+      delete globalThis.__VINEXT_onRequestErrorHandler__;
+    }
+  });
+
+  it.each(["NEXT_REDIRECT;push;/target;307;", "NEXT_HTTP_ERROR_FALLBACK;404;detail"])(
+    "does not report development proxy navigation signal %s",
+    async (digest) => {
+      vi.stubEnv("NODE_ENV", "development");
+      const onRequestError = vi.fn();
+      const navigationError = Object.assign(new Error("navigation"), { digest });
+      globalThis.__VINEXT_onRequestErrorHandler__ = onRequestError;
+
+      try {
+        const result = await runGeneratedMiddleware({
+          isProxy: true,
+          module: {
+            proxy() {
+              throw navigationError;
+            },
+          },
+          request: new Request("https://example.com/proxy-navigation"),
+        });
+
+        expect(result.response?.status).toBe(500);
+        expect(navigationError.message).toBe(
+          "Next.js navigation API is not allowed to be used in Proxy.",
+        );
+        expect(onRequestError).not.toHaveBeenCalled();
+      } finally {
+        delete globalThis.__VINEXT_onRequestErrorHandler__;
+        vi.unstubAllEnvs();
+      }
+    },
+  );
+
+  it.each(["NEXT_HTTP_ERROR_FALLBACK;500", "NEXT_REDIRECT;garbage"])(
+    "reports malformed development proxy navigation digest %s",
+    async (digest) => {
+      vi.stubEnv("NODE_ENV", "development");
+      const onRequestError = vi.fn();
+      const thrown = Object.assign(new Error("user error"), { digest });
+      globalThis.__VINEXT_onRequestErrorHandler__ = onRequestError;
+
+      try {
+        const result = await runGeneratedMiddleware({
+          isProxy: true,
+          module: {
+            proxy() {
+              throw thrown;
+            },
+          },
+          request: new Request("https://example.com/proxy-user-error"),
+        });
+
+        expect(result.response?.status).toBe(500);
+        expect(thrown.message).toBe("user error");
+        expect(onRequestError).toHaveBeenCalledWith(
+          thrown,
+          expect.any(Object),
+          expect.objectContaining({ routeType: "proxy" }),
+        );
+      } finally {
+        delete globalThis.__VINEXT_onRequestErrorHandler__;
+        vi.unstubAllEnvs();
+      }
+    },
+  );
+
+  it("reports development proxy errors with non-string digests", async () => {
+    vi.stubEnv("NODE_ENV", "development");
+    const onRequestError = vi.fn();
+    const thrown = Object.assign(new Error("user error"), {
+      digest: {
+        toString() {
+          throw new Error("digest must not be coerced");
+        },
+      },
+    });
+    globalThis.__VINEXT_onRequestErrorHandler__ = onRequestError;
+
+    try {
+      const result = await runGeneratedMiddleware({
+        isProxy: true,
+        module: {
+          proxy() {
+            throw thrown;
+          },
+        },
+        request: new Request("https://example.com/proxy-user-error"),
+      });
+
+      expect(result.response?.status).toBe(500);
+      expect(onRequestError).toHaveBeenCalledWith(
+        thrown,
+        expect.any(Object),
+        expect.objectContaining({ routeType: "proxy" }),
+      );
+    } finally {
+      delete globalThis.__VINEXT_onRequestErrorHandler__;
+      vi.unstubAllEnvs();
+    }
   });
 
   it("relativizes the Location header for same-host redirects", async () => {

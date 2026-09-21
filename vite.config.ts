@@ -34,6 +34,8 @@ export default defineConfig({
     singleQuote: false,
     trailingComma: "all",
     ignorePatterns: [
+      // Kept byte-for-byte comparable with Sentry's upstream Next.js fixture.
+      "tests/e2e/sentry-nextjs-16-static/fixture/**",
       "tests/fixtures/ecosystem/**",
       "examples/**",
       "packages/types/next/upstream/**",
@@ -42,6 +44,8 @@ export default defineConfig({
   lint: {
     ignorePatterns: [
       "fixtures/ecosystem/**",
+      // Kept byte-for-byte comparable with Sentry's upstream Next.js fixture.
+      "tests/e2e/sentry-nextjs-16-static/fixture/**",
       "tests/fixtures/**",
       "tests/fixtures/ecosystem/**",
       "examples/**",
@@ -54,8 +58,8 @@ export default defineConfig({
     },
     plugins: ["typescript", "unicorn", "import", "react"],
     jsPlugins: [
-      "./oxlint-plugins/prefer-import-alias.js",
-      "./oxlint-plugins/prefer-shared-utils.js",
+      "./oxlint-plugins/prefer-import-alias.ts",
+      "./oxlint-plugins/prefer-shared-utils.ts",
     ],
     rules: {
       "@typescript-eslint/no-explicit-any": "error",
@@ -180,10 +184,10 @@ export default defineConfig({
           // are pure-logic and have no fixture/server dependencies.
           include: ["tests/**/*.test.ts", "scripts/**/*.test.ts"],
           exclude: [
-            "tests/fixtures/**/node_modules/**",
-            // Integration tests: spin up Vite dev servers against shared fixture
-            // dirs. Must run serially to avoid Vite deps optimizer cache races
-            // (node_modules/.vite/*) that produce "outdated pre-bundle" 500s.
+            "tests/**/node_modules/**",
+            "tests/e2e/**",
+            // Integration tests spin up Vite dev servers against shared fixture
+            // dirs and use per-worker optimizer caches in their own project.
             // When adding a test that calls startFixtureServer() or createServer(),
             // move it here.
             "tests/app-router-client-preloading.test.ts",
@@ -211,6 +215,7 @@ export default defineConfig({
             "tests/cjs.test.ts",
             "tests/client-global-define.test.ts",
             "tests/dev-route-discovery.test.ts",
+            "tests/dynamic-requests-build.test.ts",
             "tests/ecosystem.test.ts",
             "tests/entry-templates.test.ts",
             "tests/esm-externals.test.ts",
@@ -225,6 +230,7 @@ export default defineConfig({
             "tests/pages-i18n-prod.test.ts",
             "tests/pages-isr-query-context.test.ts",
             "tests/pages-router-concurrency.test.ts",
+            "tests/pages-router-nitro.test.ts",
             "tests/pages-router.test.ts",
             "tests/process-browser-define.test.ts",
             "tests/postcss-resolve.test.ts",
@@ -245,6 +251,9 @@ export default defineConfig({
         },
         test: {
           name: "integration",
+          env: {
+            VINEXT_PARALLEL_INTEGRATION: "true",
+          },
           // MSW is intentionally NOT installed in the integration project.
           // Integration tests spin up in-process HTTP servers and fixture
           // dev servers and exercise them via `fetch("http://127.0.0.1:<port>/...")`.
@@ -283,6 +292,7 @@ export default defineConfig({
             "tests/cjs.test.ts",
             "tests/client-global-define.test.ts",
             "tests/dev-route-discovery.test.ts",
+            "tests/dynamic-requests-build.test.ts",
             "tests/ecosystem.test.ts",
             "tests/entry-templates.test.ts",
             "tests/esm-externals.test.ts",
@@ -298,6 +308,7 @@ export default defineConfig({
             "tests/pages-i18n-prod.test.ts",
             "tests/pages-isr-query-context.test.ts",
             "tests/pages-router-concurrency.test.ts",
+            "tests/pages-router-nitro.test.ts",
             "tests/pages-router.test.ts",
             "tests/process-browser-define.test.ts",
             "tests/postcss-resolve.test.ts",
@@ -309,9 +320,9 @@ export default defineConfig({
             "tests/nextjs-compat/**/*.test.ts",
           ],
           testTimeout: 30000,
-          // Serial execution prevents Vite deps optimizer cache races when
-          // multiple test files share the same fixture directory.
-          fileParallelism: false,
+          fileParallelism: true,
+          maxWorkers: 3,
+          sequence: { groupOrder: 1 },
         },
       },
     ],

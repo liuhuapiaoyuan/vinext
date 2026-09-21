@@ -1,5 +1,6 @@
 import { toSlash } from "pathslash";
 import {
+  appRouteHasMainTreeLoadingBoundary,
   computeAppRouteStaticSiblings,
   convertSegmentsToRouteParts,
   type AppRoute,
@@ -9,6 +10,7 @@ import type { MetadataFileRoute } from "../server/metadata-routes.js";
 
 type AppRscManifestCode = {
   imports: string[];
+  importInitializers: string[];
   routeEntries: string[];
   metaRouteEntries: string[];
   generateStaticParamsEntries: string[];
@@ -42,6 +44,7 @@ type AppRscManifestCode = {
 };
 
 type BuildAppRscManifestCodeOptions = {
+  deferEagerImports?: boolean;
   routes: AppRoute[];
   metadataRoutes?: MetadataFileRoute[];
   globalErrorPath?: string | null;
@@ -93,10 +96,12 @@ type ImportAllocator = {
   getLazyLoaderVar(filePath: string): string;
   importMap: ReadonlyMap<string, string>;
   imports: string[];
+  importInitializers: string[];
 };
 
-function createImportAllocator(): ImportAllocator {
+function createImportAllocator(deferEagerImports: boolean): ImportAllocator {
   const imports: string[] = [];
+  const importInitializers: string[] = [];
   const importMap = new Map<string, string>();
   const lazyMap = new Map<string, string>();
   let importIdx = 0;
@@ -105,13 +110,19 @@ function createImportAllocator(): ImportAllocator {
   return {
     importMap,
     imports,
+    importInitializers,
     getImportVar(filePath) {
       const existing = importMap.get(filePath);
       if (existing) return existing;
 
       const varName = `mod_${importIdx++}`;
       const absPath = toSlash(filePath);
-      imports.push(`import * as ${varName} from ${JSON.stringify(absPath)};`);
+      if (deferEagerImports) {
+        imports.push(`let ${varName};`);
+        importInitializers.push(`${varName} = await import(${JSON.stringify(absPath)});`);
+      } else {
+        imports.push(`import * as ${varName} from ${JSON.stringify(absPath)};`);
+      }
       importMap.set(filePath, varName);
       return varName;
     },
@@ -142,12 +153,9 @@ function registerRouteModules(routes: AppRoute[], imports: ImportAllocator): voi
     // reached via lazy `{ load }` sources in generateStaticParamsMap, resolved
     // on demand at prerender time.
     if (route.pagePath) imports.getLazyLoaderVar(route.pagePath);
-    // Route handlers are always lazy: they are never referenced by
-    // generateStaticParamsMap (buildGenerateStaticParamsEntries sources only
-    // from layouts + page, never route.routePath), so unlike dynamic-route
-    // pages they have no module-load-time consumer. (Next.js route handlers can
-    // export generateStaticParams for prerendering, but vinext does not wire
-    // that into the map yet — a separate gap, unaffected by lazy loading.)
+    // Route handlers stay lazy. Dynamic handlers that export
+    // generateStaticParams are reached through a lazy source in
+    // generateStaticParamsMap, just like page modules.
     if (route.routePath) imports.getLazyLoaderVar(route.routePath);
     for (const layout of route.layouts) imports.getLazyLoaderVar(layout);
     for (const tmpl of route.templates) imports.getLazyLoaderVar(tmpl);
@@ -349,6 +357,7 @@ ${interceptEntries.join(",\n")}
     return `  {
     __buildTimeClassifications: __VINEXT_CLASS(${routeIdx}), // evaluated once at module load
     __buildTimeReasons: __classDebug ? __VINEXT_CLASS_REASONS(${routeIdx}) : null,
+    canUseCanonicalLoadingShell: ${appRouteHasMainTreeLoadingBoundary(route)},
     ids: ${JSON.stringify(route.ids ?? null)},
     pattern: ${JSON.stringify(route.pattern)},
     patternParts: ${JSON.stringify(route.patternParts)},
@@ -500,6 +509,15 @@ function buildGenerateStaticParamsEntries(
         `{ load: ${imports.getLazyLoaderVar(route.pagePath)} }`,
       );
     }
+    if (!route.pagePath && route.routePath) {
+      // Next.js permits dynamic Route Handlers to enumerate their concrete
+      // cache identities with generateStaticParams.
+      appendStaticParamSource(
+        sourcesByPattern,
+        route.pattern,
+        `{ load: ${imports.getLazyLoaderVar(route.routePath)} }`,
+      );
+    }
   }
 
   return Array.from(sourcesByPattern.entries()).map(([pattern, sources]) => {
@@ -519,7 +537,7 @@ function buildRootParamNameEntries(namesByPattern: Map<string, string[]>): strin
 export function buildAppRscManifestCode(
   options: BuildAppRscManifestCodeOptions,
 ): AppRscManifestCode {
-  const imports = createImportAllocator();
+  const imports = createImportAllocator(options.deferEagerImports === true);
   const metadataRoutes = options.metadataRoutes ?? [];
 
   registerRouteModules(options.routes, imports);
@@ -568,6 +586,7 @@ export function buildAppRscManifestCode(
 
   return {
     imports: imports.imports,
+    importInitializers: imports.importInitializers,
     routeEntries,
     metaRouteEntries: createMetadataRouteEntriesSource(metadataRoutes, imports.importMap),
     generateStaticParamsEntries: buildGenerateStaticParamsEntries(

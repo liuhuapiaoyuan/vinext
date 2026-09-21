@@ -1,5 +1,90 @@
 # @vinext/cloudflare
 
+## 1.0.0-beta.8
+
+### Features
+
+#### Cache
+
+- support self-contained response store (#3246)
+- lazily resolve response store tag expirations (#3203)
+- stream response-store cache misses (#3200)
+- seed RSC during response-store warmup (#3196)
+- add Workers Response Store POC (#3192)
+
+#### Cloudflare
+
+- scaffold Response Store Wrangler config (#3249)
+- isolate cached response entrypoint (#3152)
+- summarize CDN warmup by route (#3163)
+
+### Bug Fixes
+
+#### Cloudflare
+
+- declare response store durable object export (#3262)
+- restore bounded probe scheduling (#3171)
+- reduce staged CDN probe work (#3168)
+- prewarm routed response stages (#3153)
+- wait for per-route version propagation (#3164)
+
+#### Misc
+
+- **Cache:** align response store HTML identity (#3209)
+- **Cache:** preserve staged cache invalidation parity (#3158)
+- **Build:** preserve staged prerender routing (#3151)
+
+### Performance
+
+- **Cache:** reduce response store Durable Object load (#3213)
+- **Cloudflare:** cut KV data cache round trips from 3 to 2 per tagged hit (#3187)
+
+### Contributors
+
+- @james-elicx
+- @LubomirGeorgiev
+
+## 1.0.0-beta.7
+
+### Features
+
+#### Cache
+
+- classify and warm static Route Handlers (#3113)
+- probe Pages Router cacheability (#3098)
+- deploy probed manifests in two stages (#3093)
+
+#### Cloudflare
+
+- configure warmup promotion delay (#3017)
+- allow warmup without promotion (#3016)
+- prewarm canonical ISR RSC requests (#3002)
+
+### Bug Fixes
+
+#### Cloudflare
+
+- finalize CDN version metadata output (#3137)
+- support explicit CDN warm targets (#3138)
+- harden post-deploy readiness checks (#3136)
+- restore web CDN warmup deploy (#3135)
+- classify CDN cacheability per concrete route (#3115)
+- discover prewarm paths from staged worker (#3090)
+- verify Worker version IDs during CDN warmup (#3072)
+- complete warmup response and promotion contracts (#3046)
+- harden canonical RSC warmup end to end (#3040)
+- default CDN warmup concurrency to 25 (#3015)
+
+#### Misc
+
+- **Cache:** certify staged cache fills before promotion (#3094)
+- **Cache:** gate CDN admission on probed routes (#3092)
+- **Build:** validate CDN warm discovery and deploy inputs (#3057)
+
+### Contributors
+
+- @james-elicx
+
 ## 1.0.0-beta.6
 
 ### Bug Fixes

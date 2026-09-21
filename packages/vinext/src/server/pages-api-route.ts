@@ -29,6 +29,7 @@ import {
   type ExecutionContextLike,
 } from "vinext/shims/request-context";
 import { NextRequest } from "vinext/shims/server";
+import { tracePagesApiHandler } from "./pages-execution-tracing.js";
 
 type PagesApiRouteConfig = {
   runtime?: string;
@@ -102,6 +103,8 @@ type HandlePagesApiRouteOptions = {
    */
   ctx?: ExecutionContextLike;
   edgeRuntime?: EdgeApiExecutionRuntime;
+  /** Headers installed before user code, matching Next.js custom-route ordering. */
+  initialResponseHeaders?: Headers;
   match: PagesApiRouteMatch | null;
   reportRequestError?: (error: Error, routePattern: string) => void | Promise<void>;
   request: Request;
@@ -156,6 +159,7 @@ async function _handlePagesApiRoute(options: HandlePagesApiRouteOptions): Promis
 
   try {
     if (isEdgeApiRouteModule(route.module)) {
+      const handler = route.module.default;
       // Next.js wraps the incoming Request in a NextRequest before invoking
       // edge API handlers, so handlers can use `req.nextUrl.searchParams`,
       // `req.cookies`, etc. (Cf. NextRequestHint in next/src/server/web/adapter.ts.)
@@ -171,9 +175,26 @@ async function _handlePagesApiRoute(options: HandlePagesApiRouteOptions): Promis
             }
           : undefined,
       );
-      const response = await route.module.default(nextRequest);
+      const response = await tracePagesApiHandler(route.pattern, () => handler(nextRequest));
       if (response instanceof Response) {
-        return finalizeEdgeApiResponse(response, options.edgeRuntime ?? "worker");
+        const finalized = finalizeEdgeApiResponse(response, options.edgeRuntime ?? "worker");
+        if (
+          !options.initialResponseHeaders ||
+          !options.initialResponseHeaders.keys().next().value
+        ) {
+          return finalized;
+        }
+        const headers = new Headers(options.initialResponseHeaders);
+        for (const [name, value] of finalized.headers) {
+          if (name.toLowerCase() !== "set-cookie") headers.set(name, value);
+        }
+        const finalizedCookies = finalized.headers.getSetCookie();
+        for (const cookie of finalizedCookies) headers.append("Set-Cookie", cookie);
+        return new Response(finalized.body, {
+          headers,
+          status: finalized.status,
+          statusText: finalized.statusText,
+        });
       }
 
       throw new Error("Edge API route did not return a Response");
@@ -204,6 +225,7 @@ async function _handlePagesApiRoute(options: HandlePagesApiRouteOptions): Promis
     const { req, res, responsePromise } = createPagesReqRes({
       allowedRevalidateHeaderKeys: options.nextConfig?.allowedRevalidateHeaderKeys,
       body,
+      initialResponseHeaders: options.initialResponseHeaders,
       query,
       request: options.request,
       trustedRevalidateOrigin: options.trustedRevalidateOrigin,
@@ -264,7 +286,11 @@ async function _handlePagesApiRoute(options: HandlePagesApiRouteOptions): Promis
     // handlers attached. A synchronous throw may destroy the response bridge,
     // which rejects responsePromise as well as the handler completion.
     const handlerCompletion = Promise.resolve()
-      .then(() => handler(req, res))
+      .then(() =>
+        tracePagesApiHandler(route.pattern, () => handler(req, res), {
+          recordErrors: options.edgeRuntime !== "node",
+        }),
+      )
       .then(() => ({ type: "handler" as const }), destroyAfterHandlerError);
 
     // A real Node ServerResponse is consumed by the socket while the API
@@ -274,9 +300,9 @@ async function _handlePagesApiRoute(options: HandlePagesApiRouteOptions): Promis
     // the handler to finish first.
     const firstSettled = await Promise.race([responseReady, handlerCompletion]);
     if (firstSettled.type === "response") {
-      const handlerLifecycle = handlerCompletion.then(completeHandler, (error) => {
-        void options.reportRequestError?.(error, route.pattern);
-      });
+      const handlerLifecycle = handlerCompletion.then(completeHandler, (error) =>
+        options.reportRequestError?.(error, route.pattern),
+      );
       // The body may already be complete (for example, res.end() followed by
       // awaited cleanup), so keeping only a floating promise is not enough on
       // Workers. Register the remaining handler lifecycle before returning;
@@ -297,7 +323,7 @@ async function _handlePagesApiRoute(options: HandlePagesApiRouteOptions): Promis
       });
     }
 
-    void options.reportRequestError?.(
+    await options.reportRequestError?.(
       error instanceof Error ? error : new Error(String(error)),
       route.pattern,
     );

@@ -4,6 +4,8 @@ Run Next.js applications on Vite, with Cloudflare Workers as the primary deploym
 
 **Website:** [vinext.dev](https://vinext.dev)
 
+**Documentation:** [vinext.dev/docs](https://vinext.dev/docs)
+
 > **Read the announcement:** [How we rebuilt Next.js with AI in one week](https://blog.cloudflare.com/vinext/)
 
 > **Under active development.** vinext supports substantial Next.js applications today, but it is not yet a drop-in replacement for every application or production workload. Expect compatibility gaps, especially in newer App Router features, and evaluate it against your own application before adopting it.
@@ -118,7 +120,7 @@ Your existing `pages/`, `app/`, `next.config.js`, and `public/` directories work
 
 Options: `-p / --port <port>`, `-H / --hostname <host>`, `--turbopack` (accepted, no-op).
 
-`@vinext/cloudflare deploy` options: `--preview`, `--env <name>`, `--name <name>`, `--skip-build`, `--dry-run`, `--experimental-tpr`.
+`@vinext/cloudflare deploy` options: `--preview`, `--env <name>`, `--name <name>`, `--skip-build`, `--dry-run`, `--experimental-traffic-aware-warm-cache`.
 
 `vinext init` prompts for a deployment target, defaulting to Cloudflare. Agents must ask the
 user which target they want, then pass `--platform=cloudflare` or `--platform=node`.
@@ -331,19 +333,21 @@ For TypeScript types, generate them with `wrangler types` and the `env` import w
 
 > **Note:** You do not need `getPlatformProxy()`, a custom worker entry with `fetch(request, env)`, or any other workaround. `cloudflare:workers` is the recommended way to access bindings in vinext.
 
-#### Traffic-aware Pre-Rendering (experimental)
+#### Traffic-aware pre-warming (experimental)
 
-TPR queries Cloudflare zone analytics at deploy time to find which pages actually get traffic, pre-renders only those, and uploads them to KV cache. The result is SSG-level latency for popular pages without pre-rendering your entire site.
+Traffic-aware warming queries Cloudflare zone analytics at deploy time to select the routes that actually get traffic. Those routes then go through vinext's standard staged CDN pre-warming flow, including route resolution, cacheability checks, and promotion.
 
 ```bash
-npx @vinext/cloudflare deploy --experimental-tpr                    # Pre-render pages covering 90% of traffic
-vp exec vinext-cloudflare deploy --experimental-tpr                 # Same, with Vite+
-npx @vinext/cloudflare deploy --experimental-tpr --tpr-coverage 95  # More aggressive coverage
-npx @vinext/cloudflare deploy --experimental-tpr --tpr-limit 500    # Cap at 500 pages
-npx @vinext/cloudflare deploy --experimental-tpr --tpr-window 48    # Use 48h of analytics
+npx @vinext/cloudflare deploy --experimental-traffic-aware-warm-cache                              # Pre-warm routes covering 90% of traffic
+vp exec vinext-cloudflare deploy --experimental-traffic-aware-warm-cache                           # Same, with Vite+
+npx @vinext/cloudflare deploy --experimental-traffic-aware-warm-cache --traffic-aware-coverage 95  # More aggressive coverage
+npx @vinext/cloudflare deploy --experimental-traffic-aware-warm-cache --traffic-aware-limit 500    # Cap at 500 routes
+npx @vinext/cloudflare deploy --experimental-traffic-aware-warm-cache --traffic-aware-window 48    # Use 48h of analytics
 ```
 
 Requires a custom domain (zone analytics are unavailable on `*.workers.dev`) and `CLOUDFLARE_API_TOKEN` with Zone.Analytics read permission.
+
+The previous `--experimental-tpr` and `--tpr-*` names remain supported as aliases.
 
 #### Custom Vite configuration
 
@@ -517,6 +521,7 @@ These are deployed to Cloudflare Workers and updated on every push to `main`:
 | Nextra Docs            | Nextra docs site (MDX, App Router)                                                                               | [nextra-docs-template.vinext.workers.dev](https://nextra-docs-template.vinext.workers.dev)       |
 | App Router (minimal)   | Minimal App Router on Workers                                                                                    | [app-router-cloudflare.vinext.workers.dev](https://app-router-cloudflare.vinext.workers.dev)     |
 | Pages Router (minimal) | Minimal Pages Router on Workers                                                                                  | [pages-router-cloudflare.vinext.workers.dev](https://pages-router-cloudflare.vinext.workers.dev) |
+| Static export          | [Hybrid App/Pages Router site](examples/static-export) served as assets only                                     | [static-export.vinext.workers.dev](https://static-export.vinext.workers.dev)                     |
 | RealWorld API          | REST API routes example                                                                                          | [realworld-api-rest.vinext.workers.dev](https://realworld-api-rest.vinext.workers.dev)           |
 | Benchmarks Dashboard   | Build performance tracking over time (D1-backed)                                                                 | [vinext.dev/benchmarks](https://vinext.dev/benchmarks)                                           |
 | App Router + Nitro     | App Router deployed via Nitro (multi-platform)                                                                   | [examples/app-router-nitro](examples/app-router-nitro)                                           |
@@ -593,7 +598,7 @@ Every `next/*` import is shimmed to a Vite-compatible implementation.
 | Standalone output (`output: 'standalone'`) | ✅  | Generates `dist/standalone` with `server.js`, build artifacts, and runtime deps             |
 | `connection()`                             | ✅  | Forces dynamic rendering                                                                    |
 | `"use cache"` directive                    | ✅  | File-level and function-level. `cacheLife()` profiles, `cacheTag()`, stale-while-revalidate |
-| `instrumentation.ts`                       | ✅  | `register()` and `onRequestError()` callbacks                                               |
+| `instrumentation.ts`                       | ✅  | `register()`, `onRequestError()`, and [framework tracing](docs/tracing.mdx)                 |
 | Route segment config                       | 🟡  | `revalidate`, `dynamic`, `dynamicParams`. `runtime` and `preferredRegion` are ignored       |
 
 ### Configuration
@@ -702,19 +707,37 @@ The KV data adapter reads `env[binding]` at runtime, so add the matching KV name
 }
 ```
 
-`binding` defaults to `VINEXT_KV_CACHE`, so `kvDataAdapter()` with no options works as long as that's your binding name. Other options: `appPrefix` (namespace cache keys to isolate multiple apps in one KV namespace), `ttlSeconds` (default KV `expirationTtl`, default 30 days), and `tagCacheTtlMs` (in-memory tag-invalidation cache TTL, default 5s).
+`binding` defaults to `VINEXT_KV_CACHE`, so `kvDataAdapter()` with no options works as long as that's your binding name. Other options: `appPrefix` (namespace cache keys to isolate multiple apps in one KV namespace), `ttlSeconds` (default KV `expirationTtl`, default 30 days), `tagCacheTtlMs` (in-memory tag-invalidation cache TTL, default 5s), and `entryCacheTtlSeconds` (optional KV edge-cache TTL for entry reads; tag markers keep KV's default).
 
-`cdnAdapter()` takes no options, but the Workers Cache only exposes `ctx.cache` when `cache.enabled` is set in `wrangler.jsonc`:
+When `cdnAdapter()` is used in a Cloudflare build, vinext emits two Worker
+entrypoints and configures Workers Cache only on the response entrypoint. The
+default entrypoint keeps caching disabled so middleware and request-time routing
+run on every request. Do not enable Workers Cache on the default entrypoint in
+your source `wrangler.jsonc`; the generated `dist/server/wrangler.json` contains
+the per-entrypoint cache settings and version metadata binding used for staged
+discovery and warming.
 
-```jsonc
-{
-  "cache": { "enabled": true },
-}
-```
+The generated version metadata binding lets staged discovery and warming verify
+the uploaded Worker version. Pass `versionMetadataBinding` to `cdnAdapter()`
+only when the deployment needs a custom binding name.
 
-While the data adapter can store entries and serve HIT/STALE itself, the CDN adapter delegates serving to Cloudflare's edge: the origin renders fresh responses and tags them with `Cache-Tag`, and `revalidateTag()` / `revalidatePath()` purge the edge through `ctx.cache.purge({ tags })`. See [examples/workers-cache](examples/workers-cache) for both adapters wired up together.
+`vinext-cloudflare deploy --experimental-warm-cdn-cache` performs the two-stage
+upload and makes one final cache-fill request per admitted identity by default.
+Add `--warm-cdn-certify` only to opt into a second, header-only request that
+must prove every planned entry reusable before promotion.
 
-Each builder returns a plain, serializable `{ adapter, options }` descriptor — **it never touches the Workers runtime**, so nothing throws at build or dev time when bindings aren't available. The actual adapter (and its `env` binding lookup) is instantiated lazily on the first request.
+While the data adapter can store entries and serve HIT/STALE itself, the CDN adapter delegates serving to Cloudflare's edge: the origin renders fresh responses and tags them with `Cache-Tag`, and `revalidateTag()` / `revalidatePath()` purge the edge through `ctx.cache.purge({ tags })`. See [examples/response-store-demo](examples/response-store-demo) for the Workers Response Store adapter.
+
+The response entrypoint adds a transport-only digest of the complete stage
+identity to its Workers Cache URL. That internal key is independent of zone
+Cache Rules and prevents distinct query, representation, rewrite, or
+interception identities from colliding.
+
+Adapter declarations do not access the Workers runtime, so nothing throws at
+config-evaluation or dev time when bindings are unavailable. Builders may also
+provide platform-specific output hooks; `cdnAdapter()` uses one to configure
+the Cloudflare entrypoints after the application build. Runtime adapters (and
+their `env` binding lookups) are instantiated lazily on the first request.
 
 Registration is wired into **every router and runtime** — App Router and Pages Router, on Cloudflare Workers as well as the Node.js server (`vinext start`) and dev. It self-guards (instantiated once per isolate) and is resilient: if an adapter can't initialize on a given runtime (e.g. a KV binding doesn't exist on the Node server), vinext logs a warning and falls back to the default handler instead of failing requests.
 

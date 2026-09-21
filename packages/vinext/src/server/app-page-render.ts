@@ -8,6 +8,7 @@ import { resolveClientStaleTimeSeconds } from "../utils/cache-control-metadata.j
 import { AppElementsWire, isAppElementsRecord, type AppOutgoingElements } from "./app-elements.js";
 import { hasDigest } from "./app-rsc-errors.js";
 import {
+  finalizeAppPageCacheabilityEvaluationResponse,
   finalizeAppPageHtmlCacheResponse,
   finalizeAppPageRscCacheResponse,
 } from "./app-page-cache-finalizer.js";
@@ -33,6 +34,7 @@ import {
   buildAppPageLinkHeader,
   createAppPageFontData,
   createAppPageRscErrorTracker,
+  createAppPageSsrErrorHandler,
   deferUntilStreamConsumed,
   renderAppPageHtmlStream,
   renderAppPageHtmlStreamWithRecovery,
@@ -84,6 +86,11 @@ import { getStaticLayoutObservationSkipRejection } from "./app-layout-param-obse
 import { peekDynamicUsage } from "vinext/shims/headers";
 import { VINEXT_RSC_COMPLETION_METADATA_HEADER } from "./headers.js";
 import { appendRscCompletionMetadata } from "./rsc-completion-metadata.js";
+import type { AppRenderErrorContextOverrides } from "./app-rsc-error-handler.js";
+import { recordAppPageRenderError, traceAppPageRender } from "./app-page-tracing.js";
+import type { FrameworkSpan } from "./framework-tracer.js";
+import { traceResponseStartWithCompletion } from "./response-start-tracing.js";
+import { recordRouteCacheabilityClientTraceMetadataMarker } from "vinext/shims/cacheability-classification";
 
 type AppPageBoundaryOnError = (
   error: unknown,
@@ -98,7 +105,13 @@ type AppPageRequestCacheLife = {
   stale?: number;
 };
 
-type RenderAppPageLifecycleOptions = {
+type AppPageRenderableElement = ReactNode | Readonly<Record<string, ReactNode>>;
+
+type PreparedAppPageElement =
+  | { element: AppPageRenderableElement; response?: never }
+  | { element?: never; response: Response };
+
+type RenderAppPageLifecycleOptionsBase = {
   basePath?: string;
   bypassInterceptionContextCache?: boolean;
   /**
@@ -120,7 +133,11 @@ type RenderAppPageLifecycleOptions = {
   consumeRenderObservationState?: () => AppPageRenderObservationState;
   /** Read and clear any invalid dynamic usage error recorded during render (dev-only). */
   consumeInvalidDynamicUsageError?: () => unknown;
-  createRscOnErrorHandler: (pathname: string, routePath: string) => AppPageBoundaryOnError;
+  createRscOnErrorHandler: (
+    pathname: string,
+    routePath: string,
+    overrides?: AppRenderErrorContextOverrides,
+  ) => AppPageBoundaryOnError;
   getFontLinks: () => string[];
   getFontPreloads: () => AppPageFontPreload[];
   getFontStyles: () => string[];
@@ -145,6 +162,8 @@ type RenderAppPageLifecycleOptions = {
   probePageBeforeRender?: boolean;
   omitPendingDynamicCacheState?: boolean;
   isRscRequest: boolean;
+  traceOperation?: "prerender" | "render";
+  onRenderComplete?: (completion: Promise<void>) => void;
   isrDebug?: AppPageDebugLogger;
   isrHtmlKey: (pathname: string) => string;
   isrRscKey: (
@@ -201,8 +220,17 @@ type RenderAppPageLifecycleOptions = {
   // Per-layout observation tracker. Constructed in dispatch, consumed by the
   // skip transport planner to reject layouts that are unsafe for static reuse.
   layoutParamAccess?: AppLayoutParamAccessTracker;
-  element: ReactNode | Readonly<Record<string, ReactNode>>;
   classification?: LayoutClassificationOptions | null;
+};
+
+type RenderAppPageLifecycleOptions = RenderAppPageLifecycleOptionsBase &
+  (
+    | { element: AppPageRenderableElement; prepareElement?: never }
+    | { element?: never; prepareElement: () => Promise<PreparedAppPageElement> }
+  );
+
+type ResolvedRenderAppPageLifecycleOptions = RenderAppPageLifecycleOptionsBase & {
+  element: AppPageRenderableElement;
 };
 
 function buildResponseTiming(
@@ -631,6 +659,64 @@ function wrapRscResponseForDevErrorReporting(
 export async function renderAppPageLifecycle(
   options: RenderAppPageLifecycleOptions,
 ): Promise<Response> {
+  if (options.isRscRequest) {
+    const prepared = await prepareAppPageElement(options);
+    return prepared instanceof Response ? prepared : renderAppPageLifecycleImpl(prepared);
+  }
+
+  const operation = options.traceOperation ?? (options.isPrerender ? "prerender" : "render");
+  let resolveResponse!: (response: Response) => void;
+  let rejectResponse!: (error: unknown) => void;
+  let renderCompletion = Promise.resolve();
+  const responsePromise = new Promise<Response>((resolve, reject) => {
+    resolveResponse = resolve;
+    rejectResponse = reject;
+  });
+  const tracedRender = traceAppPageRender(options.routePattern, operation, async (renderSpan) => {
+    try {
+      const prepared = await prepareAppPageElement(options);
+      if (prepared instanceof Response) {
+        const traced = traceResponseStartWithCompletion(prepared);
+        resolveResponse(traced.response);
+        await traced.started;
+        return;
+      }
+      const traced = traceResponseStartWithCompletion(
+        await renderAppPageLifecycleImpl(
+          {
+            ...prepared,
+            onRenderComplete(completion) {
+              renderCompletion = completion;
+              void completion.catch(() => {});
+              options.onRenderComplete?.(completion);
+            },
+          },
+          renderSpan,
+        ),
+      );
+      resolveResponse(traced.response);
+      await Promise.all([renderCompletion, traced.started]);
+    } catch (error) {
+      rejectResponse(error);
+      throw error;
+    }
+  });
+  void tracedRender.catch(() => {});
+  return responsePromise;
+}
+
+async function prepareAppPageElement(
+  options: RenderAppPageLifecycleOptions,
+): Promise<Response | ResolvedRenderAppPageLifecycleOptions> {
+  if (!options.prepareElement) return options;
+  const prepared = await options.prepareElement();
+  return prepared.response ?? { ...options, element: prepared.element };
+}
+
+async function renderAppPageLifecycleImpl(
+  options: ResolvedRenderAppPageLifecycleOptions,
+  renderSpan?: FrameworkSpan,
+): Promise<Response> {
   // Request dynamic state is consumptive, but both cache finalization and the
   // streamed client completion marker need the final answer. Keep the first
   // positive observation for this render so whichever branch drains first
@@ -733,8 +819,21 @@ export async function renderAppPageLifecycle(
   });
 
   const compileEnd = options.isProduction ? undefined : performance.now();
-  const baseOnError = options.createRscOnErrorHandler(options.cleanPathname, options.routePattern);
-  const rscErrorTracker = createAppPageRscErrorTracker(baseOnError);
+  const errorContextOverrides: AppRenderErrorContextOverrides = {
+    ...(options.isProgressiveActionRender
+      ? { renderSource: "react-server-components-payload", routeType: "action" }
+      : {}),
+    ...(options.isPrerender ? { revalidateReason: "stale" } : {}),
+  };
+  const baseOnError = options.createRscOnErrorHandler(
+    options.cleanPathname,
+    options.routePattern,
+    errorContextOverrides,
+  );
+  const rscErrorTracker = createAppPageRscErrorTracker((error, requestInfo, errorContext) => {
+    if (renderSpan) recordAppPageRenderError(renderSpan, error);
+    return baseOnError(error, requestInfo, errorContext);
+  });
   // Defensive wrap for standalone callers. In the normal dispatch path this is
   // a no-op since dispatchAppPage already activated dedupe. Note that
   // renderToReadableStream returns synchronously — the actual fetch calls
@@ -989,6 +1088,16 @@ export async function renderAppPageLifecycle(
     getStyles: options.getFontStyles,
   });
   const fontLinkHeader = buildAppPageFontLinkHeader(fontData.preloads);
+  const clientTraceMetadataMarker =
+    options.isProduction &&
+    options.isPrerender !== true &&
+    options.clientTraceMetadata &&
+    options.clientTraceMetadata.length > 0
+      ? crypto.randomUUID()
+      : undefined;
+  if (clientTraceMetadataMarker) {
+    recordRouteCacheabilityClientTraceMetadataMarker(clientTraceMetadataMarker);
+  }
   let requestCacheLifeForPrerender: AppPageRequestCacheLife | null = null;
   let dynamicUsedDuringHtmlRender = false;
   let renderEnd: number | undefined;
@@ -1008,6 +1117,18 @@ export async function renderAppPageLifecycle(
     },
     async renderHtmlStream() {
       const ssrHandler = await options.loadSsrHandler();
+      const baseOnSsrError = options.createRscOnErrorHandler(
+        options.cleanPathname,
+        options.routePattern,
+        {
+          ...errorContextOverrides,
+          renderSource: "server-rendering",
+        },
+      );
+      const onSsrError: AppPageBoundaryOnError = (error, requestInfo, errorContext) => {
+        if (renderSpan) recordAppPageRenderError(renderSpan, error);
+        return baseOnSsrError(error, requestInfo, errorContext);
+      };
       return renderAppPageHtmlStream({
         capturedRscDataRef,
         getInitialNavigationCacheMetadata: () => {
@@ -1027,16 +1148,17 @@ export async function renderAppPageLifecycle(
           // Runs after the RSC embed drains, so this peek observes the
           // completed render's minimum. Peek, not consume — the cache-write
           // closure owns the consuming read.
-          // Prerendering drains the captured RSC stream and consumes the
-          // completed request cache life before the HTML stream reaches this
-          // done-script callback. Reuse that captured value here; peeking the
-          // now-cleared request state would omit the client stale claim from
-          // the prerendered HTML even though the seeded cache entry retains it.
+          // During prerendering the done-script callback can run immediately
+          // after the RSC capture drains, before the outer lifecycle performs
+          // its consuming cacheLife read. Use the live non-destructive peek in
+          // that window, then reuse the captured value after the outer read;
+          // peeking only after consumption would omit the client stale claim
+          // even though the seeded cache entry retains it.
           // Runtime renders have not consumed the state yet and still use the
           // non-destructive peek so the cache-write closure remains its owner.
           const requestCacheLife =
             options.isPrerender === true
-              ? requestCacheLifeForPrerender
+              ? (requestCacheLifeForPrerender ?? options.peekRequestCacheLife?.())
               : options.peekRequestCacheLife?.();
           const staleTimeSeconds = resolveClientStaleTimeSeconds(requestCacheLife);
           return {
@@ -1061,6 +1183,7 @@ export async function renderAppPageLifecycle(
         navigationContext: options.getNavigationContext(),
         basePath: options.basePath,
         clientTraceMetadata: options.clientTraceMetadata,
+        clientTraceMetadataMarker,
         reactMaxHeadersLength: options.reactMaxHeadersLength,
         rootParams: options.rootParams,
         pprFallbackShellSignal: options.pprFallbackShellSignal,
@@ -1076,6 +1199,7 @@ export async function renderAppPageLifecycle(
         waitForAllReady: shouldWaitForAllReady,
         isStaticGeneration: options.isPrerender === true,
         isForceStatic: options.isForceStatic,
+        onSsrError: createAppPageSsrErrorHandler(onSsrError, rscErrorTracker.isCapturedError),
       });
     },
     renderSpecialErrorResponse(specialError) {
@@ -1083,6 +1207,7 @@ export async function renderAppPageLifecycle(
     },
     resolveSpecialError: resolveAppPageSpecialError,
   });
+  options.onRenderComplete?.(htmlRender.renderComplete);
   if (htmlRender.response) {
     return htmlRender.response;
   }
@@ -1243,6 +1368,7 @@ export async function renderAppPageLifecycle(
       },
       capturedRscDataPromise: capturedRscDataRef.value,
       cleanPathname: options.cleanPathname,
+      clientTraceMetadataMarker,
       consumeDynamicUsage: consumeRenderDynamicUsage,
       consumeRenderObservationState: options.consumeRenderObservationState,
       createHtmlRenderObservation(input) {
@@ -1296,7 +1422,7 @@ export async function renderAppPageLifecycle(
     });
   }
 
-  return buildAppPageHtmlResponse(safeHtmlStream, {
+  const response = buildAppPageHtmlResponse(safeHtmlStream, {
     cacheTags: options.isPrerender === true ? options.getPageTags() : undefined,
     draftCookie,
     linkHeader,
@@ -1305,6 +1431,25 @@ export async function renderAppPageLifecycle(
     policy: htmlResponsePolicy,
     requestCacheLife: requestCacheLifeForPrerender,
     timing: htmlResponseTiming,
+  });
+  return finalizeAppPageCacheabilityEvaluationResponse(response, {
+    capturedDynamicUsageBeforeContextCleanup() {
+      return dynamicUsedBeforeContextCleanup;
+    },
+    consumeDynamicUsage: consumeRenderDynamicUsage,
+    consumeRenderObservationState: options.consumeRenderObservationState,
+    getPageTags() {
+      return options.getPageTags();
+    },
+    getRequestCacheLife() {
+      return readRequestCacheLifeForCachePolicy(options);
+    },
+    expireSeconds,
+    revalidateSeconds: resolveAppPageCacheWriteRevalidateSeconds({
+      isDynamicError: options.isDynamicError,
+      isForceStatic: options.isForceStatic,
+      revalidateSeconds,
+    }),
   });
 }
 

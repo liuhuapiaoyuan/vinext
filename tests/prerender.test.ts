@@ -13,7 +13,12 @@ import fs from "node:fs";
 import { createServer, type Server } from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { buildPagesFixture, buildAppFixture, buildCloudflareAppFixture } from "./helpers.js";
+import {
+  buildPagesFixture,
+  buildAppFixture,
+  buildCloudflareAppFixture,
+  createIsolatedFixture,
+} from "./helpers.js";
 import {
   extractRscPayloadFromPrerenderedHtml,
   resolveParentParams,
@@ -24,7 +29,11 @@ import {
 import { VINEXT_PRERENDER_SPECULATIVE_HEADER } from "../packages/vinext/src/server/headers.js";
 import { safeJsonStringify } from "../packages/vinext/src/server/html.js";
 import type { AppRoute } from "../packages/vinext/src/routing/app-router.js";
-import { getAppRouteOutputPath } from "../packages/vinext/src/utils/prerender-output-paths.js";
+import {
+  getAppRouteOutputPath,
+  getOutputPath,
+  getRscOutputPath,
+} from "../packages/vinext/src/utils/prerender-output-paths.js";
 
 const PAGES_FIXTURE = path.resolve(import.meta.dirname, "./fixtures/pages-basic");
 const APP_FIXTURE = path.resolve(import.meta.dirname, "./fixtures/app-basic");
@@ -93,6 +102,49 @@ function legacyRscDoneScript(): string {
 }
 
 // ─── App Router RSC payload extraction ───────────────────────────────────────
+
+describe("getRscOutputPath", () => {
+  // Ported from Next.js:
+  // test/e2e/app-dir/static-export-skew-trailing-slash/static-export-skew-trailing-slash.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/static-export-skew-trailing-slash/static-export-skew-trailing-slash.test.ts
+  it("matches static export HTML layout with text/plain Flight artifacts", () => {
+    expect(getRscOutputPath("/", { mode: "export", trailingSlash: true })).toBe("index.txt");
+    expect(getRscOutputPath("/target", { mode: "export", trailingSlash: true })).toBe(
+      "target/index.txt",
+    );
+    expect(getRscOutputPath("/target", { mode: "export", trailingSlash: false })).toBe(
+      "target.txt",
+    );
+    expect(
+      getRscOutputPath("/", {
+        mode: "export",
+        trailingSlash: false,
+        basePath: "/docs",
+      }),
+    ).toBe("docs/index.txt");
+    expect(
+      getRscOutputPath("/target", {
+        mode: "export",
+        trailingSlash: false,
+        basePath: "/docs",
+      }),
+    ).toBe("docs/target.txt");
+  });
+
+  it("retains .rsc files for server prerenders", () => {
+    expect(getRscOutputPath("/")).toBe("index.rsc");
+    expect(getRscOutputPath("/target")).toBe("target.rsc");
+  });
+});
+
+describe("getOutputPath", () => {
+  it("emits canonical basePath keys for both trailingSlash modes", () => {
+    expect(getOutputPath("/", false, "/docs")).toBe("docs.html");
+    expect(getOutputPath("/", true, "/docs")).toBe("docs/index.html");
+    expect(getOutputPath("/about", false, "/docs")).toBe("docs/about.html");
+    expect(getOutputPath("/about", true, "/docs")).toBe("docs/about/index.html");
+  });
+});
 
 describe("extractRscPayloadFromPrerenderedHtml", () => {
   function decodeExtractedPayload(html: string): string | null {
@@ -223,6 +275,67 @@ describe("extractRscPayloadFromPrerenderedHtml", () => {
 });
 
 describe("prerenderApp — RSC extraction", () => {
+  it("requests App pages through basePath and writes basePath-prefixed export artifacts", async () => {
+    const root = tmpDir("vinext-prerender-app-basepath-");
+    const outDir = path.join(root, "out");
+    const appDir = path.join(root, "app");
+    fs.mkdirSync(appDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(appDir, "page.tsx"),
+      "export const dynamic = 'force-static';\nexport default function Page() { return null; }\n",
+    );
+
+    const requestedPaths: string[] = [];
+    const rscPayload = '0:["$","main",null,{"children":"basePath page"}]\n';
+    const server = createServer((req, res) => {
+      requestedPaths.push(req.url ?? "");
+      if (req.url !== "/docs") {
+        res.statusCode = 404;
+        res.end("<html>not found</html>");
+        return;
+      }
+      res.setHeader("content-type", "text/html");
+      res.end(
+        "<html><body>" +
+          runtimeRscChunkScript(rscPayload) +
+          runtimeRscDoneScript() +
+          "</body></html>",
+      );
+    });
+
+    const port = await listen(server);
+    try {
+      const { prerenderApp } = await import("../packages/vinext/src/build/prerender.js");
+      const { appRouter } = await import("../packages/vinext/src/routing/app-router.js");
+      const { resolveNextConfig } = await import("../packages/vinext/src/config/next-config.js");
+      const routes = await appRouter(appDir);
+      const config = await resolveNextConfig({ basePath: "/docs" });
+
+      const result = await prerenderApp({
+        mode: "export",
+        rscBundlePath: path.join(root, "dist", "server", "index.js"),
+        routes,
+        outDir,
+        config,
+        _prodServer: { server, port },
+      });
+
+      expect(requestedPaths).toContain("/docs");
+      expect(requestedPaths).not.toContain("/");
+      expect(findRoute(result.routes, "/")).toMatchObject({
+        route: "/",
+        status: "rendered",
+      });
+      expect(fs.readFileSync(path.join(outDir, "docs.html"), "utf8")).toContain("<html><body>");
+      expect(fs.readFileSync(path.join(outDir, "docs", "index.txt"), "utf8")).toBe(rscPayload);
+      expect(fs.existsSync(path.join(outDir, "index.html"))).toBe(false);
+      expect(fs.existsSync(path.join(outDir, "index.txt"))).toBe(false);
+    } finally {
+      await closeServer(server);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("requests metadata routes through basePath while writing basePath-free artifacts", async () => {
     const root = tmpDir("vinext-prerender-metadata-basepath-");
     const outDir = path.join(root, "out");
@@ -668,6 +781,74 @@ describe("prerenderApp — RSC extraction", () => {
 
 // ─── Pages Router ─────────────────────────────────────────────────────────────
 
+describe("prerenderPages — basePath export", () => {
+  it("requests and writes Pages exports under basePath", async () => {
+    const root = tmpDir("vinext-prerender-pages-basepath-");
+    const outDir = path.join(root, "out");
+    const pagesDir = path.join(root, "pages");
+    fs.mkdirSync(pagesDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(pagesDir, "about.tsx"),
+      "export default function About() { return null; }\n",
+    );
+    fs.writeFileSync(
+      path.join(pagesDir, "index.tsx"),
+      "export default function Home() { return null; }\n",
+    );
+
+    const requestedPaths: string[] = [];
+    const server = createServer((req, res) => {
+      requestedPaths.push(req.url ?? "");
+      if (req.url !== "/docs" && req.url !== "/docs/about") {
+        res.statusCode = 404;
+        res.end("not found");
+        return;
+      }
+      const responsePath = req.url === "/docs/about" ? "/docs/about" : "/docs";
+      res.setHeader("content-type", "text/html");
+      res.end(`<!DOCTYPE html><html><body>Pages basePath ${responsePath}</body></html>`);
+    });
+
+    const port = await listen(server);
+    try {
+      const { prerenderPages } = await import("../packages/vinext/src/build/prerender.js");
+      const { pagesRouter, apiRouter } =
+        await import("../packages/vinext/src/routing/pages-router.js");
+      const { resolveNextConfig } = await import("../packages/vinext/src/config/next-config.js");
+      const routes = await pagesRouter(pagesDir);
+      const apiRoutes = await apiRouter(pagesDir);
+      const config = await resolveNextConfig({ basePath: "/docs", output: "export" });
+
+      const result = await prerenderPages({
+        mode: "export",
+        routes,
+        apiRoutes,
+        pagesDir,
+        outDir,
+        config,
+        _prodServer: { server, port },
+      });
+
+      expect(requestedPaths).toEqual(expect.arrayContaining(["/docs", "/docs/about"]));
+      expect(findRoute(result.routes, "/about")).toMatchObject({
+        route: "/about",
+        status: "rendered",
+        outputFiles: ["docs/about.html"],
+      });
+      expect(fs.readFileSync(path.join(outDir, "docs", "about.html"), "utf8")).toContain(
+        "Pages basePath /docs/about",
+      );
+      expect(fs.readFileSync(path.join(outDir, "docs.html"), "utf8")).toContain(
+        "Pages basePath /docs",
+      );
+      expect(fs.existsSync(path.join(outDir, "about.html"))).toBe(false);
+    } finally {
+      await closeServer(server);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("prerenderPages — default mode (pages-basic)", () => {
   let outDir: string;
   let results: PrerenderRouteResult[];
@@ -738,7 +919,11 @@ describe("prerenderPages — default mode (pages-basic)", () => {
       expect(html).toContain('<p id="identity-consistent">true</p>');
       expect(html).toContain('<p id="shadowed-global-this">local-globalThis</p>');
       expect(html).toContain('<p id="filename-readable">true</p>');
-      expect(html).toMatch(/<p id="concatenated-path">.*\/server\/concatenated\.js<\/p>/);
+      // instrumentation.ts completes before the lazy user-module graph loads,
+      // and bundled CommonJS globals retain that emitted chunk identity.
+      expect(html).toMatch(
+        /<p id="concatenated-path">.*\/server\/_next\/static\/concatenated\.js<\/p>/,
+      );
     }
   });
 
@@ -1640,6 +1825,60 @@ describe("prerender — generateStaticParams/getStaticPaths errors (#1982)", () 
     }
   });
 
+  // Next.js keeps a route with generateStaticParams() returning [] in its SSG
+  // prerender metadata so unknown paths can be generated on demand.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/build/templates/app-page-runtime.ts
+  it("retains route-level SSG metadata when generateStaticParams returns no paths", async () => {
+    const root = tmpDir("vinext-prerender-empty-gsp-");
+    const outDir = path.join(root, "out");
+    const pageDir = path.join(root, "app", "blog", "[slug]");
+    fs.mkdirSync(pageDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(pageDir, "page.tsx"),
+      "export function generateStaticParams() { return []; }\nexport default function Page() { return null; }\n",
+    );
+
+    const server = createServer((req, res) => {
+      const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      if (url.pathname === "/__vinext/prerender/static-params") {
+        res.setHeader("content-type", "application/json");
+        res.end("[]");
+        return;
+      }
+      res.statusCode = 500;
+      res.end("an empty static params route should not render at build time");
+    });
+
+    const port = await listen(server);
+    try {
+      const { prerenderApp } = await import("../packages/vinext/src/build/prerender.js");
+      const { appRouter } = await import("../packages/vinext/src/routing/app-router.js");
+      const { resolveNextConfig } = await import("../packages/vinext/src/config/next-config.js");
+      const routes = await appRouter(path.join(root, "app"));
+      const result = await prerenderApp({
+        mode: "default",
+        rscBundlePath: path.join(root, "dist", "server", "index.js"),
+        routes,
+        outDir,
+        config: await resolveNextConfig({}),
+        _prodServer: { server, port },
+      });
+
+      expect(result.routes).toContainEqual({
+        route: "/blog/:slug",
+        status: "skipped",
+        reason: "empty-static-params",
+      });
+      const manifest = JSON.parse(
+        fs.readFileSync(path.join(outDir, "vinext-prerender.json"), "utf8"),
+      );
+      expect(manifest.pregeneratedConcretePaths).toContainEqual(["/blog/:slug", []]);
+    } finally {
+      await closeServer(server);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("surfaces a thrown getStaticPaths error instead of silently skipping the route", async () => {
     const root = tmpDir("vinext-prerender-pages-gsp-error-");
     const outDir = path.join(root, "out");
@@ -1839,25 +2078,35 @@ describe("prerenderApp — cacheComponents PPR fallback-shell artifacts", () => 
 // ─── runPrerender — output: 'export' wiring ───────────────────────────────────
 
 describe("runPrerender — output: 'export' wiring", () => {
+  let fixtureDir: string;
   let pagesBundlePath: string;
   let exportNextConfig: Awaited<
     ReturnType<typeof import("../packages/vinext/src/config/next-config.js").resolveNextConfig>
   >;
 
   beforeAll(async () => {
-    // Build pages-basic to a fresh tmpdir — no fixture copying needed.
+    fixtureDir = await createIsolatedFixture(
+      PAGES_FIXTURE,
+      "vinext-run-prerender-",
+      undefined,
+      path.join(PAGES_FIXTURE, "node_modules"),
+    );
     // Pass the bundle path and resolved config to runPrerender so it
     // exercises output: 'export' without touching the real next.config.mjs.
     pagesBundlePath = await buildPagesFixture(PAGES_FIXTURE);
     const { resolveNextConfig } = await import("../packages/vinext/src/config/next-config.js");
-    exportNextConfig = await resolveNextConfig({ output: "export" }, PAGES_FIXTURE);
+    exportNextConfig = await resolveNextConfig({ output: "export" }, fixtureDir);
   }, 120_000);
+
+  afterAll(() => {
+    fs.rmSync(fixtureDir, { recursive: true, force: true });
+  });
 
   it("throws when next.config output: 'export' and SSR routes exist", async () => {
     const { runPrerender } = await import("../packages/vinext/src/build/run-prerender.js");
     await expect(
       runPrerender({
-        root: PAGES_FIXTURE,
+        root: fixtureDir,
         nextConfig: exportNextConfig,
         pagesBundlePath,
       }),
@@ -1865,7 +2114,7 @@ describe("runPrerender — output: 'export' wiring", () => {
   });
 
   it("does not reload disk config when the caller supplies resolved config", async () => {
-    const configPath = path.join(PAGES_FIXTURE, "next.config.mjs");
+    const configPath = path.join(fixtureDir, "next.config.mjs");
     const originalConfig = fs.readFileSync(configPath, "utf-8");
 
     try {
@@ -1874,11 +2123,11 @@ describe("runPrerender — output: 'export' wiring", () => {
         import("../packages/vinext/src/build/run-prerender.js"),
         import("../packages/vinext/src/config/next-config.js"),
       ]);
-      const nextConfig = await resolveNextConfig({ output: "export" }, PAGES_FIXTURE);
+      const nextConfig = await resolveNextConfig({ output: "export" }, fixtureDir);
 
       await expect(
         runPrerender({
-          root: PAGES_FIXTURE,
+          root: fixtureDir,
           nextConfig,
           pagesBundlePath,
         }),
@@ -1889,7 +2138,7 @@ describe("runPrerender — output: 'export' wiring", () => {
   });
 
   it("does not rewrite the Worker entry when prerender validation fails", async () => {
-    const workerEntry = path.join(PAGES_FIXTURE, "dist", "server", "index.js");
+    const workerEntry = path.join(fixtureDir, "dist", "server", "index.js");
     const source = 'export default { fetch() { return new Response("unchanged"); } };\n';
     fs.mkdirSync(path.dirname(workerEntry), { recursive: true });
     fs.writeFileSync(workerEntry, source, "utf-8");
@@ -1898,7 +2147,7 @@ describe("runPrerender — output: 'export' wiring", () => {
       const { runPrerender } = await import("../packages/vinext/src/build/run-prerender.js");
       await expect(
         runPrerender({
-          root: PAGES_FIXTURE,
+          root: fixtureDir,
           nextConfig: exportNextConfig,
           pagesBundlePath,
         }),
@@ -1906,7 +2155,7 @@ describe("runPrerender — output: 'export' wiring", () => {
 
       expect(fs.readFileSync(workerEntry, "utf-8")).toBe(source);
     } finally {
-      fs.rmSync(path.join(PAGES_FIXTURE, "dist"), { recursive: true, force: true });
+      fs.rmSync(path.join(fixtureDir, "dist"), { recursive: true, force: true });
     }
   });
 
@@ -1914,7 +2163,7 @@ describe("runPrerender — output: 'export' wiring", () => {
     const { runPrerender } = await import("../packages/vinext/src/build/run-prerender.js");
     await expect(
       runPrerender({
-        root: PAGES_FIXTURE,
+        root: fixtureDir,
         nextConfig: exportNextConfig,
         pagesBundlePath,
       }),

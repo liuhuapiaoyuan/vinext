@@ -16,6 +16,7 @@ export type WranglerVersionTraffic = {
   percentage: number;
 };
 export type WranglerDeploymentStatus = {
+  deploymentId: string | null;
   versions: WranglerVersionTraffic[];
   output: string;
 };
@@ -29,26 +30,26 @@ export declare function parseWranglerVersionUploadOutput(
   output: string,
 ): WranglerVersionUploadResult;
 export declare function buildWranglerVersionUploadArgs(
-  options: Pick<DeployOptions, "preview" | "env" | "name" | "config"> & {
+  options: Pick<DeployOptions, "preview" | "env" | "name" | "config" | "verbose"> & {
     previewAlias?: string;
   },
 ): WranglerVersionArgs;
 export declare function buildWranglerVersionDeployArgs(
   versionTraffic: readonly WranglerVersionTraffic[],
-  options: Pick<DeployOptions, "preview" | "env" | "name" | "config">,
+  options: Pick<DeployOptions, "preview" | "env" | "name" | "config" | "verbose">,
 ): WranglerVersionArgs;
 export declare function buildWranglerDeploymentsStatusArgs(
-  options: Pick<DeployOptions, "preview" | "env" | "name" | "config">,
+  options: Pick<DeployOptions, "preview" | "env" | "name" | "config" | "verbose">,
 ): WranglerVersionArgs;
 export declare function buildWranglerTriggersDeployArgs(
-  options: Pick<DeployOptions, "preview" | "env" | "name" | "config">,
+  options: Pick<DeployOptions, "preview" | "env" | "name" | "config" | "verbose">,
 ): WranglerVersionArgs;
 export declare function parseWranglerDeploymentStatusOutput(
   output: string,
 ): WranglerDeploymentStatus;
 export declare function runWranglerVersionUpload(
   root: string,
-  options: Pick<DeployOptions, "preview" | "env" | "name" | "config"> & {
+  options: Pick<DeployOptions, "preview" | "env" | "name" | "config" | "verbose"> & {
     previewAlias?: string;
   },
   execute?: typeof execFileSync,
@@ -56,17 +57,17 @@ export declare function runWranglerVersionUpload(
 export declare function runWranglerVersionDeploy(
   root: string,
   versionTraffic: readonly WranglerVersionTraffic[],
-  options: Pick<DeployOptions, "preview" | "env" | "name" | "config">,
+  options: Pick<DeployOptions, "preview" | "env" | "name" | "config" | "verbose">,
   phase?: "stage" | "promote-warmed" | "promote-uploaded",
   execute?: typeof execFileSync,
 ): WranglerVersionDeployResult;
 export declare function runWranglerDeploymentStatus(
   root: string,
-  options: Pick<DeployOptions, "preview" | "env" | "name" | "config">,
+  options: Pick<DeployOptions, "preview" | "env" | "name" | "config" | "verbose">,
   execute?: typeof execFileSync,
 ): WranglerDeploymentStatus;
 export declare function runWranglerTriggersDeploy(
   root: string,
-  options: Pick<DeployOptions, "preview" | "env" | "name" | "config">,
+  options: Pick<DeployOptions, "preview" | "env" | "name" | "config" | "verbose">,
   execute?: typeof execFileSync,
 ): WranglerVersionDeployResult;

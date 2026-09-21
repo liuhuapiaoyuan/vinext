@@ -14,20 +14,31 @@ import path from "node:path";
 import { describe, it, expect } from "vite-plus/test";
 import {
   findVinextCacheConfigInPlugins,
+  generateCdnCacheAdapterModule,
   loadVinextCacheConfigFromViteConfig,
   generateCacheAdaptersModule,
+  isConfiguredCdnResponsePolicyHeader,
   hasBuildIdentityResponseHeader,
+  hasUncachedRequestRouting,
   hasVerbatimResponseVary,
+  supportsCanonicalRscWarmup,
+  cacheWarmupStatusSource,
   VINEXT_CACHE_CONFIG_PLUGIN_PROPERTY,
   VIRTUAL_CACHE_ADAPTERS,
+  VIRTUAL_CDN_CACHE_ADAPTER,
 } from "../packages/vinext/src/cache/cache-adapters-virtual.js";
 import { generateRscEntry } from "../packages/vinext/src/entries/app-rsc-entry.js";
 import { generateServerEntry } from "../packages/vinext/src/entries/pages-server-entry.js";
-import { readAppRouterEntrySource, readPagesRouterEntrySource } from "./worker-entry-source.js";
+import {
+  readAppRequestStageEntrySource,
+  readAppRouterEntrySource,
+  readPagesRequestStageEntrySource,
+} from "./worker-entry-source.js";
 import { resolveNextConfig } from "../packages/vinext/src/config/next-config.js";
 import { createValidFileMatcher } from "../packages/vinext/src/routing/file-matcher.js";
 import { kvDataAdapter } from "../packages/cloudflare/src/cache/kv-data-adapter.js";
 import { cdnAdapter } from "../packages/cloudflare/src/cache/cdn-adapter.js";
+import { responseStoreAdapter } from "../packages/cloudflare/src/cache/response-store-adapter.js";
 import createKvDataCacheAdapter, {
   KVCacheHandler,
 } from "../packages/cloudflare/src/cache/kv-data-adapter.runtime.js";
@@ -40,36 +51,51 @@ describe("generateCacheAdaptersModule", () => {
     expect(VIRTUAL_CACHE_ADAPTERS).toBe("virtual:vinext-cache-adapters");
   });
 
+  it("emits a CDN-only registrar for request-stage graphs", () => {
+    expect(VIRTUAL_CDN_CACHE_ADAPTER).toBe("virtual:vinext-cdn-cache-adapter");
+    const code = generateCdnCacheAdapterModule({
+      cdn: { adapter: "my-cdn-adapter" },
+      data: { adapter: "my-data-adapter" },
+    });
+    expect(code).toContain(`import __vinextCdnAdapterFactory from "my-cdn-adapter";`);
+    expect(code).not.toContain("my-data-adapter");
+    expect(code).not.toContain("registerDataCacheHandler");
+  });
+
   it("emits a no-op registrar when no adapters are configured", () => {
     for (const cache of [undefined, {}, { cdn: undefined, data: undefined }]) {
       const code = generateCacheAdaptersModule(cache);
       expect(code).toContain("export function registerConfiguredCacheAdapters() {}");
       expect(code).not.toContain("import");
-      expect(code).not.toContain("setDataCacheHandler");
-      expect(code).not.toContain("setCdnCacheAdapter");
+      expect(code).not.toContain("registerDataCacheHandler");
+      expect(code).not.toContain("registerCdnCacheAdapter");
     }
   });
 
   it("wires only the data adapter when only data is configured", () => {
     const code = generateCacheAdaptersModule({ data: { adapter: "my-data-adapter" } });
     expect(code).toContain(`import __vinextDataAdapterFactory from "my-data-adapter";`);
-    expect(code).toContain(`import { setDataCacheHandler } from "vinext/shims/cache-handler";`);
     expect(code).toContain(
-      "setDataCacheHandler(__vinextDataAdapterFactory({ env, options: undefined }));",
+      `import { registerDataCacheHandler } from "vinext/shims/cache-handler";`,
+    );
+    expect(code).toContain(
+      "registerDataCacheHandler(() => __vinextDataAdapterFactory({ env, options: undefined }));",
     );
     expect(code).not.toContain("__vinextCdnAdapterFactory");
-    expect(code).not.toContain("setCdnCacheAdapter");
+    expect(code).not.toContain("registerCdnCacheAdapter");
   });
 
   it("wires only the cdn adapter when only cdn is configured", () => {
     const code = generateCacheAdaptersModule({ cdn: { adapter: "my-cdn-adapter" } });
     expect(code).toContain(`import __vinextCdnAdapterFactory from "my-cdn-adapter";`);
-    expect(code).toContain(`import { setCdnCacheAdapter } from "vinext/shims/cdn-cache";`);
     expect(code).toContain(
-      "setCdnCacheAdapter(__vinextCdnAdapterFactory({ env, options: undefined }));",
+      `import { registerCdnCacheAdapter } from "vinext/shims/cdn-cache-state";`,
+    );
+    expect(code).toContain(
+      "registerCdnCacheAdapter(() => __vinextCdnAdapterFactory({ env, options: undefined }));",
     );
     expect(code).not.toContain("__vinextDataAdapterFactory");
-    expect(code).not.toContain("setDataCacheHandler");
+    expect(code).not.toContain("registerDataCacheHandler");
   });
 
   it("inlines descriptor options and forwards them to the factory", () => {
@@ -77,7 +103,28 @@ describe("generateCacheAdaptersModule", () => {
       data: { adapter: "@vinext/cloudflare/cache/kv-data-adapter", options: { binding: "MY_KV" } },
     });
     expect(code).toContain(
-      `setDataCacheHandler(__vinextDataAdapterFactory({ env, options: {"binding":"MY_KV"} }));`,
+      `registerDataCacheHandler(() => __vinextDataAdapterFactory({ env, options: {"binding":"MY_KV"} }));`,
+    );
+  });
+
+  it("adds build identity to the origin-managed adapter when the data adapter provides it", () => {
+    const code = generateCacheAdaptersModule({
+      data: {
+        adapter: "my-data-adapter",
+        capabilities: { buildIdentity: "response-header" },
+      },
+    });
+
+    expect(code).toContain('import { DefaultCdnCacheAdapter } from "vinext/shims/cdn-cache";');
+    expect(code).toContain(
+      "process.env.__VINEXT_RSC_BUILD_IDENTITY || process.env.__VINEXT_BUILD_ID",
+    );
+    expect(code).toContain("registerCdnCacheAdapter(() => new DefaultCdnCacheAdapter(");
+    expect(code.indexOf("registerDataCacheHandler(")).toBeLessThan(
+      code.indexOf("registerCdnCacheAdapter(() => new DefaultCdnCacheAdapter("),
+    );
+    expect(code.indexOf("registerCdnCacheAdapter(() => new DefaultCdnCacheAdapter(")).toBeLessThan(
+      code.indexOf("  } catch (error) {"),
     );
   });
 
@@ -88,13 +135,25 @@ describe("generateCacheAdaptersModule", () => {
     });
     expect(code).toContain(`from "@vinext/cloudflare/cache/cdn-adapter";`);
     expect(code).toContain(`from "@vinext/cloudflare/cache/kv-data-adapter";`);
-    expect(code).toContain("setDataCacheHandler(__vinextDataAdapterFactory(");
-    expect(code).toContain("setCdnCacheAdapter(__vinextCdnAdapterFactory(");
+    expect(code).toContain("registerDataCacheHandler(() => __vinextDataAdapterFactory(");
+    expect(code).toContain("registerCdnCacheAdapter(() => __vinextCdnAdapterFactory(");
     expect(code).toContain(
       "if (typeof process !== 'undefined' && process.env?.__VINEXT_PRERENDER_PATH_DISCOVERY === '1') return;",
     );
     expect(code).toContain("if (__vinextCacheAdaptersRegistered) return;");
     expect(code).toContain("__vinextCacheAdaptersRegistered = true;");
+  });
+
+  it("advertises data-cache availability without importing it into the request stage", () => {
+    const code = generateCdnCacheAdapterModule({
+      cdn: { adapter: "my-cdn-adapter", options: { shards: 16 } },
+      data: { adapter: "my-data-adapter" },
+    });
+
+    expect(code).toContain("export const hasConfiguredDataCache = true;");
+    expect(code).toContain('export const configuredCdnCacheAdapterOptions = {"shards":16};');
+    expect(code).toContain('from "my-cdn-adapter"');
+    expect(code).not.toContain("my-data-adapter");
   });
 
   it("logs registration failures without printing raw Error stack traces", () => {
@@ -142,6 +201,20 @@ describe("findVinextCacheConfigInPlugins", () => {
     expect(await findVinextCacheConfigInPlugins(plugins)).toBe(cache);
   });
 
+  it("preserves adapter-owned multi-stage output metadata", async () => {
+    const cache = {
+      cdn: {
+        adapter: "adapter",
+        output: { entry: "/adapter/worker.js", type: "multi-stage" as const },
+      },
+    };
+    const plugins = [{ [VINEXT_CACHE_CONFIG_PLUGIN_PROPERTY]: cache }] as unknown as Parameters<
+      typeof findVinextCacheConfigInPlugins
+    >[0];
+
+    expect(await findVinextCacheConfigInPlugins(plugins)).toBe(cache);
+  });
+
   it("preserves promise-aware cache loading through the internal Vite wrapper", async () => {
     const cache = { data: { adapter: "adapter", options: { binding: "MY_KV" } } };
     const vite = {
@@ -165,6 +238,18 @@ describe("kvDataAdapter builder", () => {
     expect(descriptor.adapter.endsWith("kv-data-adapter.runtime.js")).toBe(true);
     expect(descriptor.options).toEqual({ binding: "MY_KV", ttlSeconds: 60 });
     expect(kvDataAdapter().options).toBeUndefined();
+    expect(descriptor.capabilities).toEqual({
+      buildIdentity: "response-header",
+      warmup: "data-cache",
+    });
+    expect(hasBuildIdentityResponseHeader({ data: descriptor })).toBe(true);
+    expect(cacheWarmupStatusSource({ data: descriptor })).toBe("data-cache");
+    expect(
+      hasBuildIdentityResponseHeader({
+        cdn: { adapter: "custom-cdn" },
+        data: descriptor,
+      }),
+    ).toBe(false);
   });
 
   it("validates the binding option at config time", () => {
@@ -266,10 +351,25 @@ describe("registration is wired into every router/runtime entry", () => {
   });
 
   it("Pages Router worker entry registers with env", () => {
-    const code = readPagesRouterEntrySource();
-    expect(code).toContain('from "virtual:vinext-cache-adapters"');
-    expect(code).toContain("registerConfiguredCacheAdapters(env)");
-    expect(code).toContain("await validateCdnRequest(request)");
+    const code = readPagesRequestStageEntrySource();
+    const eagerCdnRegistration = "configuredCdnCacheAdapters.registerConfiguredCacheAdapters(env);";
+    const validateCdnRequest = "await validateCdnRequest(request)";
+    const lazyDataRegistration = code.match(
+      /registerLazyDataCacheHandler\(async \(\) => \{[\s\S]*?\n\s*\}\);/,
+    )?.[0];
+
+    expect(code).toContain('from "virtual:vinext-cdn-cache-adapter"');
+    expect(code).not.toContain('from "virtual:vinext-cache-adapters"');
+    expect(code).toContain(eagerCdnRegistration);
+    expect(code.indexOf(eagerCdnRegistration)).toBeLessThan(code.indexOf(validateCdnRequest));
+    expect(lazyDataRegistration).toContain('await import("virtual:vinext-cache-adapters")');
+    expect(lazyDataRegistration).toContain("adapters.registerConfiguredCacheAdapters(env);");
+  });
+
+  it("App request stage cannot retain the configured data adapter module", () => {
+    const code = readAppRequestStageEntrySource();
+    expect(code).toContain('from "virtual:vinext-cdn-cache-adapter"');
+    expect(code).not.toContain('from "virtual:vinext-cache-adapters"');
   });
 
   it("App Router worker entry validates CDN routing after registering with env", () => {
@@ -288,14 +388,60 @@ describe("cdnAdapter builder + factory", () => {
     expect(path.isAbsolute(descriptor.adapter)).toBe(true);
     expect(descriptor.adapter.endsWith("cdn-adapter.runtime.js")).toBe(true);
     expect(descriptor.options).toBeUndefined();
+    expect(descriptor.output.type).toBe("multi-stage");
+    expect(path.isAbsolute(descriptor.output.entry)).toBe(true);
+    expect(descriptor.output.entry.endsWith("cdn-adapter.worker.js")).toBe(true);
+    expect(
+      descriptor.output.transformHostEntry({
+        code: 'import handler from "vinext/server/fetch-handler";\nexport default handler;',
+        id: "\0virtual:cloudflare/worker-entry",
+      }),
+    ).toContain(
+      `export { VinextCachedResponse, VinextUncachedResponse } from ${JSON.stringify(descriptor.output.entry)};`,
+    );
+    expect(
+      descriptor.output.transformHostEntry({
+        code: "export default { fetch() {} };",
+        id: "/app/unrelated.ts",
+      }),
+    ).toBeNull();
+    expect(
+      descriptor.output.transformHostEntry({
+        code: 'export default function Docs() { return "vinext/server/fetch-handler"; }',
+        id: "/app/page.tsx",
+      }),
+    ).toBeNull();
+    expect(
+      descriptor.output.transformHostEntry({
+        code: '// import handler from "vinext/server/fetch-handler";\nexport default {};',
+        id: "/app/page.ts",
+      }),
+    ).toBeNull();
     expect(descriptor.capabilities).toEqual({
       buildIdentity: "response-header",
+      isResponsePolicyHeader: expect.any(Function),
+      requestRouting: "uncached-stage",
       responseVary: "verbatim",
+      routeCacheability: "probe-manifest",
     });
     expect(hasBuildIdentityResponseHeader({ cdn: descriptor })).toBe(true);
+    expect(hasUncachedRequestRouting({ cdn: descriptor })).toBe(true);
     expect(hasVerbatimResponseVary({ cdn: descriptor })).toBe(true);
     expect(hasBuildIdentityResponseHeader({ cdn: { adapter: "custom-cache" } })).toBe(false);
+    expect(hasUncachedRequestRouting({ cdn: { adapter: "url-only-cache" } })).toBe(false);
     expect(hasVerbatimResponseVary({ cdn: { adapter: "url-only-cache" } })).toBe(false);
+    const custom = {
+      cdn: {
+        adapter: "custom-cache",
+        capabilities: {
+          isResponsePolicyHeader: (name: string) =>
+            name.trim().toLowerCase() === "x-example-policy",
+        },
+      },
+    };
+    expect(isConfiguredCdnResponsePolicyHeader(custom, "Cache-Control")).toBe(true);
+    expect(isConfiguredCdnResponsePolicyHeader(custom, " X-Example-Policy ")).toBe(true);
+    expect(isConfiguredCdnResponsePolicyHeader(custom, "X-Unrelated")).toBe(false);
   });
 
   it("factory returns a CloudflareCdnCacheAdapter", () => {
@@ -311,6 +457,46 @@ describe("cdnAdapter builder + factory", () => {
     });
     expect(() => cdnAdapter({ versionMetadataBinding: "" })).toThrow(
       "must be a non-empty string binding name",
+    );
+  });
+});
+
+describe("responseStoreAdapter builder", () => {
+  it("declares single-upload, after-render warmup capabilities", () => {
+    const descriptor = responseStoreAdapter();
+    expect(descriptor.cdn.capabilities).toEqual({
+      buildIdentity: "response-header",
+      isResponsePolicyHeader: expect.any(Function),
+      requestRouting: "uncached-stage",
+      warmup: "response-store",
+    });
+    expect(hasBuildIdentityResponseHeader(descriptor)).toBe(true);
+    expect(hasVerbatimResponseVary(descriptor)).toBe(false);
+    expect(supportsCanonicalRscWarmup(descriptor)).toBe(false);
+  });
+
+  it("can keep Response Store inside the application Worker", () => {
+    const descriptor = responseStoreAdapter({ mode: "self-contained" });
+    expect(descriptor.cdn.output.entry).toMatch(
+      /response-store-adapter\.self-contained\.worker\.js$/,
+    );
+    expect(
+      descriptor.cdn.output.transformHostEntry({
+        code: "export default {};",
+        id: "virtual:cloudflare/worker-entry",
+      }),
+    ).toBe(
+      `export default {};\nexport { CacheMetadata, ResponseStoreBinding, ResponseStoreRevalidator } from ${JSON.stringify(descriptor.cdn.output.entry)};\n`,
+    );
+  });
+
+  it("opts into metadata sharding explicitly", () => {
+    const descriptor = responseStoreAdapter({ shards: 16 });
+    expect(descriptor.cdn.options).toEqual({ shards: 16 });
+    expect(descriptor.data.options).toEqual({ shards: 16 });
+    expect(responseStoreAdapter().cdn.options).toBeUndefined();
+    expect(() => responseStoreAdapter({ shards: 1 })).toThrow(
+      "Workers Response Store shards must be an integer greater than 1",
     );
   });
 });

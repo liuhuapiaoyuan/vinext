@@ -8,6 +8,7 @@ import {
   type Response,
 } from "@playwright/test";
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import { VINEXT_EXPECTED_WORKER_VERSION_HEADER } from "../../../packages/cloudflare/src/version-headers.js";
 
 const TARGET_PATH = "/prewarm-target";
@@ -57,6 +58,52 @@ async function getResponseAfterPromotion(
   );
 }
 
+async function getReusableResponseAfterPromotion(
+  request: APIRequestContext,
+  url: string,
+  headers: Record<string, string>,
+  label: string,
+): Promise<APIResponse> {
+  const response = await getResponseAfterPromotion(request, url, headers);
+  const responseHeaders = response.headers();
+  if (responseHeaders["cf-cache-status"] !== "MISS") return response;
+
+  // Workers Cache is tiered. A deploy fill and this verification request can
+  // traverse different lower/upper tiers, so the first request from this
+  // client may still be a MISS. The named response entrypoint admits the
+  // completed response, while the uncached gateway strips its inner CDN policy
+  // before composing request-specific headers. Require the same client to
+  // reuse that exact entry immediately.
+  const trace = `${label} first response headers: ${JSON.stringify(responseHeaders)}`;
+  expect(responseHeaders["cache-control"], trace).toBe("private, max-age=0, must-revalidate");
+  expect(responseHeaders["cdn-cache-control"], trace).toBeUndefined();
+  expect(responseHeaders["cloudflare-cdn-cache-control"], trace).toBeUndefined();
+  await response.body();
+
+  const reused = await getResponseAfterPromotion(request, url, headers);
+  expect(
+    reused.headers()["cf-cache-status"],
+    `${label} reused response headers: ${JSON.stringify(reused.headers())}`,
+  ).toBe("HIT");
+  return reused;
+}
+
+async function waitForEdgeCacheState(
+  request: APIRequestContext,
+  url: string,
+  expected: "HIT" | "MISS",
+  failureMessage: string,
+): Promise<APIResponse> {
+  const deadline = Date.now() + 30_000;
+  do {
+    const response = await getResponseAfterPromotion(request, url, { accept: "text/html" });
+    if (response.headers()["cf-cache-status"] === expected) return response;
+    await response.dispose();
+    await new Promise((resolve) => setTimeout(resolve, PROMOTION_PROBE_INTERVAL_MS));
+  } while (Date.now() < deadline);
+  throw new Error(failureMessage);
+}
+
 async function observeRsc(page: Page, action: () => Promise<unknown>): Promise<ObservedRsc> {
   const responsePromise = page.waitForResponse(
     (response) => {
@@ -81,11 +128,12 @@ async function observeRsc(page: Page, action: () => Promise<unknown>): Promise<O
 
 function expectCanonical(observed: ObservedRsc, rscBuildId: string): void {
   rejectStaleSeedWorker(observed.response);
+  const responseHeaders = observed.response.headers();
   console.log(
     `RSC cache trace: url=${observed.url.pathname}${observed.url.search} ` +
-      `cache=${observed.response.headers()["cf-cache-status"] ?? "missing"} ` +
-      `ray=${observed.response.headers()["cf-ray"] ?? "missing"} ` +
-      `encoding=${observed.response.headers()["content-encoding"] ?? "identity"}`,
+      `cache=${responseHeaders["cf-cache-status"] ?? "missing"} ` +
+      `ray=${responseHeaders["cf-ray"] ?? "missing"} ` +
+      `encoding=${responseHeaders["content-encoding"] ?? "identity"}`,
   );
   expect(observed.url.pathname).toBe(TARGET_PATH);
   expect(observed.headers.accept).toBe("text/x-component");
@@ -93,11 +141,19 @@ function expectCanonical(observed: ObservedRsc, rscBuildId: string): void {
   expect(observed.headers["next-router-state-tree"]).toBeUndefined();
   expect(observed.headers["next-url"]).toBeUndefined();
   expect(observed.headers["x-vinext-rsc-state-fingerprint"]).toBeUndefined();
-  expect(observed.response.headers()["x-vinext-rsc-build-id"]).toBe(rscBuildId);
-  expect(
-    observed.response.headers()["cf-cache-status"],
-    JSON.stringify({ request: observed.headers, response: observed.response.headers() }),
-  ).toBe("HIT");
+  expect(responseHeaders["x-vinext-rsc-build-id"]).toBe(rscBuildId);
+
+  const trace = JSON.stringify({ request: observed.headers, response: responseHeaders });
+  const cacheStatus = responseHeaders["cf-cache-status"];
+  expect(["HIT", "MISS"], trace).toContain(cacheStatus);
+  if (cacheStatus === "MISS") {
+    // Chromium negotiates zstd while the Node-based deploy warmer negotiates
+    // br. A browser may therefore fill a separate encoded edge object even
+    // though the canonical representation was already warmed and verified.
+    expect(responseHeaders["cache-control"], trace).toBe("private, max-age=0, must-revalidate");
+    expect(responseHeaders["cdn-cache-control"], trace).toBeUndefined();
+    expect(responseHeaders["cloudflare-cdn-cache-control"], trace).toBeUndefined();
+  }
 }
 
 function expectFull(observed: ObservedRsc, rscBuildId: string): void {
@@ -162,7 +218,7 @@ async function waitForStablePromotion({
   );
 }
 
-test("deploy-prewarmed Pages HTML and RSC variants are reused", async ({
+test("deploy-prewarmed variants are reused and late-dynamic HTML stays private", async ({
   baseURL,
   browser,
   playwright,
@@ -172,11 +228,20 @@ test("deploy-prewarmed Pages HTML and RSC variants are reused", async ({
   if (!baseURL) throw new Error("deployed test requires a base URL");
   test.setTimeout(240_000);
 
-  const buildId = fs.readFileSync("examples/workers-cache/dist/server/BUILD_ID", "utf-8").trim();
-  const rscBuildId = fs
-    .readFileSync("examples/workers-cache/dist/server/RSC_BUILD_ID", "utf-8")
+  const buildId = fs
+    .readFileSync("examples/response-store-demo/dist/server/BUILD_ID", "utf-8")
     .trim();
+  const rscBuildId = fs
+    .readFileSync("examples/response-store-demo/dist/server/RSC_BUILD_ID", "utf-8")
+    .trim();
+  const { prerenderSecret } = JSON.parse(
+    fs.readFileSync("examples/response-store-demo/dist/server/vinext-server.json", "utf-8"),
+  ) as { prerenderSecret: string };
 
+  // Match a browser navigation and the HTML request emitted by cdn-warm.ts.
+  // Playwright's APIRequestContext otherwise sends `Accept: */*`, which is a
+  // different representation from the one this deployed regression warms.
+  const htmlHeaders = { accept: "text/html" };
   const fullHeaders = { accept: "text/x-component", rsc: "1" };
   const shellHeaders = {
     ...fullHeaders,
@@ -192,7 +257,35 @@ test("deploy-prewarmed Pages HTML and RSC variants are reused", async ({
   // without touching either canonical cache entry before its HIT assertion.
   await waitForStablePromotion({ baseURL, buildId, playwright, rscBuildId });
 
-  const workerName = new URL(baseURL).hostname.split(".")[0];
+  // A browser fetch() uses Accept: */* by default. The resolved App Page kind,
+  // rather than that header, must authorize a fresh HTML cache identity. This
+  // query is unique so the first response necessarily exercises Worker
+  // admission instead of the canonical entry populated during deployment.
+  const browserFetchUrl = new URL("/cached/intro", baseURL);
+  browserFetchUrl.searchParams.set("browser-fetch", randomUUID());
+  const browserFetchMiss = await request.get(browserFetchUrl.href, {
+    headers: { accept: "*/*" },
+  });
+  const browserFetchMissHeaders = browserFetchMiss.headers();
+  expect(browserFetchMiss.ok(), JSON.stringify(browserFetchMissHeaders)).toBe(true);
+  expect(browserFetchMissHeaders["content-type"]).toContain("text/html");
+  expect(browserFetchMissHeaders["cf-cache-status"]).toBe("MISS");
+  expect(browserFetchMissHeaders["x-vinext-cache"]).toBe("MISS");
+  expect(browserFetchMissHeaders["x-nextjs-cache"]).toBe("MISS");
+  expect(browserFetchMissHeaders["cache-control"]).toBe("private, max-age=0, must-revalidate");
+  expect(browserFetchMissHeaders["cdn-cache-control"]).toBeUndefined();
+  expect(browserFetchMissHeaders["cloudflare-cdn-cache-control"]).toBeUndefined();
+  const browserFetchBody = await browserFetchMiss.text();
+
+  const browserFetchHit = await request.get(browserFetchUrl.href, {
+    headers: { accept: "*/*" },
+  });
+  const browserFetchHitHeaders = browserFetchHit.headers();
+  expect(browserFetchHitHeaders["cf-cache-status"]).toBe("HIT");
+  expect(browserFetchHitHeaders["x-vinext-cache"]).toBe("HIT");
+  expect(browserFetchHitHeaders["x-nextjs-cache"]).toBe("HIT");
+  expect(await browserFetchHit.text()).toBe(browserFetchBody);
+
   const downstreamOnlyOverride = await request.get(`${baseURL}/api/prewarm-version?downstream=1`, {
     headers: {
       "Cloudflare-Workers-Version-Overrides":
@@ -203,26 +296,119 @@ test("deploy-prewarmed Pages HTML and RSC variants are reused", async ({
 
   const mismatchedOverride = await request.get(`${baseURL}/api/prewarm-version?mismatch=1`, {
     headers: {
-      "Cloudflare-Workers-Version-Overrides": `${workerName}="00000000-0000-4000-8000-000000000000"`,
+      // The deploy path already exercises a real same-Worker version
+      // override. Keep this request on the current version so vinext can
+      // deterministically reject the deliberately mismatched assertion;
+      // asking Cloudflare to dispatch this Worker to a fabricated version can
+      // fail at the platform routing layer before vinext runs.
+      "Cloudflare-Workers-Version-Overrides":
+        'unrelated-downstream="00000000-0000-4000-8000-000000000000"',
       [VINEXT_EXPECTED_WORKER_VERSION_HEADER]: "00000000-0000-4000-8000-000000000000",
     },
   });
-  expect(mismatchedOverride.status()).toBe(503);
-  expect(mismatchedOverride.headers()["cache-control"]).toBe("no-store");
-  expect(await mismatchedOverride.text()).toContain("Cloudflare invoked Worker version");
+  const mismatchedOverrideHeaders = mismatchedOverride.headers();
+  const mismatchedOverrideBody = await mismatchedOverride.text();
+  const mismatchedOverrideTrace = JSON.stringify({
+    body: mismatchedOverrideBody,
+    headers: mismatchedOverrideHeaders,
+    status: mismatchedOverride.status(),
+  });
+  expect(mismatchedOverride.status(), mismatchedOverrideTrace).toBe(503);
+  expect(mismatchedOverrideHeaders["cache-control"], mismatchedOverrideTrace).toBe("no-store");
+  expect(mismatchedOverrideBody, mismatchedOverrideTrace).toContain(
+    "Cloudflare invoked Worker version",
+  );
 
-  const pagesResponse = await getResponseAfterPromotion(request, `${baseURL}${PAGES_TARGET_PATH}`);
+  const pagesResponse = await getReusableResponseAfterPromotion(
+    request,
+    `${baseURL}${PAGES_TARGET_PATH}`,
+    {
+      ...htmlHeaders,
+      "x-test-config-visitor": "config-a",
+      "x-test-visitor-id": "visitor-a",
+    },
+    "Pages HTML",
+  );
   const pagesResponseHeaders = pagesResponse.headers();
   expect(pagesResponse.ok(), JSON.stringify(pagesResponseHeaders)).toBe(true);
   expect(pagesResponseHeaders["content-type"]).toContain("text/html");
   expect(pagesResponseHeaders["x-vinext-build-id"]).toBe(rscBuildId);
+  expect(pagesResponseHeaders["cache-control"]).toBe("private, max-age=0, must-revalidate");
+  expect(pagesResponseHeaders["cdn-cache-control"]).toBeUndefined();
+  expect(pagesResponseHeaders["cloudflare-cdn-cache-control"]).toBeUndefined();
   expect(
     pagesResponseHeaders["cf-cache-status"],
     `Pages response headers: ${JSON.stringify(pagesResponseHeaders)}`,
   ).toBe("HIT");
-  expect(await pagesResponse.text()).toContain("Pages prewarm target");
+  expect(pagesResponseHeaders["x-workers-config-visitor"]).toBe("config-a");
+  expect(pagesResponseHeaders["x-workers-cache-visitor"]).toBe("visitor-a");
+  const pagesBody = await pagesResponse.text();
+  expect(pagesBody).toContain("Pages prewarm target");
 
-  const appHtmlResponse = await getResponseAfterPromotion(request, `${baseURL}${TARGET_PATH}`);
+  const secondPagesResponse = await getResponseAfterPromotion(
+    request,
+    `${baseURL}${PAGES_TARGET_PATH}`,
+    {
+      ...htmlHeaders,
+      "x-test-config-visitor": "config-b",
+      "x-test-visitor-id": "visitor-b",
+    },
+  );
+  const secondPagesResponseHeaders = secondPagesResponse.headers();
+  expect(secondPagesResponse.ok(), JSON.stringify(secondPagesResponseHeaders)).toBe(true);
+  expect(secondPagesResponseHeaders["x-vinext-build-id"]).toBe(rscBuildId);
+  expect(
+    secondPagesResponseHeaders["cf-cache-status"],
+    `Second Pages response headers: ${JSON.stringify(secondPagesResponseHeaders)}`,
+  ).toBe("HIT");
+  expect(secondPagesResponseHeaders["x-workers-config-visitor"]).toBe("config-b");
+  expect(secondPagesResponseHeaders["x-workers-cache-visitor"]).toBe("visitor-b");
+  expect(await secondPagesResponse.text()).toBe(pagesBody);
+
+  const pagesDataUrl = `${baseURL}/_next/data/${buildId}/pages-prewarm.json`;
+  const pagesDataResponse = await getReusableResponseAfterPromotion(
+    request,
+    pagesDataUrl,
+    {
+      accept: "application/json",
+      "x-nextjs-data": "1",
+      "x-test-config-visitor": "config-a",
+      "x-test-visitor-id": "visitor-a",
+    },
+    "Pages data",
+  );
+  const pagesDataHeaders = pagesDataResponse.headers();
+  expect(pagesDataResponse.ok(), JSON.stringify(pagesDataHeaders)).toBe(true);
+  expect(pagesDataHeaders["content-type"]).toContain("application/json");
+  expect(pagesDataHeaders["cf-cache-status"]).toBe("HIT");
+  expect(pagesDataHeaders["x-workers-config-visitor"]).toBe("config-a");
+  expect(pagesDataHeaders["x-workers-cache-visitor"]).toBe("visitor-a");
+  const pagesDataBody = await pagesDataResponse.text();
+  expect(JSON.parse(pagesDataBody)).toMatchObject({ pageProps: { draftMode: false } });
+
+  const secondPagesDataResponse = await getResponseAfterPromotion(request, pagesDataUrl, {
+    accept: "application/json",
+    "x-nextjs-data": "1",
+    "x-test-config-visitor": "config-b",
+    "x-test-visitor-id": "visitor-b",
+  });
+  const secondPagesDataHeaders = secondPagesDataResponse.headers();
+  expect(secondPagesDataResponse.ok(), JSON.stringify(secondPagesDataHeaders)).toBe(true);
+  expect(secondPagesDataHeaders["cf-cache-status"]).toBe("HIT");
+  expect(secondPagesDataHeaders["x-workers-config-visitor"]).toBe("config-b");
+  expect(secondPagesDataHeaders["x-workers-cache-visitor"]).toBe("visitor-b");
+  expect(await secondPagesDataResponse.text()).toBe(pagesDataBody);
+
+  const appHtmlResponse = await getReusableResponseAfterPromotion(
+    request,
+    `${baseURL}${TARGET_PATH}`,
+    {
+      ...htmlHeaders,
+      "x-test-config-visitor": "config-a",
+      "x-test-visitor-id": "visitor-a",
+    },
+    "App HTML",
+  );
   const appHtmlResponseHeaders = appHtmlResponse.headers();
   expect(appHtmlResponse.ok(), JSON.stringify(appHtmlResponseHeaders)).toBe(true);
   expect(appHtmlResponseHeaders["content-type"]).toContain("text/html");
@@ -231,12 +417,102 @@ test("deploy-prewarmed Pages HTML and RSC variants are reused", async ({
     appHtmlResponseHeaders["cf-cache-status"],
     `App HTML response headers: ${JSON.stringify(appHtmlResponseHeaders)}`,
   ).toBe("HIT");
-  expect(await appHtmlResponse.text()).toContain("Prewarm target");
+  expect(appHtmlResponseHeaders["x-workers-config-visitor"]).toBe("config-a");
+  expect(appHtmlResponseHeaders["x-workers-cache-visitor"]).toBe("visitor-a");
+  const appHtmlBody = await appHtmlResponse.text();
+  expect(appHtmlBody).toContain("Prewarm target");
 
-  const fullResponse = await getResponseAfterPromotion(
+  const secondAppHtmlResponse = await getResponseAfterPromotion(
+    request,
+    `${baseURL}${TARGET_PATH}`,
+    {
+      ...htmlHeaders,
+      "x-test-config-visitor": "config-b",
+      "x-test-visitor-id": "visitor-b",
+    },
+  );
+  const secondAppHtmlResponseHeaders = secondAppHtmlResponse.headers();
+  expect(secondAppHtmlResponse.ok(), JSON.stringify(secondAppHtmlResponseHeaders)).toBe(true);
+  expect(secondAppHtmlResponseHeaders["x-vinext-build-id"]).toBe(rscBuildId);
+  expect(
+    secondAppHtmlResponseHeaders["cf-cache-status"],
+    `Second App HTML response headers: ${JSON.stringify(secondAppHtmlResponseHeaders)}`,
+  ).toBe("HIT");
+  expect(secondAppHtmlResponseHeaders["x-workers-config-visitor"]).toBe("config-b");
+  expect(secondAppHtmlResponseHeaders["x-workers-cache-visitor"]).toBe("visitor-b");
+  expect(await secondAppHtmlResponse.text()).toBe(appHtmlBody);
+
+  // Next.js limits browser no-cache cache bypass to development. A production
+  // hard reload must continue reusing the admitted App response.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/app-render/app-render.tsx
+  const reloadedAppHtmlResponse = await getResponseAfterPromotion(
+    request,
+    `${baseURL}${TARGET_PATH}`,
+    { ...htmlHeaders, "cache-control": "no-cache", pragma: "no-cache" },
+  );
+  const reloadedAppHtmlHeaders = reloadedAppHtmlResponse.headers();
+  expect(
+    reloadedAppHtmlHeaders["cf-cache-status"],
+    `Reloaded App HTML response headers: ${JSON.stringify(reloadedAppHtmlHeaders)}`,
+  ).toBe("HIT");
+  expect(reloadedAppHtmlHeaders["x-vinext-cache"]).toBe("HIT");
+  expect(reloadedAppHtmlHeaders["x-nextjs-cache"]).toBe("HIT");
+  expect(await reloadedAppHtmlResponse.text()).toBe(appHtmlBody);
+
+  // Next.js skips its shared response cache in draft mode. This must be
+  // decided in the uncached request entrypoint because a named-entrypoint HIT
+  // cannot inspect the draft cookie before replaying anonymous bytes.
+  const draftRequest = await playwright.request.newContext();
+  try {
+    const enableDraft = await draftRequest.get(`${baseURL}/api/draft-enable`);
+    expect(enableDraft.ok()).toBe(true);
+    expect(enableDraft.headers()["set-cookie"]).toContain("__prerender_bypass=");
+    expect(enableDraft.headers()["cache-control"]).toContain("no-store");
+
+    for (const pathname of [TARGET_PATH, PAGES_TARGET_PATH]) {
+      const draftResponse = await draftRequest.get(`${baseURL}${pathname}`, {
+        headers: htmlHeaders,
+      });
+      const draftHeaders = draftResponse.headers();
+      expect(draftResponse.ok(), JSON.stringify(draftHeaders)).toBe(true);
+      expect(draftHeaders["cf-cache-status"]).not.toBe("HIT");
+      expect(draftHeaders["cache-control"]).toContain("no-store");
+      expect(await draftResponse.text()).toContain(
+        '<output data-testid="draft-mode">true</output>',
+      );
+    }
+  } finally {
+    await draftRequest.dispose();
+  }
+
+  const anonymousAfterDraft = await getResponseAfterPromotion(
+    request,
+    `${baseURL}${TARGET_PATH}`,
+    htmlHeaders,
+  );
+  expect(anonymousAfterDraft.headers()["cf-cache-status"]).toBe("HIT");
+  expect(await anonymousAfterDraft.text()).toBe(appHtmlBody);
+
+  for (const variant of ["alpha", "beta"]) {
+    const first = await getResponseAfterPromotion(request, `${baseURL}/vary`, {
+      "x-cache-variant": variant,
+    });
+    expect(first.ok(), JSON.stringify(first.headers())).toBe(true);
+    expect(await first.text()).toBe(variant);
+    expect(first.headers()["vary"]?.toLowerCase()).toContain("x-cache-variant");
+
+    const cached = await getResponseAfterPromotion(request, `${baseURL}/vary`, {
+      "x-cache-variant": variant,
+    });
+    expect(cached.headers()["cf-cache-status"], JSON.stringify(cached.headers())).toBe("HIT");
+    expect(await cached.text()).toBe(variant);
+  }
+
+  const fullResponse = await getReusableResponseAfterPromotion(
     request,
     `${baseURL}${TARGET_PATH}?_rsc`,
-    fullHeaders,
+    { ...fullHeaders, "x-test-visitor-id": "visitor-a" },
+    "full RSC",
   );
   const fullResponseHeaders = fullResponse.headers();
   expect(fullResponse.ok(), JSON.stringify(fullResponseHeaders)).toBe(true);
@@ -246,14 +522,31 @@ test("deploy-prewarmed Pages HTML and RSC variants are reused", async ({
     fullResponseHeaders["cf-cache-status"],
     `full RSC response headers: ${JSON.stringify(fullResponseHeaders)}`,
   ).toBe("HIT");
+  expect(fullResponseHeaders["x-workers-cache-visitor"]).toBe("visitor-a");
   const fullBody = await fullResponse.text();
   expect(fullBody).toContain(buildId);
   expect(fullBody).toContain("Prewarm target");
 
-  const shellResponse = await getResponseAfterPromotion(
+  const secondFullResponse = await getResponseAfterPromotion(
+    request,
+    `${baseURL}${TARGET_PATH}?_rsc`,
+    { ...fullHeaders, "x-test-visitor-id": "visitor-b" },
+  );
+  const secondFullResponseHeaders = secondFullResponse.headers();
+  expect(secondFullResponse.ok(), JSON.stringify(secondFullResponseHeaders)).toBe(true);
+  expect(secondFullResponseHeaders["x-vinext-rsc-build-id"]).toBe(rscBuildId);
+  expect(
+    secondFullResponseHeaders["cf-cache-status"],
+    `Second full RSC response headers: ${JSON.stringify(secondFullResponseHeaders)}`,
+  ).toBe("HIT");
+  expect(secondFullResponseHeaders["x-workers-cache-visitor"]).toBe("visitor-b");
+  expect(await secondFullResponse.text()).toBe(fullBody);
+
+  const shellResponse = await getReusableResponseAfterPromotion(
     request,
     `${baseURL}${TARGET_PATH}${LOADING_SHELL_RSC_SEARCH}`,
     shellHeaders,
+    "loading-shell RSC",
   );
   const shellResponseHeaders = shellResponse.headers();
   expect(shellResponse.ok()).toBe(true);
@@ -364,4 +657,125 @@ test("deploy-prewarmed Pages HTML and RSC variants are reused", async ({
     expect(dynamic.headers()["cache-control"]).toContain("no-store");
     expect(dynamic.headers()["cf-cache-status"]).toBe("BYPASS");
   });
+
+  // The App Page starts streaming before its Suspense child reads cookies(), so
+  // the first response must remain private all the way through clean EOF. A
+  // public header here would let Workers Cache replay Alice's authenticated
+  // HTML to Bob at this exact URL.
+  const disclosureUrl = `${baseURL}/dynamic?cache-case=${Date.now()}`;
+  const classification = await getResponseAfterPromotion(request, disclosureUrl, {
+    accept: "text/html",
+    "x-vinext-cacheability-probe": "1",
+    "x-vinext-prerender-secret": prerenderSecret,
+  });
+  await expect(classification.json()).resolves.toMatchObject({
+    kind: "app-page",
+    pattern: "/dynamic",
+    reason: "dynamic API used during render",
+    state: "dynamic",
+  });
+  expect(classification.headers()["cache-control"]).toContain("no-store");
+  expect(classification.headers()["cdn-cache-control"]).toBeUndefined();
+
+  const alice = await getResponseAfterPromotion(request, disclosureUrl, {
+    accept: "text/html",
+    cookie: "session=alice",
+  });
+  const aliceHtml = await alice.text();
+  expect(alice.ok(), JSON.stringify(alice.headers())).toBe(true);
+  expect(alice.headers()["cf-cache-status"]).toBe("BYPASS");
+  expect(alice.headers()["cache-control"]).toContain("no-store");
+  expect(alice.headers()["cdn-cache-control"]).toBeUndefined();
+  expect(alice.headers()["cloudflare-cdn-cache-control"]).toBeUndefined();
+  expect((alice.headers().vary ?? "").toLowerCase().split(/,\s*/)).not.toContain("cookie");
+  expect(aliceHtml).toContain('data-late-dynamic-viewer="alice"');
+  const aliceRenderId = /data-late-dynamic-render-id="([^"]+)"/.exec(aliceHtml)?.[1];
+  expect(aliceRenderId).toBeTruthy();
+
+  const bob = await getResponseAfterPromotion(request, disclosureUrl, {
+    accept: "text/html",
+    cookie: "session=bob",
+  });
+  const bobHtml = await bob.text();
+  expect(bob.ok(), JSON.stringify(bob.headers())).toBe(true);
+  expect(bob.headers()["cf-cache-status"]).toBe("BYPASS");
+  expect(bob.headers()["cache-control"]).toContain("no-store");
+  expect(bob.headers()["cdn-cache-control"]).toBeUndefined();
+  expect(bob.headers()["cloudflare-cdn-cache-control"]).toBeUndefined();
+  expect((bob.headers().vary ?? "").toLowerCase().split(/,\s*/)).not.toContain("cookie");
+  expect(bobHtml).toContain('data-late-dynamic-viewer="bob"');
+  expect(bobHtml).not.toContain('data-late-dynamic-viewer="alice"');
+  const bobRenderId = /data-late-dynamic-render-id="([^"]+)"/.exec(bobHtml)?.[1];
+  expect(bobRenderId).toBeTruthy();
+  expect(bobRenderId).not.toBe(aliceRenderId);
+
+  const purgeResponse = await request.post(`${baseURL}/api/revalidate-path`, {
+    data: { path: TARGET_PATH },
+  });
+  expect(purgeResponse.ok()).toBe(true);
+  expect(await purgeResponse.json()).toEqual({ revalidated: true, target: TARGET_PATH });
+
+  // A purge removes the warmed response body, not the manifest embedded in the
+  // promoted Worker. The first completed render must therefore be admitted as
+  // a CDN MISS, and subsequent requests must eventually reuse that exact entry.
+  const coldAfterPurge = await waitForEdgeCacheState(
+    request,
+    `${baseURL}${TARGET_PATH}`,
+    "MISS",
+    "purged App HTML entry did not become a CDN MISS",
+  );
+  const coldHeaders = coldAfterPurge.headers();
+  expect(coldAfterPurge.ok(), JSON.stringify(coldHeaders)).toBe(true);
+  expect(coldHeaders["cf-cache-status"]).toBe("MISS");
+  expect(coldHeaders["cdn-cache-control"]).toBeUndefined();
+  expect(coldHeaders["cloudflare-cdn-cache-control"]).toBeUndefined();
+  expect(await coldAfterPurge.text()).toContain("Prewarm target");
+
+  const hitAfterPurge = await waitForEdgeCacheState(
+    request,
+    `${baseURL}${TARGET_PATH}`,
+    "HIT",
+    "cold App HTML cache fill did not become reusable",
+  );
+  expect(hitAfterPurge.ok(), JSON.stringify(hitAfterPurge.headers())).toBe(true);
+  expect(await hitAfterPurge.text()).toContain("Prewarm target");
+
+  const taggedUrl = `${baseURL}/cached/featured`;
+  const taggedHit = await waitForEdgeCacheState(
+    request,
+    taggedUrl,
+    "HIT",
+    "prewarmed tagged App HTML entry did not become reusable",
+  );
+  const taggedBody = await taggedHit.text();
+  const taggedRenderId = /data-render-id="([^"]+)"/.exec(taggedBody)?.[1];
+  expect(taggedRenderId).toBeTruthy();
+
+  const tagPurge = await request.post(`${baseURL}/api/revalidate-tag`, {
+    data: { tag: "post:featured" },
+  });
+  const tagPurgeBody = await tagPurge.json();
+  expect(tagPurge.ok(), JSON.stringify(tagPurgeBody)).toBe(true);
+  expect(tagPurgeBody).toEqual({ revalidated: true, target: "post:featured" });
+
+  const taggedMiss = await waitForEdgeCacheState(
+    request,
+    taggedUrl,
+    "MISS",
+    "tag-invalidated App HTML entry did not become a CDN MISS",
+  );
+  const refreshedTaggedBody = await taggedMiss.text();
+  const refreshedTaggedRenderId = /data-render-id="([^"]+)"/.exec(refreshedTaggedBody)?.[1];
+  expect(refreshedTaggedRenderId).toBeTruthy();
+  expect(refreshedTaggedRenderId).not.toBe(taggedRenderId);
+
+  const taggedReuse = await waitForEdgeCacheState(
+    request,
+    taggedUrl,
+    "HIT",
+    "tag-refreshed App HTML entry did not become reusable",
+  );
+  expect(/data-render-id="([^"]+)"/.exec(await taggedReuse.text())?.[1]).toBe(
+    refreshedTaggedRenderId,
+  );
 });

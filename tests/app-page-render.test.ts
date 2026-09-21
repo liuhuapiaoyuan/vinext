@@ -80,6 +80,19 @@ function createDeferred<T = void>() {
 function createCommonOptions() {
   const waitUntilPromises: Promise<void>[] = [];
   const renderToReadableStream = vi.fn(() => createStream(["flight-data"]));
+  const createRscOnErrorHandler = vi.fn(
+    (
+      _pathname: string,
+      _routePath: string,
+      _overrides?: {
+        renderSource?: string;
+        revalidateReason?: string;
+        routeType?: string;
+      },
+    ): ((error: unknown) => unknown) =>
+      () =>
+        null,
+  );
   const loadSsrHandler = vi.fn(async () => ({
     async handleSsr(
       _rscStream: ReadableStream<Uint8Array>,
@@ -129,6 +142,7 @@ function createCommonOptions() {
 
   return {
     isrSet,
+    createRscOnErrorHandler,
     loadSsrHandler,
     renderErrorBoundaryResponse,
     renderLayoutSpecialError,
@@ -139,9 +153,7 @@ function createCommonOptions() {
       cleanPathname: "/posts/post",
       clearRequestContext() {},
       consumeDynamicUsage: vi.fn(() => false),
-      createRscOnErrorHandler() {
-        return () => null;
-      },
+      createRscOnErrorHandler,
       element: React.createElement("div", null, "page"),
       getDraftModeCookieHeader() {
         return null;
@@ -404,6 +416,10 @@ describe("form state rendering", () => {
     expect(response.headers.get("cache-control")).toBe("no-store, must-revalidate");
     expect(common.isrSet).not.toHaveBeenCalled();
     await expect(response.text()).resolves.toBe("<html>action state</html>");
+    expect(common.createRscOnErrorHandler).toHaveBeenCalledWith("/posts/post", "/posts/[slug]", {
+      renderSource: "react-server-components-payload",
+      routeType: "action",
+    });
   });
 });
 
@@ -801,6 +817,33 @@ describe("app page render lifecycle", () => {
 
     expect(common.renderErrorBoundaryResponse).not.toHaveBeenCalled();
     await expect(response.text()).resolves.toBe("<html>page</html>");
+  });
+
+  it("wires SSR errors to the server-rendering instrumentation context", async () => {
+    const common = createCommonOptions();
+    const ssrError = new Error("client component failed during SSR");
+    const reportSsrError = vi.fn(() => "ssr-digest");
+    common.createRscOnErrorHandler.mockImplementation((_pathname, _routePath, overrides) =>
+      overrides?.renderSource === "server-rendering" ? reportSsrError : () => null,
+    );
+
+    const response = await renderAppPageLifecycle({
+      ...common.options,
+      async loadSsrHandler() {
+        return {
+          async handleSsr(_rscStream, _navigationContext, _fontData, options) {
+            options?.onSsrError?.(ssrError);
+            return createStream(["<html>page</html>"]);
+          },
+        };
+      },
+    });
+
+    await expect(response.text()).resolves.toBe("<html>page</html>");
+    expect(reportSsrError).toHaveBeenCalledWith(ssrError, undefined, undefined);
+    expect(common.createRscOnErrorHandler).toHaveBeenCalledWith("/posts/post", "/posts/[slug]", {
+      renderSource: "server-rendering",
+    });
   });
 
   it("prefers the captured RSC error over an SSR decoder error when rendering the error boundary", async () => {
@@ -1262,6 +1305,75 @@ describe("app page render lifecycle", () => {
     expect(response.headers.get("cache-control")).toBe("s-maxage=1, stale-while-revalidate=2");
     await expect(response.text()).resolves.toBe("<html>page</html>");
     expect(common.isrSet).not.toHaveBeenCalled();
+  });
+
+  it("preserves prerender cacheLife metadata when the HTML footer finalizes before the outer read", async () => {
+    const common = createCommonOptions();
+    let requestCacheLife: { stale: number; revalidate: number; expire: number } | null = null;
+    let initialNavigationCacheMetadata: InitialNavigationCacheMetadata | undefined;
+
+    const response = await renderAppPageLifecycle({
+      ...common.options,
+      getRequestCacheLife() {
+        const value = requestCacheLife;
+        requestCacheLife = null;
+        return value;
+      },
+      isPrerender: true,
+      isProduction: false,
+      loadSsrHandler: async () => ({
+        async handleSsr(
+          rscStream: ReadableStream<Uint8Array>,
+          _navContext: unknown,
+          _fontData: unknown,
+          options?: {
+            sideStream?: ReadableStream<Uint8Array>;
+            capturedRscDataRef?: { value: Promise<ArrayBuffer> | null };
+            getInitialNavigationCacheMetadata?: () => InitialNavigationCacheMetadata;
+          },
+        ) {
+          const stream = options?.sideStream ?? rscStream;
+          const capturedRscData = new Response(stream).arrayBuffer();
+          if (options?.capturedRscDataRef) {
+            options.capturedRscDataRef.value = capturedRscData;
+          }
+
+          // The real RSC embed transform finalizes its navigation footer as
+          // soon as this capture drains. That can happen before handleSsr()
+          // returns and before renderAppPageLifecycle performs its consuming
+          // cacheLife read.
+          await capturedRscData;
+          initialNavigationCacheMetadata = options?.getInitialNavigationCacheMetadata?.();
+
+          return {
+            htmlStream: createStream(["<html>page</html>"]),
+            metadataReady: Promise.resolve(),
+            capturedRscData,
+          };
+        },
+      }),
+      peekRequestCacheLife() {
+        return requestCacheLife;
+      },
+      renderToReadableStream() {
+        let sent = false;
+        return new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (sent) {
+              controller.close();
+              return;
+            }
+            requestCacheLife = { stale: 30, revalidate: 1, expire: 60 };
+            controller.enqueue(new TextEncoder().encode("flight-data"));
+            sent = true;
+          },
+        });
+      },
+      revalidateSeconds: null,
+    });
+
+    expect(initialNavigationCacheMetadata).toEqual({ kind: "static", staleTimeSeconds: 30 });
+    await expect(response.text()).resolves.toBe("<html>page</html>");
   });
 
   it("preserves prerender cache metadata for the manifest writer after shaping headers", async () => {

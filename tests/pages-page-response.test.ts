@@ -6,6 +6,7 @@ import {
   generatePagesETag,
 } from "../packages/vinext/src/server/pages-page-response.js";
 import { resolvePagesPageData } from "../packages/vinext/src/server/pages-page-data.js";
+import { renderTracedPagesPageResponse } from "../packages/vinext/src/server/pages-page-handler.js";
 
 function getStartTags(html: string, tagName: string): string[] {
   const tags: string[] = [];
@@ -195,6 +196,27 @@ describe("isPagesStreamingBot", () => {
 });
 
 describe("pages page response", () => {
+  it("cancels a pending traced body when document shell construction fails", async () => {
+    const common = createCommonOptions();
+    let cancelled = false;
+    const bodyStream = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelled = true;
+      },
+    });
+
+    await expect(
+      renderTracedPagesPageResponse({
+        ...common.options,
+        renderDocumentToString: async () => {
+          throw new Error("document shell failed");
+        },
+        renderToReadableStream: async () => bodyStream,
+      }),
+    ).rejects.toThrow("document shell failed");
+    expect(cancelled).toBe(true);
+  });
+
   it("renders the document shell, merges gSSP headers, and marks streamed HTML responses", async () => {
     const common = createCommonOptions();
 
@@ -294,6 +316,23 @@ describe("pages page response", () => {
       }),
       { cacheControl: { revalidate: 60, expire: 300 } },
     );
+  });
+
+  it("reports the resolved Pages tag after an on-demand regeneration", async () => {
+    const common = createCommonOptions();
+
+    const response = await renderPagesPageResponse({
+      ...common.options,
+      DocumentComponent: null,
+      getSSRHeadHTML: undefined,
+      isOnDemandRevalidate: true,
+      isrCachePathname: "/posts/resolved",
+      isrRevalidateSeconds: 60,
+      routeUrl: "/posts/alias",
+    });
+
+    expect(response.headers.get("x-nextjs-cache")).toBe("REVALIDATED");
+    expect(response.headers.get("x-vinext-revalidated-cache-tag")).toBe("_N_T_/posts/resolved");
   });
 
   it("persists indefinite Pages results while formatting a static response policy", async () => {

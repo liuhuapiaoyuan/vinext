@@ -22,6 +22,12 @@ export type ResolvedKvDataAdapterConfig = {
   appPrefix?: string;
   ttlSeconds?: number;
 };
+export type ResolvedCdnAdapterConfig = {
+  versionMetadataBinding: string;
+};
+export declare function resolveCdnAdapterConfig(
+  cache: VinextCacheConfig | null | undefined,
+): ResolvedCdnAdapterConfig | null;
 export declare function resolveKvDataAdapterConfig(
   cache: VinextCacheConfig | null | undefined,
 ): ResolvedKvDataAdapterConfig | null;

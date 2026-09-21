@@ -1,5 +1,94 @@
 # vinext
 
+## 1.0.0-beta.10
+
+This release includes a new caching library for apps targeting Cloudflare Workers, called Workers Response Store. It is designed to fill the gaps that our other Cloudflare cache adapters struggled with; efficient cache warming, durable backing stores, stable ISR and revalidation, and better internal control of the cache.
+
+To find out more, check out our [caching docs](https://github.com/cloudflare/vinext/blob/main/docs/caching.mdx). Going forward, the Workers Response Store will be our recommended choice for caching due to the flexibility it provides, and over the coming weeks it shall be stabilised following community feedback.
+
+### Features
+
+#### Build
+
+- support independently deployed worker stages (#3155)
+- select adapter-owned worker stages (#3150)
+- define adapter-owned worker stages (#3142)
+
+#### Cache
+
+- stream response-store cache misses (#3200)
+- seed RSC during response-store warmup (#3196)
+- add Workers Response Store POC (#3192)
+
+#### Misc
+
+- **Cloudflare:** scaffold Response Store Wrangler config (#3249)
+
+### Bug Fixes
+
+#### Cloudflare
+
+- declare response store durable object export (#3262)
+- restore bounded probe scheduling (#3171)
+- reduce staged CDN probe work (#3168)
+
+#### Misc
+
+- **CSS:** preserve url assets with deployment IDs (#3263)
+- **Init:** simplify dependent cache prompts (#3255)
+- **Isr:** ignore interception context on HTML renders (#2915)
+- **App Router:** dedupe next/dynamic module preloads (#3186)
+- **Cache:** preserve staged cache invalidation parity (#3158)
+- **Build:** preserve staged prerender routing (#3151)
+- **Cache:** resolve CDN admission from matched route kind (#3160)
+
+### Contributors
+
+- @james-elicx
+- @JamesbbBriz
+- @keeltrace
+
+## 1.0.0-beta.9
+
+### Features
+
+#### Cache
+
+- classify and warm static Route Handlers (#3113)
+- probe Pages Router cacheability (#3098)
+- deploy probed manifests in two stages (#3093)
+- probe App Page cacheability on staged Workers (#3091)
+
+#### Misc
+
+- **Cloudflare:** prewarm canonical ISR RSC requests (#3002)
+
+### Bug Fixes
+
+#### Cloudflare
+
+- finalize CDN version metadata output (#3137)
+- harden post-deploy readiness checks (#3136)
+- classify CDN cacheability per concrete route (#3115)
+- discover prewarm paths from staged worker (#3090)
+- verify Worker version IDs during CDN warmup (#3072)
+- complete warmup response and promotion contracts (#3046)
+- harden canonical RSC warmup end to end (#3040)
+
+#### Misc
+
+- **Cache:** preserve Cache Components ownership during probing (#3103)
+- **Cache:** gate CDN admission on probed routes (#3092)
+- **App Router:** support soft navigation in static exports (#3112)
+- **Build:** support trailing-slash static exports (#3081)
+- **App Router:** validate interception context identity (#3078)
+- **App:** authenticate static file signals (#3077)
+- **Build:** validate CDN warm discovery and deploy inputs (#3057)
+
+### Contributors
+
+- @james-elicx
+
 ## 1.0.0-beta.8
 
 ### Features

@@ -3,7 +3,9 @@ import type { RequestContext } from "../config/request-context.js";
 import { isStaticFileSignal } from "./static-file-signal.js";
 import {
   applyCdnResponseHeaders,
+  captureCdnResponsePolicyHeaders,
   hasExplicitNonCacheableResponsePolicy,
+  isCdnResponsePolicyHeader,
   isNonCacheableCacheControl,
   NO_STORE_CACHE_CONTROL,
 } from "./cache-control.js";
@@ -13,6 +15,7 @@ import { hasBasePath, stripBasePath } from "../utils/base-path.js";
 import { normalizeDefaultLocalePathname } from "./pages-i18n.js";
 import { sanitizeMethodNotAllowedHeaders } from "./http-error-responses.js";
 import { hasPostConfigLinkHeaders } from "./app-response-header-provenance.js";
+import { captureRouteCacheabilityResponsePolicy } from "vinext/shims/cacheability-classification";
 
 type FinalizeAppRscResponseOptions = {
   basePath: string;
@@ -31,8 +34,12 @@ type FinalizeAppRscResponseOptions = {
    * before middleware runs.
    */
   requestContext: RequestContext;
+  /** Existing response headers that matching next.config rules may replace. */
+  overwriteExisting?: ReadonlySet<string> | ((name: string) => boolean);
   /** Response headers emitted by middleware after config matching. */
   middlewareHeaders?: Headers | null;
+  /** Whether config matching should update the active cacheability classification. */
+  recordCacheability?: boolean;
 };
 
 const HAS_CONFIG_HEADERS = process.env.__VINEXT_HAS_CONFIG_HEADERS !== "false";
@@ -79,6 +86,12 @@ export async function applyAppRscConfigHeaders(
     basePathState: { basePath: options.basePath, hadBasePath },
     appendToPostConfigLink: hasPostConfigLinkHeaders(headers),
     middlewareHeaders: options.middlewareHeaders,
+    recordCacheability: options.recordCacheability,
+    // Next.js next.config headers override its renderer-owned Cache-Control,
+    // including for force-dynamic App Pages. Other response headers retain
+    // the existing merge precedence.
+    // test/e2e/app-dir/custom-cache-control/custom-cache-control.test.ts
+    overwriteExisting: options.overwriteExisting ?? isCdnResponsePolicyHeader,
   });
 }
 
@@ -123,6 +136,11 @@ export async function finalizeAppRscResponse(
   // already applied. Redirects are already skipped above.
   if (!response.headers.has("Cache-Control")) {
     applyCdnResponseHeaders(response.headers, { cacheControl: "" });
+    // This is the adapter's fail-closed provisional policy, not an
+    // application opt-out. Admission may replace it only after the body has
+    // completed and the render has proved reusable. Capture before config
+    // headers run so any later private/no-store override still vetoes.
+    captureRouteCacheabilityResponsePolicy(captureCdnResponsePolicyHeaders(response.headers));
   }
 
   if (configHeadersAlreadyApplied.has(response)) {

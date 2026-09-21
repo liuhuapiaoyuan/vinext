@@ -29,6 +29,7 @@ import type { ISRCacheEntry } from "./isr-cache.js";
 import {
   getAppRouteHandlerRevalidateSeconds,
   hasAppRouteHandlerDefaultExport,
+  hasNonStaticAppRouteHandlerMethods,
   resolveAppRouteHandlerMethod,
   shouldReadAppRouteHandlerCache,
   type AppRouteHandlerModule,
@@ -44,6 +45,10 @@ import {
 } from "./app-route-handler-execution.js";
 import { isKnownDynamicAppRoute, isValidHTTPMethod } from "./app-route-handler-runtime.js";
 import {
+  beginRouteCacheability,
+  getRouteCacheabilityDynamicReason,
+} from "vinext/shims/cacheability-classification";
+import {
   applyRouteHandlerMiddlewareContext,
   finalizeRouteHandlerResponse,
   type RouteHandlerMiddlewareContext,
@@ -53,6 +58,12 @@ import { createStaticGenerationHeadersContext } from "./app-static-generation.js
 import { buildPageCacheTags } from "./implicit-tags.js";
 import { makeThenableParams } from "vinext/shims/thenable-params";
 import { reportRequestError } from "./instrumentation.js";
+import { applyCdnResponseBuildIdentityHeaders } from "./cache-control.js";
+import {
+  isOnDemandRevalidateRequest,
+  PRERENDER_REVALIDATE_HEADER,
+} from "./revalidation-request.js";
+import { traceResponseStart } from "./response-start-tracing.js";
 
 type AppRouteHandlerDispatchRoute = {
   pattern: string;
@@ -166,10 +177,25 @@ async function runInRouteHandlerRevalidationContext(
 export async function dispatchAppRouteHandler(
   options: DispatchAppRouteHandlerOptions,
 ): Promise<Response> {
+  return traceResponseStart(await dispatchAppRouteHandlerImpl(options));
+}
+
+async function dispatchAppRouteHandlerImpl(
+  options: DispatchAppRouteHandlerOptions,
+): Promise<Response> {
   const { route } = options;
   const handler = route.routeHandler;
   const method = options.request.method.toUpperCase();
-  const revalidateSeconds = getAppRouteHandlerRevalidateSeconds(handler);
+  if (method === "GET" || method === "HEAD") {
+    beginRouteCacheability("app-route", route.pattern);
+  }
+  const configuredRevalidateSeconds = getAppRouteHandlerRevalidateSeconds(handler);
+  // Next.js bails out of static generation when any mutating method is
+  // exported. Keep segment revalidation available to inner fetches, but do
+  // not read/write ISR or generate a public route-response policy.
+  const revalidateSeconds = hasNonStaticAppRouteHandlerMethods(handler)
+    ? null
+    : configuredRevalidateSeconds;
   const isDevelopment = options.isDevelopment ?? process.env.NODE_ENV === "development";
   const isProduction = options.isProduction ?? process.env.NODE_ENV === "production";
   const appendResponseLink = handler.runtime === "edge" || handler.runtime === "experimental-edge";
@@ -189,11 +215,13 @@ export async function dispatchAppRouteHandler(
       isHead,
     });
     options.clearRequestContext();
-    return applyDraftModeCachePolicy(
-      applyRouteHandlerMiddlewareContext(finalized, options.middlewareContext, {
-        appendResponseLink,
-      }),
-      isDraftMode || hasDraftModeTransition,
+    return applyCdnResponseBuildIdentityHeaders(
+      applyDraftModeCachePolicy(
+        applyRouteHandlerMiddlewareContext(finalized, options.middlewareContext, {
+          appendResponseLink,
+        }),
+        isDraftMode || hasDraftModeTransition,
+      ),
     );
   };
 
@@ -225,6 +253,26 @@ export async function dispatchAppRouteHandler(
   }
 
   const resolvedHandlerFn = isAppRouteHandlerFunction(handlerFn) ? handlerFn : undefined;
+  const shouldReadRouteCache =
+    revalidateSeconds !== null &&
+    !getRouteCacheabilityDynamicReason() &&
+    shouldReadAppRouteHandlerCache({
+      dynamicConfig: handler.dynamic,
+      handlerFn: resolvedHandlerFn,
+      isAutoHead,
+      isKnownDynamic: isKnownDynamicAppRoute(route.pattern),
+      isDraftMode: isDraftMode || hasDraftModeTransition,
+      isProduction,
+      method,
+      revalidateSeconds,
+    });
+  const revalidateReason = isOnDemandRevalidateRequest(
+    options.request.headers.get(PRERENDER_REVALIDATE_HEADER),
+  )
+    ? "on-demand"
+    : shouldReadRouteCache
+      ? "stale"
+      : undefined;
 
   // Route handler fetches observe the handler's segment config the same way
   // page fetches do: upstream's app-route module copies `userland.fetchCache`
@@ -235,23 +283,10 @@ export async function dispatchAppRouteHandler(
   // where handlers ignored their `fetchCache`/`force-dynamic` segment config.
   const fetchCacheMode = resolveAppRouteHandlerFetchCacheMode(handler);
   setCurrentFetchCacheMode(fetchCacheMode);
-  setCurrentFetchRevalidate(revalidateSeconds);
+  setCurrentFetchRevalidate(configuredRevalidateSeconds);
   setCurrentForceDynamicFetchDefault(handler.dynamic === "force-dynamic");
 
-  if (
-    revalidateSeconds !== null &&
-    shouldReadAppRouteHandlerCache({
-      dynamicConfig: handler.dynamic,
-      handlerFn: resolvedHandlerFn,
-      isAutoHead,
-      isKnownDynamic: isKnownDynamicAppRoute(route.pattern),
-      isDraftMode: isDraftMode || hasDraftModeTransition,
-      isProduction,
-      method,
-      revalidateSeconds,
-    }) &&
-    resolvedHandlerFn
-  ) {
+  if (shouldReadRouteCache && resolvedHandlerFn) {
     const cachedRouteResponse = await readAppRouteHandlerCacheResponse({
       basePath: options.basePath,
       buildPageCacheTags(pathname, extraTags) {
@@ -304,12 +339,12 @@ export async function dispatchAppRouteHandler(
       setNavigationContext,
     });
     if (cachedRouteResponse) {
-      return cachedRouteResponse;
+      return applyCdnResponseBuildIdentityHeaders(cachedRouteResponse);
     }
   }
 
   if (resolvedHandlerFn) {
-    return executeAppRouteHandler({
+    const response = await executeAppRouteHandler({
       basePath: options.basePath,
       buildPageCacheTags(pathname, extraTags) {
         return buildRouteHandlerPageCacheTags(pathname, extraTags, route.routeSegments);
@@ -340,14 +375,16 @@ export async function dispatchAppRouteHandler(
       middlewareRequestHeaders: options.middlewareRequestHeaders,
       params: options.params === null ? null : makeThenableParams(options.params),
       reportRequestError(error, request, context) {
-        void reportRequestError(error, request, context);
+        return reportRequestError(error, request, context);
       },
       request: options.request,
       expireSeconds: options.expireSeconds,
       revalidateSeconds,
+      revalidateReason,
       routePattern: route.pattern,
       setHeadersAccessPhase,
     });
+    return applyCdnResponseBuildIdentityHeaders(response);
   }
 
   return finalizeFrameworkResponse(new Response(null, { status: 405 }));

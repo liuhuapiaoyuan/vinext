@@ -8,6 +8,7 @@ import {
   parseWorkersDevUrl,
   parseWranglerDeploymentStatusOutput,
   parseWranglerVersionUploadOutput,
+  runWranglerDeploymentStatus,
   runWranglerVersionDeploy,
   runWranglerVersionUpload,
 } from "../packages/cloudflare/src/version-deploy.js";
@@ -131,7 +132,39 @@ describe("Cloudflare Wrangler version deployment helpers", () => {
     expect(log).toHaveBeenCalledWith("\n  Promoting uploaded Worker version to env: staging...");
   });
 
-  it("asks for an initial deploy without CDN pre-warm when the Worker does not exist yet", () => {
+  it("hides raw Wrangler upload output by default and shows it in verbose mode", () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const output = JSON.stringify({
+      version: { id: "095f00a7-23a7-43b7-a227-e4c97cab5f22" },
+    });
+    const execute = vi.fn(() => output);
+
+    runWranglerVersionUpload("/tmp/app", {}, execute as never);
+    expect(log).not.toHaveBeenCalledWith(`  ${output}`);
+    expect(log).toHaveBeenCalledWith("  Worker version ID: 095f00a7-23a7-43b7-a227-e4c97cab5f22");
+
+    log.mockClear();
+    runWranglerVersionUpload("/tmp/app", { verbose: true }, execute as never);
+    expect(log).toHaveBeenCalledWith(`  ${output}`);
+  });
+
+  it("keeps deployment-status internals quiet unless verbose output is requested", () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const output = JSON.stringify({
+      id: "deployment-1",
+      versions: [{ version_id: "11111111-1111-4111-8111-111111111111", percentage: 100 }],
+    });
+    const execute = vi.fn(() => output);
+
+    runWranglerDeploymentStatus("/tmp/app", {}, execute as never);
+    expect(log).not.toHaveBeenCalled();
+
+    runWranglerDeploymentStatus("/tmp/app", { verbose: true }, execute as never);
+    expect(log).toHaveBeenCalledWith("\n  Reading current Worker deployment...");
+    expect(log).toHaveBeenCalledWith(`  ${output}`);
+  });
+
+  it("asks for an initial normal deploy when the Worker does not exist yet", () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     const execute = vi.fn(() => {
       throw Object.assign(new Error("Command failed"), {
@@ -141,7 +174,7 @@ describe("Cloudflare Wrangler version deployment helpers", () => {
     });
 
     expect(() => runWranglerVersionUpload("/tmp/app", {}, execute as never)).toThrow(
-      "Run `vinext-cloudflare deploy` once without `--experimental-warm-cdn-cache` to create the Worker",
+      "Run `vinext-cloudflare deploy` once normally to create the Worker",
     );
   });
 
@@ -258,9 +291,13 @@ describe("Cloudflare Wrangler version deployment helpers", () => {
     expect(
       parseWranglerDeploymentStatusOutput(
         JSON.stringify({
+          id: "deployment-1",
           versions: [{ version_id: "11111111-1111-4111-8111-111111111111", percentage: 100 }],
         }),
-      ).versions,
-    ).toEqual([{ versionId: "11111111-1111-4111-8111-111111111111", percentage: 100 }]);
+      ),
+    ).toMatchObject({
+      deploymentId: "deployment-1",
+      versions: [{ versionId: "11111111-1111-4111-8111-111111111111", percentage: 100 }],
+    });
   });
 });

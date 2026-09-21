@@ -254,13 +254,11 @@ describe("Link repeated-slash warning", () => {
 
 describe("useLinkStatus", () => {
   it("returns { pending: false } by default", () => {
-    let status: { pending: boolean } | undefined;
     function TestComponent() {
-      status = useLinkStatus();
+      expect(useLinkStatus()).toEqual({ pending: false });
       return null;
     }
     ReactDOMServer.renderToString(React.createElement(TestComponent));
-    expect(status).toEqual({ pending: false });
   });
 });
 
@@ -447,6 +445,39 @@ describe("Link App Router prefetch mode", () => {
         prefetchShellFirst: false,
         shouldPrefetch: true,
       });
+    } finally {
+      if (originalWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = originalWindow;
+      }
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("uses reusable full-route prefetches for static exports", () => {
+    const originalWindow = globalThis.window;
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("__NEXT_CONFIG_OUTPUT", "export");
+    (globalThis as any).window = {
+      location: {
+        href: "http://localhost/blog",
+        origin: "http://localhost",
+      },
+      __VINEXT_LINK_PREFETCH_ROUTES__: [
+        { canPrefetchLoadingShell: true, patternParts: ["blog", ":slug"], isDynamic: true },
+      ],
+    };
+
+    try {
+      expect(resolveAutoAppRoutePrefetch("/blog/hello-world?from=export")).toEqual({
+        cacheForNavigation: true,
+        dynamicStaleTime: "full-prefetch",
+        fallbackTtl: "static",
+        prefetchShellFirst: true,
+        shouldPrefetch: true,
+      });
+      expect(resolveAutoAppRoutePrefetch("/missing").shouldPrefetch).toBe(false);
     } finally {
       if (originalWindow === undefined) {
         delete (globalThis as any).window;

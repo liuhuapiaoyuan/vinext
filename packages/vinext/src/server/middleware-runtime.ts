@@ -17,6 +17,7 @@ import {
 } from "./headers.js";
 import {
   matchesMiddleware,
+  matchesMiddlewarePathname,
   type MatcherConfig,
   type MiddlewareLocaleMatchContext,
 } from "./middleware-matcher.js";
@@ -35,11 +36,16 @@ import {
   stripBasePath,
 } from "../utils/base-path.js";
 import { normalizeDefaultLocalePathname } from "./pages-i18n.js";
+import { reportRequestError } from "./instrumentation.js";
+import { isValidNavigationSignalError } from "../utils/navigation-signal.js";
+import { frameworkTracer } from "./tracer.js";
 
 export type MiddlewareModule = Record<string, unknown>;
 
 export type MiddlewareResult = {
   continue: boolean;
+  /** True when this pathname can match middleware for some request context. */
+  pathnameEligible?: boolean;
   redirectUrl?: string;
   redirectStatus?: number;
   rewriteUrl?: string;
@@ -86,6 +92,10 @@ type ExecuteMiddlewareOptions = {
   isProxy: boolean;
   module: MiddlewareModule;
   normalizedPathname?: string;
+  /** Called only after the configured matcher accepts this request. */
+  onMatch?: () => void;
+  /** Called when the pathname matches, before request `has`/`missing` checks. */
+  onPathMatch?: () => void;
   /**
    * The caller already created an isolated body branch for middleware. This
    * lets App Router normalize that branch's URL and headers without adding a
@@ -102,6 +112,24 @@ type ExecuteMiddlewareOptions = {
    */
   trailingSlash?: boolean;
 };
+
+function reportProxyError(options: ExecuteMiddlewareOptions, error: unknown): Promise<void> {
+  const url = new URL(options.request.url);
+  return reportRequestError(
+    error,
+    {
+      path: url.pathname + url.search,
+      method: options.request.method,
+      headers: Object.fromEntries(options.request.headers.entries()),
+    },
+    {
+      routerKind: "Pages Router",
+      routePath: "/proxy",
+      routeType: "proxy",
+      revalidateReason: undefined,
+    },
+  );
+}
 
 type RunGeneratedMiddlewareOptions = ExecuteMiddlewareOptions & {
   ctx?: ExecutionContextLike;
@@ -439,6 +467,18 @@ export async function executeMiddleware(
             };
     }
   }
+  const encodedPathMatches =
+    encodedMatchPathname !== null &&
+    matchesMiddlewarePathname(encodedMatchPathname, matcher, options.i18nConfig, localeContext);
+  const decodedPathMatches =
+    !encodedPathMatches &&
+    decodedMatchPathname !== null &&
+    decodedMatchPathname !== encodedMatchPathname &&
+    matchesMiddlewarePathname(decodedMatchPathname, matcher, options.i18nConfig, localeContext);
+  if (encodedPathMatches || decodedPathMatches) {
+    options.onPathMatch?.();
+  }
+
   const encodedMatches =
     encodedMatchPathname !== null &&
     matchesMiddleware(
@@ -464,6 +504,8 @@ export async function executeMiddleware(
     return { continue: true };
   }
 
+  options.onMatch?.();
+
   const nextRequest = createNextRequest(
     options.request,
     options.i18nConfig,
@@ -482,9 +524,31 @@ export async function executeMiddleware(
 
   let response: Response | undefined | void;
   try {
-    response = await middlewareFn(nextRequest, fetchEvent);
+    response = await frameworkTracer.runWithDetachedContext(() =>
+      frameworkTracer.withPropagatedContext(options.request.headers, () =>
+        frameworkTracer.trace(
+          {
+            attributes: {
+              "http.method": options.request.method,
+              "http.target": nextRequest.nextUrl.pathname,
+            },
+            name: `middleware ${options.request.method}`,
+            type: "Middleware.execute",
+          },
+          () => middlewareFn(nextRequest, fetchEvent),
+        ),
+      ),
+    );
   } catch (e) {
+    const isDevelopmentNavigationSignal =
+      process.env.NODE_ENV !== "production" && isValidNavigationSignalError(e);
+    if (isDevelopmentNavigationSignal && e instanceof Error) {
+      e.message = `Next.js navigation API is not allowed to be used in ${options.isProxy ? "Proxy" : "Middleware"}.`;
+    }
     console.error("[vinext] Middleware error:", e);
+    if (!isDevelopmentNavigationSignal) {
+      await reportProxyError(options, e);
+    }
     const waitUntilPromises = drainFetchEvent(fetchEvent);
     releaseMiddlewareRequestBody(nextRequest, waitUntilPromises);
     const message = options.includeErrorDetails
@@ -654,6 +718,17 @@ export async function executeMiddleware(
 export async function runGeneratedMiddleware(
   options: RunGeneratedMiddlewareOptions,
 ): Promise<MiddlewareResult> {
-  const run = () => executeMiddleware(options);
+  let pathnameEligible = false;
+  const run = async () => {
+    const result = await executeMiddleware({
+      ...options,
+      onPathMatch() {
+        pathnameEligible = true;
+        options.onPathMatch?.();
+      },
+    });
+    if (pathnameEligible) result.pathnameEligible = true;
+    return result;
+  };
   return options.ctx ? runWithExecutionContext(options.ctx, run) : run();
 }

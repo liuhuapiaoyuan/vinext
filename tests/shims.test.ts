@@ -1435,18 +1435,15 @@ describe("next/navigation shim", () => {
     expect(consumerCtx).toBeTruthy();
 
     const register = () => {};
-    let received: unknown = undefined;
 
     function Probe() {
-      received = React.useContext(consumerCtx!);
+      expect(React.useContext(consumerCtx!)).toBe(register);
       return null;
     }
 
     renderToStaticMarkup(
       React.createElement(providerCtx!.Provider, { value: register }, React.createElement(Probe)),
     );
-
-    expect(received).toBe(register);
   });
 
   it("useSelectedLayoutSegments returns empty array outside React context", async () => {
@@ -1776,14 +1773,13 @@ describe("next/navigation shim", () => {
     const React = await import("react");
     const { renderToStaticMarkup } = await import("react-dom/server");
 
-    let captured: string | null = "";
     function Probe() {
-      captured = useUntrackedPathname();
-      return React.createElement("span", null, captured ?? "null");
+      const pathname = useUntrackedPathname();
+      expect(pathname).toBe("/");
+      return React.createElement("span", null, pathname ?? "null");
     }
 
     renderToStaticMarkup(React.createElement(Probe));
-    expect(captured).toBe("/");
   });
 
   it("useUntrackedPathname returns pathname from server context", async () => {
@@ -1799,15 +1795,14 @@ describe("next/navigation shim", () => {
       params: {},
     });
 
-    let captured: string | null = "";
     function Probe() {
-      captured = useUntrackedPathname();
-      return React.createElement("span", null, captured ?? "null");
+      const pathname = useUntrackedPathname();
+      expect(pathname).toBe("/untracked/test");
+      return React.createElement("span", null, pathname ?? "null");
     }
 
     try {
       renderToStaticMarkup(React.createElement(Probe));
-      expect(captured).toBe("/untracked/test");
     } finally {
       setNavigationContext(null);
     }
@@ -1852,16 +1847,15 @@ describe("next/navigation shim", () => {
         {},
       );
 
-      let pathname: string | null = "";
       function Probe() {
-        pathname = useUntrackedPathname();
+        const pathname = useUntrackedPathname();
+        expect(pathname).toBe("/pending-untracked");
         return React.createElement("span", null, pathname ?? "null");
       }
 
       renderToStaticMarkup(
         React.createElement(Context.Provider, { value: snapshot }, React.createElement(Probe)),
       );
-      expect(pathname).toBe("/pending-untracked");
     } finally {
       vi.resetModules();
       if (previousWindow === undefined) {
@@ -1913,17 +1907,15 @@ describe("next/navigation shim", () => {
         {},
       );
 
-      let pathname: string | null = "";
       function Probe() {
-        pathname = useUntrackedPathname();
+        const pathname = useUntrackedPathname();
+        expect(pathname).toBe("/committed");
         return React.createElement("span", null, pathname ?? "null");
       }
 
       renderToStaticMarkup(
         React.createElement(Context.Provider, { value: snapshot }, React.createElement(Probe)),
       );
-      // Must return the committed pathname, not the stale provider snapshot.
-      expect(pathname).toBe("/committed");
     } finally {
       vi.resetModules();
       if (previousWindow === undefined) {
@@ -1972,16 +1964,15 @@ describe("next/navigation shim", () => {
       );
       navigation.commitClientNavigationState(7, { releaseSnapshot: false });
 
-      let pathname: string | null = "";
       function Probe() {
-        pathname = useUntrackedPathname();
+        const pathname = useUntrackedPathname();
+        expect(pathname).toBe("/in-flight");
         return React.createElement("span", null, pathname ?? "null");
       }
 
       renderToStaticMarkup(
         React.createElement(Context.Provider, { value: snapshot }, React.createElement(Probe)),
       );
-      expect(pathname).toBe("/in-flight");
 
       navigation.commitClientNavigationState(undefined, { releaseSnapshot: true });
     } finally {
@@ -2011,14 +2002,13 @@ describe("next/navigation shim", () => {
         hookPath
       )) as typeof import("../packages/vinext/src/shims/internal/navigation-untracked.js");
 
-      let captured: string | null = "";
       function Probe() {
-        captured = useUntrackedPathname();
-        return React.createElement("span", null, captured ?? "null");
+        const pathname = useUntrackedPathname();
+        expect(pathname).toBe("/pages/untracked");
+        return React.createElement("span", null, pathname ?? "null");
       }
 
       renderToStaticMarkup(React.createElement(Probe));
-      expect(captured).toBe("/pages/untracked");
     } finally {
       if (previousAccessor === undefined) {
         delete globalRecord[accessorKey];
@@ -3422,10 +3412,9 @@ describe("next/router withRouter HOC", () => {
       await import("../packages/vinext/src/shims/internal/router-context.js");
 
     const providedRouter = createTestRouter({ pathname: "/from-context" });
-    let captured: NextRouter | null = null;
 
     function Probe() {
-      captured = useRouter();
+      expect(useRouter()).toBe(providedRouter);
       return React.createElement("span", null, "ok");
     }
 
@@ -3436,8 +3425,6 @@ describe("next/router withRouter HOC", () => {
         React.createElement(Probe),
       ),
     );
-
-    expect(captured).toBe(providedRouter);
   });
 
   it("next/router useRouter throws when the Pages Router context is not mounted", async () => {
@@ -6594,7 +6581,7 @@ describe("next/cache shim", () => {
             data: {
               headers: {},
               body: JSON.stringify({ v: "stale-value" }),
-              url: "unstable_cache:stale-swr-test:[]",
+              url: "unstable_cache:v2:stale-swr-test:[]",
             },
             tags: ["stale-swr"],
             revalidate: 1,
@@ -6669,7 +6656,7 @@ describe("next/cache shim", () => {
             data: {
               headers: {},
               body: JSON.stringify({ v: "stale-value" }),
-              url: "unstable_cache:foreground-test:[]",
+              url: "unstable_cache:v2:foreground-test:[]",
             },
             tags: ["foreground"],
             revalidate: 1,
@@ -6749,6 +6736,34 @@ describe("next/cache shim", () => {
 // ---------------------------------------------------------------------------
 
 describe('"use cache" runtime', () => {
+  it("runs cache misses in the matching work-unit scope", async () => {
+    const { registerCachedFunction, clearPrivateCache } =
+      await import("../packages/vinext/src/shims/cache-runtime.js");
+    const { setCacheHandler, MemoryCacheHandler } =
+      await import("../packages/vinext/src/shims/cache.js");
+    const { workUnitAsyncStorage } =
+      await import("../packages/vinext/src/shims/internal/work-unit-async-storage.js");
+    setCacheHandler(new MemoryCacheHandler());
+    clearPrivateCache();
+
+    const shared = registerCachedFunction(
+      async () => workUnitAsyncStorage.getStore()?.type,
+      "test:otel-work-unit-shared",
+    );
+    const privateCached = registerCachedFunction(
+      async () => workUnitAsyncStorage.getStore()?.type,
+      "test:otel-work-unit-private",
+      "private",
+    );
+
+    await expect(workUnitAsyncStorage.run({ type: "request" }, () => shared())).resolves.toBe(
+      "cache",
+    );
+    await expect(
+      workUnitAsyncStorage.run({ type: "request" }, () => privateCached()),
+    ).resolves.toBe("private-cache");
+  });
+
   it("registerCachedFunction caches return values", async () => {
     const { registerCachedFunction } =
       await import("../packages/vinext/src/shims/cache-runtime.js");
@@ -7268,36 +7283,122 @@ describe('"use cache" runtime', () => {
     expect(r3).toEqual({ count: 2 });
   });
 
-  it("private variant marks prerender output dynamic", async () => {
+  it("private variant suspends prerendering before user code", async () => {
     const { registerCachedFunction } =
       await import("../packages/vinext/src/shims/cache-runtime.js");
     const { consumeDynamicUsage } = await import("../packages/vinext/src/shims/headers.js");
     const { createRequestContext, runWithRequestContext } =
       await import("../packages/vinext/src/shims/unified-request-context.js");
+    const { workUnitAsyncStorage } =
+      await import("../packages/vinext/src/shims/internal/work-unit-async-storage.js");
 
     // Ported from Next.js: "use cache: private" is dynamic in prerendering contexts.
     // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/use-cache/use-cache-wrapper.ts
-    const previousPrerender = process.env.VINEXT_PRERENDER;
-    process.env.VINEXT_PRERENDER = "1";
+    let executions = 0;
+    const cached = registerCachedFunction(
+      async () => {
+        executions++;
+        return "private";
+      },
+      "test:private-prerender",
+      "private",
+    );
+    const controller = new AbortController();
+    let bailoutExpression: string | undefined;
 
-    try {
-      await runWithRequestContext(createRequestContext(), async () => {
-        const cached = registerCachedFunction(
-          async () => "private",
-          "test:private-prerender",
-          "private",
-        );
-        await cached();
+    await runWithRequestContext(createRequestContext(), async () => {
+      const pending = workUnitAsyncStorage.run(
+        {
+          type: "prerender",
+          renderSignal: controller.signal,
+          route: "/private",
+          signalPrerenderBailout(expression) {
+            bailoutExpression = expression;
+          },
+        },
+        () => cached(),
+      );
+      let settled = false;
+      void pending.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
+      await Promise.resolve();
 
-        expect(consumeDynamicUsage()).toBe(true);
-      });
-    } finally {
-      if (previousPrerender === undefined) {
-        delete process.env.VINEXT_PRERENDER;
-      } else {
-        process.env.VINEXT_PRERENDER = previousPrerender;
-      }
-    }
+      expect(settled).toBe(false);
+      expect(executions).toBe(0);
+      expect(consumeDynamicUsage()).toBe(true);
+      expect(bailoutExpression).toBe('"use cache: private"');
+    });
+  });
+
+  it("bails out of private cache probes before asynchronous setup or user code", async () => {
+    const { registerCachedFunction } =
+      await import("../packages/vinext/src/shims/cache-runtime.js");
+    const { CACHEABILITY_REQUEST_STATE } =
+      await import("../packages/vinext/src/shims/cacheability-classification.js");
+    const { runWithExecutionContext } =
+      await import("../packages/vinext/src/shims/request-context.js");
+    const { workUnitAsyncStorage } =
+      await import("../packages/vinext/src/shims/internal/work-unit-async-storage.js");
+
+    let executions = 0;
+    const cached = registerCachedFunction(
+      async () => {
+        executions++;
+        return "private";
+      },
+      "test:private-probe",
+      "private",
+    );
+    const state = {
+      captureDeadlineAt: Date.now() + 1_000,
+      mode: "probe" as const,
+      route: { kind: "app-page" as const, pattern: "/private" },
+    };
+
+    const controller = new AbortController();
+    let bailoutExpression: string | undefined;
+    const pending = runWithExecutionContext(
+      {
+        [CACHEABILITY_REQUEST_STATE]: state,
+        waitUntil() {},
+      },
+      () =>
+        workUnitAsyncStorage.run(
+          {
+            type: "prerender",
+            renderSignal: controller.signal,
+            route: "/private",
+            signalPrerenderBailout(expression) {
+              bailoutExpression = expression;
+            },
+          },
+          () => cached(),
+        ),
+    );
+    let settled = false;
+    void pending.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    await Promise.resolve();
+
+    expect(settled).toBe(false);
+    expect(executions).toBe(0);
+    expect(state).toMatchObject({
+      outcome: { cacheable: false, dynamicUsage: true },
+      probeBailout: { kind: "private-cache" },
+    });
+    expect(bailoutExpression).toBe('"use cache: private"');
   });
 
   it('rejects "use cache: private" nested inside public "use cache"', async () => {
@@ -7477,6 +7578,32 @@ describe('"use cache" runtime', () => {
     expect(calls).toBe(1);
   });
 
+  it("excludes framework arguments from revalidation invocations", async () => {
+    const { registerCachedFunction } =
+      await import("../packages/vinext/src/shims/cache-runtime.js");
+    const { setCacheHandler, MemoryCacheHandler } =
+      await import("../packages/vinext/src/shims/cache.js");
+    const handler = new MemoryCacheHandler();
+    const set = vi.spyOn(handler, "set");
+    const encodeInvocationArgs = vi.fn(async (args: unknown[]) => JSON.stringify(args));
+    setCacheHandler(handler);
+
+    const cached = registerCachedFunction(async () => "value", "test:revalidation-arity", "", {
+      argumentCount: 0,
+      encodeInvocationArgs,
+      serverReferenceId: "test#cached",
+    });
+    await (cached as (...args: unknown[]) => Promise<string>)("framework argument");
+
+    expect(encodeInvocationArgs).toHaveBeenCalledWith([]);
+    expect(set.mock.calls[0]?.[2]).toMatchObject({
+      cacheFunctionInvocation: {
+        encryptedArgs: "[]",
+        referenceId: "test#cached",
+      },
+    });
+  });
+
   it("preserves rest arguments when declared arity is unknown", async () => {
     const { registerCachedFunction } =
       await import("../packages/vinext/src/shims/cache-runtime.js");
@@ -7522,20 +7649,25 @@ describe('"use cache" runtime', () => {
       await import("../packages/vinext/src/shims/cache-runtime.js");
     const { setCacheHandler, MemoryCacheHandler } =
       await import("../packages/vinext/src/shims/cache.js");
+    const { workUnitAsyncStorage } =
+      await import("../packages/vinext/src/shims/internal/work-unit-async-storage.js");
     setCacheHandler(new MemoryCacheHandler());
 
     let callCount = 0;
+    const workUnitTypes: Array<string | undefined> = [];
     const fn = async (_cb: () => void) => {
       callCount++;
+      workUnitTypes.push(workUnitAsyncStorage.getStore()?.type);
       return { called: true };
     };
 
     const cached = registerCachedFunction(fn, "test:fn-arg");
 
     // Functions can't be serialized — should execute every time (no caching)
-    await cached(() => {});
-    await cached(() => {});
+    await workUnitAsyncStorage.run({ type: "request" }, () => cached(() => {}));
+    await workUnitAsyncStorage.run({ type: "request" }, () => cached(() => {}));
     expect(callCount).toBe(2);
+    expect(workUnitTypes).toEqual(["cache", "cache"]);
   });
 
   it("produces different cache entries for Promise-augmented params with different values", async () => {
@@ -11200,6 +11332,26 @@ describe("cookie name validation", () => {
 // NextRequest API tests
 
 describe("NextRequest API", () => {
+  it("preserves a lazy request.cf accessor without reading it", async () => {
+    const { NextRequest } = await import("../packages/vinext/src/shims/server.js");
+    const source = new Request("https://example.com/");
+    let reads = 0;
+    Object.defineProperty(source, "cf", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        reads += 1;
+        return { country: "AU" };
+      },
+    });
+
+    const request = new NextRequest(source);
+
+    expect(reads).toBe(0);
+    expect(Reflect.get(request, "cf")).toEqual({ country: "AU" });
+    expect(reads).toBe(1);
+  });
+
   it("throws canonical 'Please use only absolute URLs' error for relative URL input", async () => {
     const { NextRequest } = await import("../packages/vinext/src/shims/server.js");
     // Matches Next.js's documented behaviour — middleware tests assert on this
@@ -13480,6 +13632,20 @@ describe("matchHeaders", () => {
     // Request without the required header should not match
     const matched = matchHeaders("/about", rules, makeCtx());
     expect(matched).toEqual([]);
+  });
+
+  it("reports pathname eligibility before request conditions are evaluated", async () => {
+    const { matchHeaders } = await import("../packages/vinext/src/config/config-matchers.js");
+    const rule: any = {
+      source: "/about",
+      has: [{ type: "cookie", key: "variant", value: "private" }],
+      headers: [{ key: "x-variant", value: "private" }],
+    };
+    const onRulePathnameMatch = vi.fn();
+
+    expect(matchHeaders("/about", [rule], makeCtx(), undefined, onRulePathnameMatch)).toEqual([]);
+    expect(onRulePathnameMatch).toHaveBeenCalledOnce();
+    expect(onRulePathnameMatch).toHaveBeenCalledWith(rule);
   });
 
   // Regression for #1331: under `trailingSlash: true` the incoming pathname
@@ -16234,14 +16400,12 @@ describe("next/compat/router shim", () => {
     const { renderToStaticMarkup } = await import("react-dom/server");
     const { useRouter } = await import("../packages/vinext/src/shims/compat-router.js");
 
-    let captured: unknown = "NOT_SET";
     function Probe() {
-      captured = useRouter();
+      expect(useRouter()).toBeNull();
       return React.createElement("div", null, "probe");
     }
 
     renderToStaticMarkup(React.createElement(Probe));
-    expect(captured).toBeNull();
   });
 
   it("useRouter returns the router when wrapWithRouterContext wraps the tree", async () => {
@@ -16251,20 +16415,19 @@ describe("next/compat/router shim", () => {
       await import("../packages/vinext/src/shims/compat-router.js");
     const { wrapWithRouterContext } = await import("../packages/vinext/src/shims/router.js");
 
-    let captured: unknown = "NOT_SET";
     function Probe() {
-      captured = useCompatRouter();
+      const router = useCompatRouter();
+      expect(router).not.toBeNull();
+      expect(typeof router?.pathname).toBe("string");
+      expect(typeof router?.push).toBe("function");
+      expect(typeof router?.replace).toBe("function");
+      expect(typeof router?.back).toBe("function");
+      expect(typeof router?.reload).toBe("function");
       return React.createElement("div", null, "probe");
     }
 
     const element = wrapWithRouterContext(React.createElement(Probe));
     renderToStaticMarkup(element);
-    expect(captured).not.toBeNull();
-    expect(typeof (captured as any).pathname).toBe("string");
-    expect(typeof (captured as any).push).toBe("function");
-    expect(typeof (captured as any).replace).toBe("function");
-    expect(typeof (captured as any).back).toBe("function");
-    expect(typeof (captured as any).reload).toBe("function");
   });
 
   it("useRouter returns router reflecting SSR context when set", async () => {
@@ -16281,9 +16444,12 @@ describe("next/compat/router shim", () => {
       asPath: "/posts/42?tab=comments",
     });
 
-    let captured: unknown = "NOT_SET";
     function Probe() {
-      captured = useCompatRouter();
+      const router = useCompatRouter();
+      expect(router).not.toBeNull();
+      expect(router?.pathname).toBe("/posts/42");
+      expect(router?.asPath).toBe("/posts/42?tab=comments");
+      expect(router?.query.id).toBe("42");
       return React.createElement("div", null, "probe");
     }
 
@@ -16291,11 +16457,6 @@ describe("next/compat/router shim", () => {
     renderToStaticMarkup(element);
 
     setSSRContext(null);
-
-    expect(captured).not.toBeNull();
-    expect((captured as any).pathname).toBe("/posts/42");
-    expect((captured as any).asPath).toBe("/posts/42?tab=comments");
-    expect((captured as any).query.id).toBe("42");
   });
 
   it("preserves array query values from SSR context", async () => {
@@ -16312,9 +16473,10 @@ describe("next/compat/router shim", () => {
       asPath: "/docs/a/b",
     });
 
-    let captured: unknown = "NOT_SET";
     function Probe() {
-      captured = useCompatRouter();
+      const router = useCompatRouter();
+      expect(router).not.toBeNull();
+      expect(router?.query.slug).toEqual(["a", "b"]);
       return React.createElement("div", null, "probe");
     }
 
@@ -16322,9 +16484,6 @@ describe("next/compat/router shim", () => {
     renderToStaticMarkup(element);
 
     setSSRContext(null);
-
-    expect(captured).not.toBeNull();
-    expect((captured as any).query.slug).toEqual(["a", "b"]);
   });
 
   // Regression for issue #1466: React's `useSyncExternalStore` calls
@@ -16578,19 +16737,17 @@ describe("next/compat/router shim", () => {
     };
 
     try {
-      let captured: unknown = "NOT_SET";
       function Probe() {
-        captured = useCompatRouter();
+        const router = useCompatRouter();
+        expect(router).not.toBeNull();
+        expect(router?.query.slug).toEqual(["a", "b"]);
+        expect(router?.query.tag).toEqual(["a", "b"]);
+        expect(router?.asPath).toBe("/docs/a/b?tag=a&tag=b#section");
         return React.createElement("div", null, "probe");
       }
 
       const element = wrapWithRouterContext(React.createElement(Probe));
       renderToStaticMarkup(element);
-
-      expect(captured).not.toBeNull();
-      expect((captured as any).query.slug).toEqual(["a", "b"]);
-      expect((captured as any).query.tag).toEqual(["a", "b"]);
-      expect((captured as any).asPath).toBe("/docs/a/b?tag=a&tag=b#section");
     } finally {
       if (previousWindow === undefined) {
         delete (globalThis as any).window;
@@ -16625,18 +16782,16 @@ describe("next/compat/router shim", () => {
     };
 
     try {
-      let captured: unknown = "NOT_SET";
       function Probe() {
-        captured = useCompatRouter();
+        const router = useCompatRouter();
+        expect(router).not.toBeNull();
+        expect(router?.query.slug).toEqual(["a", "b"]);
+        expect(router?.asPath).toBe("/docs/a/b?slug=c");
         return React.createElement("div", null, "probe");
       }
 
       const element = wrapWithRouterContext(React.createElement(Probe));
       renderToStaticMarkup(element);
-
-      expect(captured).not.toBeNull();
-      expect((captured as any).query.slug).toEqual(["a", "b"]);
-      expect((captured as any).asPath).toBe("/docs/a/b?slug=c");
     } finally {
       if (previousWindow === undefined) {
         delete (globalThis as any).window;
@@ -16671,20 +16826,18 @@ describe("next/compat/router shim", () => {
     };
 
     try {
-      let captured: unknown = "NOT_SET";
       function Probe() {
-        captured = useCompatRouter();
+        const router = useCompatRouter();
+        expect(router).not.toBeNull();
+        expect(Reflect.get(router?.query ?? {}, "toString")).toBe("a");
+        expect(router?.query.constructor).toBe("b");
+        expect(router?.query.__proto__).toBe("c");
+        expect(Object.getPrototypeOf(router?.query)).toBe(Object.prototype);
         return React.createElement("div", null, "probe");
       }
 
       const element = wrapWithRouterContext(React.createElement(Probe));
       renderToStaticMarkup(element);
-
-      expect(captured).not.toBeNull();
-      expect((captured as any).query.toString).toBe("a");
-      expect((captured as any).query.constructor).toBe("b");
-      expect((captured as any).query.__proto__).toBe("c");
-      expect(Object.getPrototypeOf((captured as any).query)).toBe(Object.prototype);
     } finally {
       if (previousWindow === undefined) {
         delete (globalThis as any).window;
@@ -16867,18 +17020,17 @@ describe("Pages Router router helpers", () => {
     try {
       await routerModule.default.push("/posts/43", undefined, { shallow: true });
 
-      let captured: unknown = "NOT_SET";
       function Probe() {
-        captured = useCompatRouter();
+        const router = useCompatRouter();
+        expect(router).not.toBeNull();
+        expect(router?.pathname).toBe("/posts/[id]");
+        expect(router?.asPath).toBe("/posts/43");
+        expect(router?.query).toEqual({ id: "43" });
         return React.createElement("div", null, "probe");
       }
 
       renderToStaticMarkup(routerModule.wrapWithRouterContext(React.createElement(Probe)));
 
-      expect(captured).not.toBeNull();
-      expect((captured as any).pathname).toBe("/posts/[id]");
-      expect((captured as any).asPath).toBe("/posts/43");
-      expect((captured as any).query).toEqual({ id: "43" });
       expect(win.__NEXT_DATA__.query).toEqual({ id: "42" });
     } finally {
       if (previousWindow === undefined) {
@@ -17003,16 +17155,14 @@ describe("Pages Router router helpers", () => {
       await import("../packages/vinext/src/shims/compat-router.js");
     const routerSingleton = mod.default;
 
-    let captured: unknown = "NOT_SET";
     function Probe() {
-      captured = useCompatRouter();
+      expect(typeof useCompatRouter()?.beforePopState).toBe("function");
       return React.createElement("div", null, "probe");
     }
 
     renderToStaticMarkup(mod.wrapWithRouterContext(React.createElement(Probe)));
 
     expect(typeof (routerSingleton as any).beforePopState).toBe("function");
-    expect(typeof (captured as any).beforePopState).toBe("function");
   });
 
   describe("isExternalUrl", () => {

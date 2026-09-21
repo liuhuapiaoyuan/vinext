@@ -103,6 +103,7 @@ import { parseHttpDate } from "./http-date.js";
 import type { NextI18nConfig } from "../config/next-config.js";
 import { readTrustedRevalidationHostname } from "./revalidation-host.js";
 import { readStaticFileSignal } from "./static-file-signal.js";
+import { traceFrameworkRequest } from "./request-tracing.js";
 
 /**
  * mtime of the build each bare (query-less) server-entry URL was first
@@ -301,6 +302,8 @@ export type ProdServerOptions = {
   outDir?: string;
   /** Explicit App Router RSC entry path. Defaults to `<outDir>/server/index.js`. */
   rscEntryPath?: string;
+  /** Directory containing server manifests, sidecars, and prerender artifacts. */
+  serverDir?: string;
   /** Explicit Pages Router server entry path. Defaults to `<outDir>/server/entry.js`. */
   serverEntryPath?: string;
   /** Disable compression (default: false) */
@@ -1267,14 +1270,37 @@ async function sendWebResponse(
     // Use streaming flush modes so progressive HTML remains decodable before the
     // full response completes.
     const compressor = createCompressor(encoding!, "streaming");
-    pipeline(nodeStream, compressor, res, () => {
-      /* ignore pipeline errors on closed connections */
+    await new Promise<void>((resolve) => {
+      pipeline(nodeStream, compressor, res, () => {
+        // A closed connection terminates the request just as a completed body
+        // does, so retain the existing best-effort error handling.
+        resolve();
+      });
     });
   } else {
-    pipeline(nodeStream, res, () => {
-      /* ignore pipeline errors on closed connections */
+    await new Promise<void>((resolve) => {
+      pipeline(nodeStream, res, () => {
+        // A closed connection terminates the request just as a completed body
+        // does, so retain the existing best-effort error handling.
+        resolve();
+      });
     });
   }
+}
+
+function waitForNodeResponseCompletion(res: ServerResponse): Promise<void> {
+  if (res.writableFinished || res.destroyed) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => {
+      res.off("finish", done);
+      res.off("close", done);
+      res.off("error", done);
+      resolve();
+    };
+    res.once("finish", done);
+    res.once("close", done);
+    res.once("error", done);
+  });
 }
 
 /**
@@ -1298,6 +1324,7 @@ export async function startProdServer(options: ProdServerOptions = {}) {
     host = "0.0.0.0",
     outDir = path.resolve("dist"),
     rscEntryPath: explicitRscEntryPath,
+    serverDir: explicitServerDir,
     serverEntryPath: explicitServerEntryPath,
     noCompression = false,
     purpose,
@@ -1308,14 +1335,17 @@ export async function startProdServer(options: ProdServerOptions = {}) {
   // Always resolve outDir to absolute to ensure dynamic import() works
   const resolvedOutDir = path.resolve(outDir);
   const clientDir = path.join(resolvedOutDir, "client");
+  const serverDir = explicitServerDir
+    ? path.resolve(explicitServerDir)
+    : path.join(resolvedOutDir, "server");
 
   // Detect build type
   const rscEntryPath = explicitRscEntryPath
     ? path.resolve(explicitRscEntryPath)
-    : path.join(resolvedOutDir, "server", "index.js");
+    : path.join(serverDir, "index.js");
   const serverEntryPath = explicitServerEntryPath
     ? path.resolve(explicitServerEntryPath)
-    : path.join(resolvedOutDir, "server", "entry.js");
+    : path.join(serverDir, "entry.js");
   const isAppRouter = fs.existsSync(rscEntryPath);
 
   if (!isAppRouter && !fs.existsSync(serverEntryPath)) {
@@ -1325,7 +1355,16 @@ export async function startProdServer(options: ProdServerOptions = {}) {
   }
 
   if (isAppRouter) {
-    return startAppRouterServer({ port, host, clientDir, rscEntryPath, compress, purpose, silent });
+    return startAppRouterServer({
+      port,
+      host,
+      clientDir,
+      serverDir,
+      rscEntryPath,
+      compress,
+      purpose,
+      silent,
+    });
   }
 
   return startPagesRouterServer({
@@ -1345,6 +1384,7 @@ type AppRouterServerOptions = {
   port: number;
   host: string;
   clientDir: string;
+  serverDir: string;
   rscEntryPath: string;
   compress: boolean;
   purpose?: ProdServerOptions["purpose"];
@@ -1352,6 +1392,7 @@ type AppRouterServerOptions = {
 };
 
 type WorkerAppRouterEntry = {
+  __ensureInstrumentation?(): void | Promise<void>;
   fetch(request: Request, env?: unknown, ctx?: ExecutionContextLike): Promise<Response> | Response;
 };
 
@@ -1585,11 +1626,11 @@ function installPagesClientAssets(options: {
  * 4. Stream the Web Response back (with optional compression)
  */
 async function startAppRouterServer(options: AppRouterServerOptions) {
-  const { port, host, clientDir, rscEntryPath, compress, purpose, silent } = options;
+  const { port, host, clientDir, serverDir, rscEntryPath, compress, purpose, silent } = options;
 
   // Load prerender secret written at build time by vinext:server-manifest plugin.
   // Used to authenticate internal /__vinext/prerender/* HTTP endpoints.
-  const prerenderSecret = readPrerenderSecret(path.dirname(rscEntryPath));
+  const prerenderSecret = readPrerenderSecret(serverDir);
 
   // Import the RSC handler. importServerEntryModule uses the bare file://
   // URL so lazy chunks that import the entry back resolve to the same module
@@ -1598,6 +1639,16 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
   const rscModule = await importServerEntryModule(rscEntryPath);
   const rscEntryRequire = createServerEntryRequire(rscEntryPath);
   const rscHandler = resolveAppRouterHandler(rscModule.default);
+  const workerEntry =
+    rscModule.default && typeof rscModule.default === "object"
+      ? (rscModule.default as WorkerAppRouterEntry)
+      : undefined;
+  const ensureInstrumentation =
+    typeof workerEntry?.__ensureInstrumentation === "function"
+      ? () => workerEntry.__ensureInstrumentation!()
+      : typeof rscModule.__ensureInstrumentation === "function"
+        ? () => rscModule.__ensureInstrumentation()
+        : () => undefined;
 
   // `assetPrefix` is embedded as a compile-time constant in the generated
   // RSC entry (see `entries/app-rsc-entry.ts`'s `export const __assetPrefix`),
@@ -1629,7 +1680,7 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
       ? (rscModule.__imageConfig as ImageConfig)
       : undefined;
   if (imageConfig === undefined) {
-    const imageConfigPath = path.join(path.dirname(rscEntryPath), "image-config.json");
+    const imageConfigPath = path.join(serverDir, "image-config.json");
     if (fs.existsSync(imageConfigPath)) {
       try {
         imageConfig = JSON.parse(fs.readFileSync(imageConfigPath, "utf-8"));
@@ -1662,7 +1713,7 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
   // any pre-rendered page is a cache HIT instead of a full re-render.
   const seedPrerenderedRoutes = resolveAppRouterPrerenderSeeder(rscModule);
   const seededRoutes = await runWithServerEntryRequire(rscEntryRequire, () =>
-    seedPrerenderedRoutes(path.dirname(rscEntryPath)),
+    seedPrerenderedRoutes(serverDir),
   );
   if (seededRoutes > 0) {
     console.log(
@@ -1675,7 +1726,7 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
   // .br/.gz/.zst variants (generated at build time) are detected automatically.
   const staticCache = await StaticFileCache.create(clientDir);
 
-  const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+  const handleRequestImpl = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const rawUrl = req.url ?? "/";
     const rawPathname = rawUrl.split("?")[0];
 
@@ -1888,6 +1939,36 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
     }
   };
 
+  const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    try {
+      await ensureInstrumentation();
+    } catch (error) {
+      console.error("[vinext] Instrumentation error:", error);
+      if (!res.headersSent) {
+        if (purpose === "prerender") {
+          res.setHeader(VINEXT_PRERENDER_RENDER_ERROR_HEADER, "1");
+        }
+        res.writeHead(500);
+        res.end("Internal Server Error");
+      }
+      return;
+    }
+    const target = req.url ?? "/";
+    const headers = nodeHeadersToWebHeaders(req.headers);
+    return traceFrameworkRequest({
+      callback: async () => {
+        await handleRequestImpl(req, res);
+        await waitForNodeResponseCompletion(res);
+      },
+      getStatus: () => res.statusCode,
+      headers,
+      isRsc:
+        new URL(target, "http://localhost").pathname.endsWith(".rsc") || headers.get("RSC") === "1",
+      method: req.method ?? "GET",
+      target,
+    });
+  };
+
   const server = createServer((req, res) => {
     void runWithServerEntryRequire(rscEntryRequire, () => handleRequest(req, res));
   });
@@ -1944,7 +2025,8 @@ function isPagesServerEntryPageRoute(value: unknown): value is PagesServerEntryP
 
   if (!("module" in value) || value.module === undefined) return true;
   const pageModule = value.module;
-  if (!pageModule || typeof pageModule !== "object") return false;
+  if (pageModule === null) return true;
+  if (typeof pageModule !== "object") return false;
 
   return !("getStaticPaths" in pageModule) || typeof pageModule.getStaticPaths === "function";
 }
@@ -1985,6 +2067,10 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
     typeof serverEntry.matchPageRoute === "function" ? serverEntry.matchPageRoute : undefined;
   const matchApiRoute =
     typeof serverEntry.matchApiRoute === "function" ? serverEntry.matchApiRoute : undefined;
+  const ensureInstrumentation =
+    typeof serverEntry.__ensureInstrumentation === "function"
+      ? () => serverEntry.__ensureInstrumentation()
+      : () => undefined;
   const hasMiddleware = serverEntry.hasMiddleware === true;
   const pageRoutes = readPagesServerEntryPageRoutes(serverEntry.pageRoutes);
   const pagesWebSocketRoutes = readWebSocketRoutes(serverEntry.webSocketRoutes);
@@ -2045,6 +2131,32 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
   const staticCache = await StaticFileCache.create(clientDir);
 
   const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    try {
+      await ensureInstrumentation();
+    } catch (error) {
+      console.error("[vinext] Instrumentation error:", error);
+      if (!res.headersSent) {
+        if (purpose === "prerender") {
+          res.setHeader(VINEXT_PRERENDER_RENDER_ERROR_HEADER, "1");
+        }
+        res.writeHead(500);
+        res.end("Internal Server Error");
+      }
+      return;
+    }
+    return traceFrameworkRequest({
+      callback: async () => {
+        await handleRequestImpl(req, res);
+        await waitForNodeResponseCompletion(res);
+      },
+      getStatus: () => res.statusCode,
+      headers: nodeHeadersToWebHeaders(req.headers),
+      method: req.method ?? "GET",
+      target: req.url ?? "/",
+    });
+  };
+
+  const handleRequestImpl = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const rawUrl = req.url ?? "/";
     const rawPagesPathnameBeforeNormalize = rawUrl.split("?")[0];
 
@@ -2500,6 +2612,7 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
 export {
   sendCompressed,
   sendWebResponse,
+  waitForNodeResponseCompletion,
   negotiateEncoding,
   COMPRESSIBLE_TYPES,
   COMPRESS_THRESHOLD,

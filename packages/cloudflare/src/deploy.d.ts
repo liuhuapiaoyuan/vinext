@@ -8,8 +8,15 @@
  *   3. Deploys to Cloudflare Workers via Wrangler
  */
 import { spawn } from "node:child_process";
-import { parseWranglerConfig } from "./tpr.js";
-import { type CdnWarmOptions, type CdnWarmRequestPlan } from "./cdn-warm.js";
+import { type VinextCacheConfig } from "vinext/internal/config/prerender";
+import { type ProjectInfo } from "vinext/internal/utils/project";
+import { type TrafficEntry } from "./tpr.js";
+import { parseWranglerConfig } from "./wrangler-config.js";
+import {
+  type CdnWarmOptions,
+  type CdnWarmRequestPlan,
+  type PrerenderWarmPlan,
+} from "./cdn-warm.js";
 import { type WranglerDeploymentStatus, type WranglerVersionTraffic } from "./version-deploy.js";
 import { type KVBulkPair } from "./prerender-kv-populate.js";
 export declare const DEFAULT_CDN_WARM_PROMOTION_DELAY_MS = 15000;
@@ -28,35 +35,53 @@ export type DeployOptions = {
   skipBuild?: boolean;
   /** Dry run — validate setup but don't build or deploy */
   dryRun?: boolean;
+  /** Print raw output from internal Wrangler commands. */
+  verbose?: boolean;
   /** Pre-render all discovered routes into the dist output after building */
   prerenderAll?: boolean;
   /** Maximum number of routes to prerender in parallel */
   prerenderConcurrency?: number;
   /** Warm Cloudflare's CDN cache by requesting build-discovered paths for the uploaded version */
   warmCdnCache?: boolean;
+  /** Explicit production origin to use for CDN discovery, probing, and warming */
+  warmCdnTarget?: string;
   /** Maximum number of CDN warmup requests to issue in parallel */
   warmCdnConcurrency?: number;
   /** Per-request CDN warmup timeout in milliseconds */
   warmCdnTimeout?: number;
   /** Number of CDN warmup retries for transient failures */
   warmCdnRetries?: number;
+  /** Maximum duration of staged Worker path discovery */
+  warmCdnDiscoveryTimeout?: number;
+  /** Number of transient staged Worker path discovery retries */
+  warmCdnDiscoveryRetries?: number;
+  /** Abort after this duration without a completed cacheability probe */
+  warmCdnProbeTimeout?: number;
+  /** Number of transient staged Worker cacheability probe retries */
+  warmCdnProbeRetries?: number;
+  /** Re-request warmed identities and require reusable CDN hits before promotion */
+  warmCdnCertify?: boolean;
+  /** Maximum duration of staged Worker readiness verification */
+  warmCdnReadinessTimeout?: number;
+  /** Number of staged Worker readiness retries */
+  warmCdnReadinessRetries?: number;
   /** Consecutive successful probes required before warming the staged Worker */
   warmCdnReadinessProbes?: number;
   /** Delay between staged Worker readiness probes in milliseconds */
   warmCdnReadinessProbeDelay?: number;
   /** Promote even when staged CDN warmup cannot be completed */
   dangerouslyPromoteOnCdnWarmError?: boolean;
-  /** Promote the warmed Worker version to 100% traffic (default: true) */
+  /** Promote the uploaded Worker version to 100% traffic (default: true) */
   warmCdnPromote?: boolean;
   /** Delay between successful warmup and promotion in milliseconds */
   warmCdnPromotionDelay?: number;
   /** Include PPR fallback-shell placeholder paths during CDN warmup */
   warmCdnIncludeFallbacks?: boolean;
-  /** Enable experimental TPR (Traffic-aware Pre-Rendering) */
+  /** Select CDN pre-warm routes using traffic analytics */
   experimentalTPR?: boolean;
   /** TPR: traffic coverage percentage target (0–100, default: 90) */
   tprCoverage?: number;
-  /** TPR: hard cap on number of pages to pre-render (default: 1000) */
+  /** TPR: hard cap on selected routes (default: 1000) */
   tprLimit?: number;
   /** TPR: analytics lookback window in hours (default: 24) */
   tprWindow?: number;
@@ -69,12 +94,21 @@ export declare function parseDeployArgs(args: string[]): {
   config: string | undefined;
   skipBuild: boolean;
   dryRun: boolean;
+  verbose: boolean;
   prerenderAll: boolean;
   prerenderConcurrency: number | undefined;
   warmCdnCache: boolean;
+  warmCdnTarget: string | undefined;
   warmCdnConcurrency: number | undefined;
   warmCdnTimeout: number | undefined;
   warmCdnRetries: number | undefined;
+  warmCdnDiscoveryTimeout: number | undefined;
+  warmCdnDiscoveryRetries: number | undefined;
+  warmCdnProbeTimeout: number | undefined;
+  warmCdnProbeRetries: number | undefined;
+  warmCdnCertify: boolean;
+  warmCdnReadinessTimeout: number | undefined;
+  warmCdnReadinessRetries: number | undefined;
   warmCdnReadinessProbes: number | undefined;
   warmCdnReadinessProbeDelay: number | undefined;
   dangerouslyPromoteOnCdnWarmError: boolean;
@@ -159,32 +193,77 @@ export declare function runWranglerKVBulkPut(
 ): Promise<void>;
 export declare function runWranglerDeploy(
   root: string,
-  options: Pick<DeployOptions, "preview" | "env" | "name" | "config">,
+  options: Pick<DeployOptions, "preview" | "env" | "name" | "config" | "verbose"> & {
+    promote?: boolean;
+  },
   execute?: typeof spawn,
 ): Promise<string>;
-export declare function hasCdnWarmRequests(plan: CdnWarmRequestPlan): boolean;
+export declare function hasCdnWarmRequests(
+  plan: Omit<CdnWarmRequestPlan, "pagesDataPaths"> & {
+    pagesDataPaths?: readonly string[];
+  },
+): boolean;
+export declare function selectTPRWarmPlan(
+  plan: PrerenderWarmPlan,
+  traffic: readonly TrafficEntry[],
+  coverage: number,
+  limit: number,
+): PrerenderWarmPlan;
+export declare function projectRequiresRouteCacheabilityProbeManifest(
+  project: Pick<ProjectInfo, "isAppRouter" | "isPagesRouter">,
+  cacheConfig: VinextCacheConfig | null,
+): boolean;
+type CdnWarmDeployOptions = Pick<
+  DeployOptions,
+  | "preview"
+  | "env"
+  | "name"
+  | "config"
+  | "verbose"
+  | "warmCdnTarget"
+  | "warmCdnConcurrency"
+  | "warmCdnTimeout"
+  | "warmCdnRetries"
+  | "warmCdnDiscoveryTimeout"
+  | "warmCdnDiscoveryRetries"
+  | "warmCdnProbeTimeout"
+  | "warmCdnProbeRetries"
+  | "warmCdnCertify"
+  | "warmCdnReadinessTimeout"
+  | "warmCdnReadinessRetries"
+  | "warmCdnReadinessProbes"
+  | "warmCdnReadinessProbeDelay"
+  | "dangerouslyPromoteOnCdnWarmError"
+  | "warmCdnPromote"
+  | "warmCdnPromotionDelay"
+> &
+  Pick<
+    CdnWarmOptions,
+    | "deploymentId"
+    | "expectedBuildId"
+    | "expectedRscBuildId"
+    | "loadingShellPaths"
+    | "pagesDataPaths"
+    | "routeHandlerPaths"
+    | "routePatterns"
+    | "rscPaths"
+    | "statusSource"
+  > & {
+    /** Allow optional route selection to discover no warmable requests. */
+    allowEmptyWarmPlan?: boolean;
+    /** Probe a staged Worker and upload the resulting manifest as a second version. */
+    cacheabilityProbe?: boolean;
+    discoverWarmPlan?: (target: {
+      headers?: HeadersInit;
+      targetUrl: string;
+    }) => Promise<PrerenderWarmPlan>;
+    /** Narrow the final warm requests without changing discovery or probe metadata. */
+    selectWarmPlan?: (plan: PrerenderWarmPlan) => PrerenderWarmPlan;
+  };
 export declare function deployWithCdnWarmup(
   root: string,
   paths: readonly string[],
-  options: Pick<
-    DeployOptions,
-    | "preview"
-    | "env"
-    | "name"
-    | "config"
-    | "warmCdnConcurrency"
-    | "warmCdnTimeout"
-    | "warmCdnRetries"
-    | "warmCdnReadinessProbes"
-    | "warmCdnReadinessProbeDelay"
-    | "dangerouslyPromoteOnCdnWarmError"
-    | "warmCdnPromote"
-    | "warmCdnPromotionDelay"
-  > &
-    Pick<
-      CdnWarmOptions,
-      "deploymentId" | "expectedBuildId" | "expectedRscBuildId" | "loadingShellPaths" | "rscPaths"
-    >,
+  options: CdnWarmDeployOptions,
 ): Promise<string>;
 export declare function resolveCdnWarmupTargetUrl(
   root: string,
@@ -193,7 +272,7 @@ export declare function resolveCdnWarmupTargetUrl(
 export declare function resolveCdnWarmupTargetUrl(
   root: string,
   deployedUrl: string | null,
-  options: Pick<DeployOptions, "preview" | "env" | "config">,
+  options: Pick<DeployOptions, "preview" | "env" | "config" | "warmCdnTarget">,
 ): string | null;
 export declare function getZeroPercentStagingTraffic(
   deployment: WranglerDeploymentStatus | null,
@@ -209,3 +288,4 @@ export declare function buildVersionOverrideHeaders(
   versionId: string,
 ): HeadersInit | undefined;
 export declare function deploy(options: DeployOptions): Promise<void>;
+export {};

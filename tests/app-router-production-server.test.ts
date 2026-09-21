@@ -9,7 +9,7 @@ import {
   getPagesClientAssets,
   setPagesClientAssets,
 } from "../packages/vinext/src/server/pages-client-assets.js";
-import { APP_FIXTURE_DIR, createIsolatedFixture } from "./helpers.js";
+import { APP_FIXTURE_DIR, createIsolatedFixture, testCacheDir } from "./helpers.js";
 
 const ROOT_LAYOUT_NOT_FOUND_REDIRECT_FIXTURE_DIR = path.resolve(
   import.meta.dirname,
@@ -296,6 +296,7 @@ describe("App Router Production server (startProdServer)", () => {
       // Build the app-basic fixture to the default dist/ directory
       const builder = await createBuilder({
         root: APP_FIXTURE_DIR,
+        cacheDir: testCacheDir(APP_FIXTURE_DIR),
         configFile: false,
         plugins: [vinext({ appDir: APP_FIXTURE_DIR })],
         logLevel: "silent",
@@ -754,7 +755,7 @@ describe("App Router Production server (startProdServer)", () => {
     const html = await res.text();
     const dynamicScriptPreloads =
       html.match(
-        /<link\b(?=[^>]*\brel="preload")(?=[^>]*\bas="script")(?=[^>]*\bhref="[^"]*\/_next\/static\/chunks\/[^"]*\.js")[^>]*>/g,
+        /<link\b(?=[^>]*\brel="modulepreload")(?=[^>]*\bas="script")(?=[^>]*\bfetchpriority="low")(?=[^>]*\bhref="[^"]*\/_next\/static\/chunks\/[^"]*\.js")[^>]*>/gi,
       ) ?? [];
 
     expect(dynamicScriptPreloads.length).toBeGreaterThan(0);
@@ -793,7 +794,7 @@ describe("App Router Production server (startProdServer)", () => {
 
     const dynamicScriptPreloads =
       html.match(
-        /<link\b(?=[^>]*\brel="preload")(?=[^>]*\bas="script")(?=[^>]*\bhref="[^"]*\/_next\/static\/chunks\/[^"]*\.js")[^>]*>/g,
+        /<link\b(?=[^>]*\brel="modulepreload")(?=[^>]*\bas="script")(?=[^>]*\bfetchpriority="low")(?=[^>]*\bhref="[^"]*\/_next\/static\/chunks\/[^"]*\.js")[^>]*>/gi,
       ) ?? [];
 
     // Parity expectation: a Server-Component call site must still emit a
@@ -837,7 +838,7 @@ describe("App Router Production server (startProdServer)", () => {
     const html = await res.text();
     const dynamicScriptPreloads =
       html.match(
-        /<link\b(?=[^>]*\brel="preload")(?=[^>]*\bas="script")(?=[^>]*\bhref="[^"]*\/_next\/static\/chunks\/[^"]*\.js")[^>]*>/g,
+        /<link\b(?=[^>]*\brel="modulepreload")(?=[^>]*\bas="script")(?=[^>]*\bfetchpriority="low")(?=[^>]*\bhref="[^"]*\/_next\/static\/chunks\/[^"]*\.js")[^>]*>/gi,
       ) ?? [];
 
     expect(dynamicScriptPreloads.length).toBeGreaterThan(0);
@@ -863,7 +864,7 @@ describe("App Router Production server (startProdServer)", () => {
     // empty render.
     expect(html).toContain("This is static content");
 
-    // The DynamicPreloadChunks signature is rel="preload" as="script"
+    // The DynamicPreloadChunks signature is rel="modulepreload" as="script"
     // fetchPriority="low" — route bootstrap uses modulepreload instead, so this
     // matches only dynamic-boundary preloads. Match the attribute name
     // case-INSENSITIVELY: React currently serializes the `fetchPriority` prop
@@ -872,7 +873,7 @@ describe("App Router Production server (startProdServer)", () => {
     // would pass vacuously even if a preload leaked.
     const dynamicScriptPreloads = (html.match(/<link\b[^>]*>/g) ?? []).filter(
       (tag) =>
-        /\brel="preload"/i.test(tag) &&
+        /\brel="modulepreload"/i.test(tag) &&
         /\bas="script"/i.test(tag) &&
         /\bfetchpriority="low"/i.test(tag),
     );
@@ -952,7 +953,7 @@ describe("App Router Production server (startProdServer)", () => {
       );
 
       const html = await res.text();
-      // DynamicPreloadChunks emits ReactDOM.preload(..., { fetchPriority: "low" });
+      // DynamicPreloadChunks marks its modulepreload with fetchPriority="low";
       // use that signal to avoid matching route bootstrap modulepreload links.
       const dynamicScriptPreloads = (html.match(/<link\b[^>]*>/g) ?? []).filter(
         (tag) =>

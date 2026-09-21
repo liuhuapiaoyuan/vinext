@@ -5,6 +5,9 @@ declare global {
   var __VINEXT_PREGENERATED_CONCRETE_PATHS: unknown;
 }
 
+/** Stable post-build module populated after prerendering completes. */
+export const PREGENERATED_CONCRETE_PATHS_MODULE = "__vinext_pregenerated_concrete_paths.js";
+
 export function normalizePregeneratedPathname(pathname: string): string {
   return normalizePath(normalizePathnameForRouteMatch(pathname));
 }
@@ -23,12 +26,16 @@ export function clearPregeneratedConcretePaths(): void {
   concreteUrlPathsByRoute.clear();
 }
 
-export function addPregeneratedConcretePath(routePattern: string, pathname: string): void {
-  let paths = concreteUrlPathsByRoute.get(routePattern);
-  if (!paths) {
-    paths = new Set();
-    concreteUrlPathsByRoute.set(routePattern, paths);
+export function addPregeneratedRoute(routePattern: string): void {
+  if (!concreteUrlPathsByRoute.has(routePattern)) {
+    concreteUrlPathsByRoute.set(routePattern, new Set());
   }
+}
+
+export function addPregeneratedConcretePath(routePattern: string, pathname: string): void {
+  addPregeneratedRoute(routePattern);
+  let paths = concreteUrlPathsByRoute.get(routePattern);
+  if (!paths) return;
   paths.add(normalizePregeneratedPathname(pathname));
 }
 
@@ -49,6 +56,7 @@ export function initPregeneratedPathsFromGlobals(): void {
   if (!data) return;
   clearPregeneratedConcretePaths();
   for (const [routePattern, pathnames] of data) {
+    addPregeneratedRoute(routePattern);
     for (const pathname of pathnames) {
       addPregeneratedConcretePath(routePattern, pathname);
     }

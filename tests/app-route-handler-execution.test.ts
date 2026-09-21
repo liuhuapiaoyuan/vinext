@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vite-plus/test";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import {
   consumeDynamicUsage,
   cookies,
@@ -25,6 +25,64 @@ import {
   createRequestContext,
   runWithRequestContext,
 } from "../packages/vinext/src/shims/unified-request-context.js";
+import { runWithExecutionContext } from "../packages/vinext/src/shims/request-context.js";
+import {
+  createWorkerCacheabilityAdmissionContext,
+  finalizeWorkerCacheabilityResponse,
+} from "../packages/vinext/src/server/cacheability-request.js";
+import {
+  CACHEABILITY_REQUEST_STATE,
+  type RouteCacheabilityState,
+} from "../packages/vinext/src/shims/cacheability-classification.js";
+import {
+  DefaultCdnCacheAdapter,
+  setCdnCacheAdapter,
+  type CdnCacheAdapter,
+} from "../packages/vinext/src/shims/cdn-cache.js";
+import { registerFrameworkTracingIntegration } from "../packages/vinext/src/server/tracer.js";
+import type {
+  FrameworkTracingBackendSpan,
+  ResolvedFrameworkSpanDescriptor,
+} from "../packages/vinext/src/server/framework-tracer.js";
+import { isPromiseLike } from "../packages/vinext/src/utils/promise.js";
+
+type RecordedRouteSpan = {
+  errors: unknown[];
+  status?: string;
+  type: string;
+};
+
+const recordedRouteSpans: RecordedRouteSpan[] = [];
+let activeRouteSpanCount = 0;
+registerFrameworkTracingIntegration({
+  id: "app-route-handler-execution-test",
+  enterSpan<T>(
+    descriptor: ResolvedFrameworkSpanDescriptor,
+    callback: (span: FrameworkTracingBackendSpan) => T,
+  ): T {
+    const recorded: RecordedRouteSpan = { errors: [], type: descriptor.type };
+    recordedRouteSpans.push(recorded);
+    activeRouteSpanCount++;
+    let result: T;
+    try {
+      result = callback({
+        recordException: (error) => recorded.errors.push(error),
+        setAttribute() {},
+        setErrorStatus: (message) => {
+          recorded.status = message ?? "error";
+        },
+      });
+    } catch (error) {
+      activeRouteSpanCount--;
+      throw error;
+    }
+    if (isPromiseLike(result)) {
+      return Promise.resolve(result).finally(() => activeRouteSpanCount--) as T;
+    }
+    activeRouteSpanCount--;
+    return result;
+  },
+});
 
 // The fetch-cache shim captures `originalFetch` from globalThis at import
 // time, so stub fetch BEFORE importing it (same pattern as
@@ -38,6 +96,8 @@ const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestIn
 vi.stubGlobal("fetch", fetchMock);
 const { withFetchCache } = await import("../packages/vinext/src/shims/fetch-cache.js");
 const { revalidateTag } = await import("../packages/vinext/src/shims/cache.js");
+
+afterEach(() => setCdnCacheAdapter(new DefaultCdnCacheAdapter()));
 
 function createDynamicUsageState(): {
   consumeDynamicUsage: () => boolean;
@@ -203,7 +263,7 @@ describe("app route handler execution helpers", () => {
       tags: string[];
     }> = [];
     const phaseCalls: string[] = [];
-    const reportCalls: Error[] = [];
+    const reportCalls: unknown[] = [];
     let didClearRequestContext = false;
 
     const response = await executeAppRouteHandler({
@@ -293,6 +353,81 @@ describe("app route handler execution helpers", () => {
     expect(didClearRequestContext).toBe(true);
     expect(reportCalls).toEqual([]);
   });
+
+  it.each(["CDN-Cache-Control", "Cloudflare-CDN-Cache-Control"])(
+    "preserves handler-owned %s instead of applying framework revalidation",
+    async (policyHeader) => {
+      const adapter: CdnCacheAdapter = {
+        buildResponseHeaders: ({ cacheControl }) => ({ "Cache-Control": cacheControl }),
+        async get() {
+          return null;
+        },
+        responsePolicy: {
+          hasExplicitNonCacheablePolicy(headers) {
+            return headers.get(policyHeader)?.includes("no-store") === true;
+          },
+          isHeader(name) {
+            return name.toLowerCase() === policyHeader.toLowerCase();
+          },
+          readCacheControl(headers) {
+            return headers.get(policyHeader) ?? headers.get("Cache-Control");
+          },
+        },
+        ownsBackgroundRevalidation: false,
+        async revalidateTag() {},
+        async set() {},
+      };
+      setCdnCacheAdapter(adapter);
+      const dynamicUsage = createDynamicUsageState();
+      const isrSet = vi.fn();
+      const response = await executeAppRouteHandler({
+        buildPageCacheTags() {
+          return [];
+        },
+        cleanPathname: "/api/provider-private",
+        clearRequestContext() {},
+        consumeDynamicUsage: dynamicUsage.consumeDynamicUsage,
+        executionContext: null,
+        getAndClearPendingCookies() {
+          return [];
+        },
+        getCollectedFetchTags() {
+          return [];
+        },
+        getDraftModeCookieHeader() {
+          return null;
+        },
+        handler: { dynamic: "auto", revalidate: 60 },
+        handlerFn() {
+          return new Response("private", {
+            headers: { [policyHeader]: "private, no-store" },
+          });
+        },
+        isAutoHead: false,
+        isProduction: true,
+        isrRouteKey(pathname) {
+          return pathname;
+        },
+        isrSet,
+        markDynamicUsage: dynamicUsage.markDynamicUsage,
+        method: "GET",
+        middlewareContext: { headers: null, status: null },
+        params: null,
+        reportRequestError() {},
+        request: new Request("https://example.com/api/provider-private"),
+        revalidateSeconds: 60,
+        routePattern: "/api/provider-private",
+        setHeadersAccessPhase() {
+          return "render";
+        },
+      });
+
+      expect(response.headers.get(policyHeader)).toBe("private, no-store");
+      expect(response.headers.get("cache-control")).toBeNull();
+      expect(isrSet).not.toHaveBeenCalled();
+      await expect(response.text()).resolves.toBe("private");
+    },
+  );
 
   it.each([
     { enabled: true, initialDraftMode: false, expectedCookie: "__prerender_bypass=draft-secret" },
@@ -520,10 +655,357 @@ describe("app route handler execution helpers", () => {
     });
 
     expect(isKnownDynamicAppRoute(routePattern)).toBe(true);
-    expect(response.headers.get("cache-control")).toBeNull();
+    expect(response.headers.get("cache-control")).toContain("no-store");
     expect(response.headers.get("x-vinext-cache")).toBeNull();
     expect(wroteCache).toBe(false);
     await expect(response.json()).resolves.toEqual({ ping: "from-header" });
+  });
+
+  it("preserves a handler-owned public policy outside CDN admission", async () => {
+    const dynamicUsage = createDynamicUsageState();
+    const response = await executeAppRouteHandler({
+      buildPageCacheTags() {
+        return [];
+      },
+      cleanPathname: "/api/custom-cache-late-dynamic",
+      clearRequestContext() {},
+      consumeDynamicUsage: dynamicUsage.consumeDynamicUsage,
+      executionContext: null,
+      getAndClearPendingCookies() {
+        return [];
+      },
+      getCollectedFetchTags() {
+        return [];
+      },
+      getDraftModeCookieHeader() {
+        return null;
+      },
+      handler: { dynamic: "auto", revalidate: 60 },
+      handlerFn(request) {
+        return new Response(
+          new ReadableStream<Uint8Array>(
+            {
+              pull(controller) {
+                controller.enqueue(
+                  new TextEncoder().encode(request.headers.get("x-tenant") ?? "missing"),
+                );
+                controller.close();
+              },
+            },
+            { highWaterMark: 0 },
+          ),
+          { headers: { "Cache-Control": "public, s-maxage=60" } },
+        );
+      },
+      isAutoHead: false,
+      isProduction: true,
+      isrRouteKey(pathname) {
+        return pathname;
+      },
+      async isrSet() {
+        throw new Error("dynamic response must not be persisted");
+      },
+      markDynamicUsage: dynamicUsage.markDynamicUsage,
+      method: "GET",
+      middlewareContext: { headers: null, status: null },
+      params: null,
+      reportRequestError() {},
+      request: new Request("https://example.com/api/custom-cache-late-dynamic", {
+        headers: { "x-tenant": "tenant-a" },
+      }),
+      revalidateSeconds: 60,
+      routePattern: "/api/custom-cache-late-dynamic",
+      setHeadersAccessPhase() {
+        return "render";
+      },
+    });
+
+    expect(response.headers.get("cache-control")).toBe("public, s-maxage=60");
+    await expect(response.text()).resolves.toBe("tenant-a");
+  });
+
+  it("records clean completion for an otherwise unconfigured GET during adapter admission", async () => {
+    const request = new Request("https://example.com/api/config-cache", {
+      headers: { "x-tenant": "tenant-a" },
+    });
+    const context = createWorkerCacheabilityAdmissionContext(
+      { waitUntil() {} },
+      request,
+      null,
+      "build-a",
+      true,
+    );
+    const state = Reflect.get(context, CACHEABILITY_REQUEST_STATE) as RouteCacheabilityState;
+    const dynamicUsage = createDynamicUsageState();
+
+    const response = await runWithExecutionContext(context, () =>
+      executeAppRouteHandler({
+        buildPageCacheTags() {
+          return [];
+        },
+        cleanPathname: "/api/config-cache",
+        clearRequestContext() {},
+        consumeDynamicUsage: dynamicUsage.consumeDynamicUsage,
+        executionContext: null,
+        getAndClearPendingCookies() {
+          return [];
+        },
+        getCollectedFetchTags() {
+          return [];
+        },
+        getDraftModeCookieHeader() {
+          return null;
+        },
+        handler: { dynamic: "auto" },
+        handlerFn() {
+          return new Response(
+            new ReadableStream<Uint8Array>(
+              {
+                pull(controller) {
+                  controller.enqueue(new TextEncoder().encode("reusable"));
+                  controller.close();
+                },
+              },
+              { highWaterMark: 0 },
+            ),
+          );
+        },
+        isAutoHead: false,
+        isProduction: true,
+        isrRouteKey(pathname) {
+          return pathname;
+        },
+        async isrSet() {
+          throw new Error("dynamic response must not be persisted");
+        },
+        markDynamicUsage: dynamicUsage.markDynamicUsage,
+        method: "GET",
+        middlewareContext: { headers: null, status: null },
+        params: null,
+        reportRequestError() {},
+        request,
+        revalidateSeconds: null,
+        routePattern: "/api/config-cache",
+        setHeadersAccessPhase() {
+          return "render";
+        },
+      }),
+    );
+
+    expect(state.completedResponseBody).toBe(true);
+    expect(state.finalResponseVetoReason).toBeUndefined();
+    await expect(response.text()).resolves.toBe("reusable");
+  });
+
+  it("preserves an explicit public policy after dynamic reads complete during admission", async () => {
+    const request = new Request("https://example.com/api/explicit-dynamic", {
+      headers: { "x-tenant": "tenant-a" },
+    });
+    const context = createWorkerCacheabilityAdmissionContext(
+      { waitUntil() {} },
+      request,
+      null,
+      "build-a",
+      true,
+    );
+    const state = Reflect.get(context, CACHEABILITY_REQUEST_STATE) as RouteCacheabilityState;
+    state.route = { kind: "app-route", pattern: "/api/explicit-dynamic" };
+    const dynamicUsage = createDynamicUsageState();
+
+    const executed = await runWithExecutionContext(context, () =>
+      executeAppRouteHandler({
+        buildPageCacheTags() {
+          return [];
+        },
+        cleanPathname: "/api/explicit-dynamic",
+        clearRequestContext() {},
+        consumeDynamicUsage: dynamicUsage.consumeDynamicUsage,
+        executionContext: null,
+        getAndClearPendingCookies() {
+          return [];
+        },
+        getCollectedFetchTags() {
+          return [];
+        },
+        getDraftModeCookieHeader() {
+          return null;
+        },
+        handler: { dynamic: "auto", revalidate: 60 },
+        handlerFn(trackedRequest) {
+          return Response.json(
+            { tenant: trackedRequest.headers.get("x-tenant") },
+            { headers: { "Cache-Control": "public, s-maxage=60" } },
+          );
+        },
+        isAutoHead: false,
+        isProduction: true,
+        isrRouteKey(pathname) {
+          return pathname;
+        },
+        async isrSet() {
+          throw new Error("dynamic response must not enter origin ISR");
+        },
+        markDynamicUsage: dynamicUsage.markDynamicUsage,
+        method: "GET",
+        middlewareContext: { headers: null, status: null },
+        params: null,
+        reportRequestError() {},
+        request,
+        revalidateSeconds: 60,
+        routePattern: "/api/explicit-dynamic",
+        setHeadersAccessPhase() {
+          return "render";
+        },
+      }),
+    );
+
+    expect(state.explicitResponseCachePolicy).toBe(true);
+    expect(state.completedResponseBody).toBeUndefined();
+    const response = await finalizeWorkerCacheabilityResponse(executed, context);
+    expect(response.headers.get("cache-control")).toBe("public, s-maxage=60");
+    await expect(response.json()).resolves.toEqual({ tenant: "tenant-a" });
+  });
+
+  it("records handler-owned public policy separately from framework revalidate policy", async () => {
+    async function executeWithHeaders(headers?: HeadersInit) {
+      const request = new Request("https://example.com/api/mixed-methods");
+      const context = createWorkerCacheabilityAdmissionContext(
+        { waitUntil() {} },
+        request,
+        JSON.stringify({ buildId: "build-a", routes: {}, version: 1 }),
+        "build-a",
+      );
+      const state = Reflect.get(context, CACHEABILITY_REQUEST_STATE) as RouteCacheabilityState;
+      const dynamicUsage = createDynamicUsageState();
+
+      await runWithExecutionContext(context, () =>
+        executeAppRouteHandler({
+          buildPageCacheTags() {
+            return [];
+          },
+          cleanPathname: "/api/mixed-methods",
+          clearRequestContext() {},
+          consumeDynamicUsage: dynamicUsage.consumeDynamicUsage,
+          executionContext: null,
+          getAndClearPendingCookies() {
+            return [];
+          },
+          getCollectedFetchTags() {
+            return [];
+          },
+          getDraftModeCookieHeader() {
+            return null;
+          },
+          handler: { dynamic: "auto", revalidate: 60 },
+          handlerFn() {
+            return new Response("reusable", { headers });
+          },
+          isAutoHead: false,
+          isProduction: true,
+          isrRouteKey(pathname) {
+            return pathname;
+          },
+          async isrSet() {},
+          markDynamicUsage: dynamicUsage.markDynamicUsage,
+          method: "GET",
+          middlewareContext: { headers: null, status: null },
+          params: null,
+          reportRequestError() {},
+          request,
+          revalidateSeconds: 60,
+          routePattern: "/api/mixed-methods",
+          setHeadersAccessPhase() {
+            return "render";
+          },
+        }),
+      );
+      return state;
+    }
+
+    await expect(executeWithHeaders()).resolves.not.toHaveProperty("explicitResponseCachePolicy");
+    await expect(
+      executeWithHeaders({ "Cache-Control": "public, s-maxage=60" }),
+    ).resolves.toHaveProperty("explicitResponseCachePolicy", true);
+  });
+
+  it("falls back to private streaming and defers cleanup when completion times out", async () => {
+    const request = new Request("https://example.com/api/large", {
+      headers: { Accept: "*/*" },
+    });
+    const context = createWorkerCacheabilityAdmissionContext(
+      { waitUntil() {} },
+      request,
+      null,
+      "build-a",
+      true,
+    );
+    const state = Reflect.get(context, CACHEABILITY_REQUEST_STATE) as RouteCacheabilityState;
+    state.captureDeadlineAt = Date.now() + 5;
+    let cleared = false;
+    const phaseCalls: string[] = [];
+
+    const response = await runWithExecutionContext(context, () =>
+      executeAppRouteHandler({
+        buildPageCacheTags() {
+          return [];
+        },
+        cleanPathname: "/api/large",
+        clearRequestContext() {
+          cleared = true;
+        },
+        consumeDynamicUsage() {
+          return false;
+        },
+        executionContext: null,
+        getAndClearPendingCookies() {
+          return [];
+        },
+        getCollectedFetchTags() {
+          return [];
+        },
+        getDraftModeCookieHeader() {
+          return null;
+        },
+        handler: { dynamic: "auto", revalidate: 60 },
+        handlerFn() {
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              async pull(controller) {
+                await new Promise((resolve) => setTimeout(resolve, 20));
+                controller.enqueue(new TextEncoder().encode("slow"));
+                controller.close();
+              },
+            }),
+          );
+        },
+        isAutoHead: false,
+        isProduction: true,
+        isrRouteKey(pathname) {
+          return pathname;
+        },
+        async isrSet() {
+          throw new Error("incomplete response must not be persisted");
+        },
+        markDynamicUsage() {},
+        method: "GET",
+        middlewareContext: { headers: null, status: null },
+        params: null,
+        reportRequestError() {},
+        request,
+        revalidateSeconds: 60,
+        routePattern: "/api/large",
+        setHeadersAccessPhase(phase) {
+          phaseCalls.push(phase);
+          return "render";
+        },
+      }),
+    );
+
+    expect(cleared).toBe(false);
+    expect(response.headers.get("cache-control")).toContain("no-store");
+    await expect(response.text()).resolves.toBe("slow");
+    expect(cleared).toBe(true);
+    expect(phaseCalls).toEqual(["route-handler", "render"]);
   });
 
   it("applies the draft cache policy to responses with immutable headers", async () => {
@@ -584,89 +1066,101 @@ describe("app route handler execution helpers", () => {
 
   // Route Handler revalidation is finalized by Next.js' App Route module:
   // packages/next/src/server/route-modules/app-route/module.ts
-  it("finishes tag invalidation before finalizing a route handler response", async () => {
-    const dynamicUsage = createDynamicUsageState();
-    const previousHandler = getDataCacheHandler();
-    let markInvalidationStarted!: () => void;
-    const invalidationStarted = new Promise<void>((resolve) => {
-      markInvalidationStarted = resolve;
-    });
-    let releaseInvalidation!: () => void;
-    const invalidationGate = new Promise<void>((resolve) => {
-      releaseInvalidation = resolve;
-    });
-    let invalidationFinished = false;
-    let didClearRequestContext = false;
+  it.each([
+    { handlerFails: false, expectedStatus: 200 },
+    { handlerFails: true, expectedStatus: 500 },
+  ])(
+    "finishes tag invalidation before finalizing a route handler response ($handlerFails)",
+    async ({ handlerFails, expectedStatus }) => {
+      const dynamicUsage = createDynamicUsageState();
+      const previousHandler = getDataCacheHandler();
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      let markInvalidationStarted!: () => void;
+      const invalidationStarted = new Promise<void>((resolve) => {
+        markInvalidationStarted = resolve;
+      });
+      let releaseInvalidation!: () => void;
+      const invalidationGate = new Promise<void>((resolve) => {
+        releaseInvalidation = resolve;
+      });
+      let invalidationFinished = false;
+      let didClearRequestContext = false;
 
-    setDataCacheHandler({
-      get: previousHandler.get.bind(previousHandler),
-      set: previousHandler.set.bind(previousHandler),
-      async revalidateTag() {
-        markInvalidationStarted();
-        await invalidationGate;
-        invalidationFinished = true;
-      },
-    });
+      setDataCacheHandler({
+        get: previousHandler.get.bind(previousHandler),
+        set: previousHandler.set.bind(previousHandler),
+        async revalidateTag() {
+          markInvalidationStarted();
+          await invalidationGate;
+          expect(activeRouteSpanCount).toBe(0);
+          invalidationFinished = true;
+        },
+      });
 
-    try {
-      const responsePromise = runWithRequestContext(createRequestContext(), () =>
-        executeAppRouteHandler({
-          buildPageCacheTags(pathname, extraTags) {
-            return [pathname, ...extraTags];
-          },
-          cleanPathname: "/api/revalidate",
-          clearRequestContext() {
-            expect(invalidationFinished).toBe(true);
-            didClearRequestContext = true;
-          },
-          consumeDynamicUsage: dynamicUsage.consumeDynamicUsage,
-          executionContext: null,
-          getAndClearPendingCookies() {
-            return [];
-          },
-          getCollectedFetchTags() {
-            return [];
-          },
-          getDraftModeCookieHeader() {
-            return null;
-          },
-          handler: { dynamic: "auto" },
-          handlerFn() {
-            expect(revalidateTag("dashboard", { expire: 0 })).toBeUndefined();
-            return new Response("revalidated");
-          },
-          isAutoHead: false,
-          isProduction: true,
-          isrRouteKey(pathname) {
-            return "route:" + pathname;
-          },
-          async isrSet() {},
-          markDynamicUsage: dynamicUsage.markDynamicUsage,
-          method: "POST",
-          middlewareContext: { headers: null, status: null },
-          params: {},
-          reportRequestError() {},
-          request: new Request("https://example.com/api/revalidate", { method: "POST" }),
-          revalidateSeconds: null,
-          routePattern: "/api/revalidate",
-          setHeadersAccessPhase() {
-            return "render";
-          },
-        }),
-      );
+      try {
+        const responsePromise = runWithRequestContext(createRequestContext(), () =>
+          executeAppRouteHandler({
+            buildPageCacheTags(pathname, extraTags) {
+              return [pathname, ...extraTags];
+            },
+            cleanPathname: "/api/revalidate",
+            clearRequestContext() {
+              expect(invalidationFinished).toBe(true);
+              didClearRequestContext = true;
+            },
+            consumeDynamicUsage: dynamicUsage.consumeDynamicUsage,
+            executionContext: null,
+            getAndClearPendingCookies() {
+              return [];
+            },
+            getCollectedFetchTags() {
+              return [];
+            },
+            getDraftModeCookieHeader() {
+              return null;
+            },
+            handler: { dynamic: "auto" },
+            handlerFn() {
+              expect(revalidateTag("dashboard", { expire: 0 })).toBeUndefined();
+              if (handlerFails) throw new Error("handler failed after revalidation");
+              return new Response("revalidated");
+            },
+            isAutoHead: false,
+            isProduction: true,
+            isrRouteKey(pathname) {
+              return "route:" + pathname;
+            },
+            async isrSet() {},
+            markDynamicUsage: dynamicUsage.markDynamicUsage,
+            method: "POST",
+            middlewareContext: { headers: null, status: null },
+            params: {},
+            reportRequestError() {},
+            request: new Request("https://example.com/api/revalidate", { method: "POST" }),
+            revalidateSeconds: null,
+            routePattern: "/api/revalidate",
+            setHeadersAccessPhase() {
+              return "render";
+            },
+          }),
+        );
 
-      await invalidationStarted;
-      expect(didClearRequestContext).toBe(false);
-      releaseInvalidation();
+        await invalidationStarted;
+        await expect.poll(() => activeRouteSpanCount).toBe(0);
+        expect(didClearRequestContext).toBe(false);
+        releaseInvalidation();
 
-      const response = await responsePromise;
-      expect(didClearRequestContext).toBe(true);
-      await expect(response.text()).resolves.toBe("revalidated");
-    } finally {
-      releaseInvalidation();
-      setDataCacheHandler(previousHandler);
-    }
-  });
+        const response = await responsePromise;
+        expect(didClearRequestContext).toBe(true);
+        expect(response.status).toBe(expectedStatus);
+        await expect(response.text()).resolves.toBe(handlerFails ? "" : "revalidated");
+      } finally {
+        releaseInvalidation();
+        errorSpy.mockRestore();
+        setDataCacheHandler(previousHandler);
+      }
+    },
+  );
 
   it("skips cache writes and marks the route dynamic when a revalidating handler fetches with no-store", async () => {
     // Regression test for the patched fetch's explicit no-store branch
@@ -743,7 +1237,7 @@ describe("app route handler execution helpers", () => {
       expect(fetchMock.mock.calls[0]?.[1]?.cache).toBe("no-store");
       expect(isKnownDynamicAppRoute(routePattern)).toBe(true);
       expect(wroteCache).toBe(false);
-      expect(response.headers.get("cache-control")).toBeNull();
+      expect(response.headers.get("cache-control")).toContain("no-store");
       expect(response.headers.get("x-vinext-cache")).toBeNull();
       await expect(response.json()).resolves.toEqual({ ok: true });
     } finally {
@@ -754,9 +1248,10 @@ describe("app route handler execution helpers", () => {
 
   it("maps special route handler errors and reports generic failures", async () => {
     const dynamicUsage = createDynamicUsageState();
-    const reportedErrors: Error[] = [];
+    const reportedErrors: unknown[] = [];
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
+    recordedRouteSpans.length = 0;
     const redirectResponse = await executeAppRouteHandler({
       buildPageCacheTags(pathname, extraTags) {
         return [pathname, ...extraTags];
@@ -790,6 +1285,7 @@ describe("app route handler execution helpers", () => {
       middlewareContext: { headers: null, status: null },
       params: {},
       reportRequestError(error) {
+        expect(activeRouteSpanCount).toBe(0);
         reportedErrors.push(error);
       },
       request: new Request("https://example.com/api/redirect"),
@@ -806,8 +1302,20 @@ describe("app route handler execution helpers", () => {
       "private, no-cache, no-store, max-age=0, must-revalidate",
     );
     expect(reportedErrors).toEqual([]);
+    expect(recordedRouteSpans).toContainEqual({
+      errors: [],
+      type: "AppRouteRouteHandlers.runHandler",
+    });
 
-    const errorResponse = await executeAppRouteHandler({
+    let finishReporting!: () => void;
+    const reportingFinished = new Promise<void>((resolve) => {
+      finishReporting = resolve;
+    });
+    const reportRequestError = vi.fn(() => reportingFinished);
+    const failure = new Error("boom");
+    recordedRouteSpans.length = 0;
+    let responseSettled = false;
+    const errorResponsePromise = executeAppRouteHandler({
       buildPageCacheTags(pathname, extraTags) {
         return [pathname, ...extraTags];
       },
@@ -826,7 +1334,7 @@ describe("app route handler execution helpers", () => {
       },
       handler: { dynamic: "auto" },
       handlerFn() {
-        throw new Error("boom");
+        throw failure;
       },
       isAutoHead: false,
       isProduction: true,
@@ -838,19 +1346,42 @@ describe("app route handler execution helpers", () => {
       method: "GET",
       middlewareContext: { headers: null, status: null },
       params: {},
-      reportRequestError(error) {
-        reportedErrors.push(error);
-      },
+      reportRequestError,
       request: new Request("https://example.com/api/error"),
       revalidateSeconds: 60,
+      revalidateReason: "on-demand",
       routePattern: "/api/error",
       setHeadersAccessPhase() {
         return "render";
       },
+    }).then((response) => {
+      responseSettled = true;
+      return response;
     });
 
+    // Ported from Next.js: packages/next/src/build/templates/app-route.ts
+    // https://github.com/vercel/next.js/blob/canary/packages/next/src/build/templates/app-route.ts
+    await vi.waitFor(() => expect(reportRequestError).toHaveBeenCalledOnce());
+    expect(responseSettled).toBe(false);
+    finishReporting();
+    const errorResponse = await errorResponsePromise;
+
     expect(errorResponse.status).toBe(500);
-    expect(reportedErrors.map((error) => error.message)).toEqual(["boom"]);
+    expect(reportRequestError).toHaveBeenCalledWith(
+      expect.objectContaining({ message: "boom" }),
+      expect.objectContaining({ path: "/api/error" }),
+      {
+        routerKind: "App Router",
+        routePath: "/api/error",
+        routeType: "route",
+        revalidateReason: "on-demand",
+      },
+    );
+    expect(recordedRouteSpans).toContainEqual({
+      errors: [failure],
+      status: "boom",
+      type: "AppRouteRouteHandlers.runHandler",
+    });
 
     errorSpy.mockRestore();
   });
@@ -880,10 +1411,11 @@ describe("app route handler execution helpers", () => {
     try {
       for (const testCase of cases) {
         const dynamicUsage = createDynamicUsageState();
-        const reportedErrors: Error[] = [];
+        const reportedErrors: unknown[] = [];
         let wroteCache = false;
         let didClearRequestContext = false;
 
+        recordedRouteSpans.length = 0;
         const response = await executeAppRouteHandler({
           buildPageCacheTags(pathname, extraTags) {
             return [pathname, ...extraTags];
@@ -922,6 +1454,7 @@ describe("app route handler execution helpers", () => {
           middlewareContext: { headers: null, status: null },
           params: {},
           reportRequestError(error) {
+            expect(activeRouteSpanCount).toBe(0);
             reportedErrors.push(error);
           },
           request: new Request("https://example.com/api/middleware-control"),
@@ -934,8 +1467,14 @@ describe("app route handler execution helpers", () => {
 
         expect(response.status).toBe(500);
         await expect(response.text()).resolves.toBe("");
-        expect(reportedErrors.map((error) => error.message)).toEqual([testCase.message]);
+        expect(
+          reportedErrors.map((error) => (error instanceof Error ? error.message : String(error))),
+        ).toEqual([testCase.message]);
         expect(wroteCache).toBe(false);
+        expect(recordedRouteSpans).toContainEqual({
+          errors: [],
+          type: "AppRouteRouteHandlers.runHandler",
+        });
         expect(didClearRequestContext).toBe(true);
       }
     } finally {
