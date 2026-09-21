@@ -53,9 +53,8 @@ describe("App Router Production server self-hosted next/font/google headers", ()
     // (which used to bake the filesystem path into the cached CSS).
     // The mocked CSS MUST contain `https://fonts.gstatic.com/...` URLs
     // so `fetchAndCacheFont`'s regex extracts them and triggers the
-    // `css.split(fontUrl).join(filePath)` rewrite that was the source
-    // of the bug. Returning CSS with already-relative URLs would sidestep
-    // the failure mode.
+    // local-url rewrite. Returning CSS with already-relative URLs would
+    // sidestep that code path.
     const originalFetch = globalThis.fetch;
     // Normalize every `fetch()` input shape to a plain URL string so the
     // mock can match by substring. The build plugin currently always

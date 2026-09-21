@@ -1399,6 +1399,68 @@ describe("fetchAndCacheFont", () => {
     // Should reference local file paths, not googleapis.com CDN
     expect(result.code).not.toContain("fonts.gstatic.com");
     expect(result.code).toContain(".woff2");
+    expect(result.code).toContain("/_next/static/_vinext_fonts/");
+    const canonicalRoot = root.replaceAll("\\", "/");
+    expect(result.code).not.toContain(canonicalRoot);
+
+    const cacheDir = path.join(root, ".vinext", "fonts");
+    const dirs = fs.readdirSync(cacheDir);
+    const interDir = dirs.find((d: string) => d.startsWith("inter-"));
+    expect(interDir).toBeDefined();
+    const style = fs.readFileSync(path.join(cacheDir, interDir!, "style.css"), "utf-8");
+    expect(style).toContain("/.vinext/fonts/");
+    expect(style).not.toContain("fonts.gstatic.com");
+    expect(style).not.toContain(canonicalRoot);
+  }, 15000);
+
+  it("embeds served URLs from a relocated-checkout cache that still has absolute paths", async () => {
+    // Pre-fix caches wrote `path.join(cacheDir, filename)` into style.css.
+    // After the project directory moves, that prefix no longer equals the
+    // current cacheDir, so split(cacheDir) used to leave the old path in
+    // selfHostedCSS. Next.js never emits the build machine path:
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/next-font/index.test.ts
+    const plugin1 = getGoogleFontsPlugin();
+    initPlugin(plugin1, { command: "build", root });
+
+    mockGoogleFontsCSS(
+      [
+        "@font-face {",
+        "  font-family: 'Inter';",
+        "  src: url(https://fonts.gstatic.com/s/inter/v19/inter-latin-400.woff2) format('woff2');",
+        "}",
+      ].join("\n"),
+    );
+    mockGoogleFontFiles();
+
+    const transform1 = unwrapHook(plugin1.transform);
+    const code = [
+      `import { Inter } from 'next/font/google';`,
+      `const inter = Inter({ weight: ['400'], subsets: ['latin'] });`,
+    ].join("\n");
+
+    await transform1.call(plugin1, code, "/app/layout.tsx");
+
+    const cacheDir = path.join(root, ".vinext", "fonts");
+    const dirs = fs.readdirSync(cacheDir);
+    const interDir = dirs.find((d: string) => d.startsWith("inter-"));
+    expect(interDir).toBeDefined();
+    const stylePath = path.join(cacheDir, interDir!, "style.css");
+    const portable = fs.readFileSync(stylePath, "utf-8");
+    const stale = portable.replaceAll("/.vinext/fonts", "/old/checkout/.vinext/fonts");
+    expect(stale).toContain("/old/checkout/.vinext/fonts");
+    fs.writeFileSync(stylePath, stale);
+
+    const plugin2 = getGoogleFontsPlugin();
+    initPlugin(plugin2, { command: "build", root });
+    const result = await unwrapHook(plugin2.transform).call(plugin2, code, "/app/layout.tsx");
+    expect(result).not.toBeNull();
+    expect(result.code).toContain("/_next/static/_vinext_fonts/");
+    expect(result.code).not.toContain("/old/checkout");
+    expect(result.code).not.toContain(root.replaceAll("\\", "/"));
+    // On-disk cache is healed to the portable prefix so the next machine
+    // does not keep carrying the stale absolute path.
+    expect(fs.readFileSync(stylePath, "utf-8")).toContain("/.vinext/fonts/");
+    expect(fs.readFileSync(stylePath, "utf-8")).not.toContain("/old/checkout");
   }, 15000);
 
   it("reuses cached CSS on filesystem", async () => {
@@ -1430,11 +1492,16 @@ describe("_rewriteCachedFontCssToServedUrls", () => {
   // same leaked filesystem path. In production this caused high-priority
   // 404s (`<origin>/home/user/project/.vinext/fonts/...`) on every request.
   //
-  // The fix replaces the cache-dir prefix with the served URL namespace
-  // `/_next/static/_vinext_fonts` before the CSS string is handed off to
-  // the bundle. The plugin's writeBundle hook then copies the cached font
-  // files into the matching `dist/client/_next/static/_vinext_fonts/`
-  // location so the rewritten URLs actually resolve against the origin.
+  // The fix replaces the cache-dir prefix (current, portable, or stale
+  // relocated) with the served URL namespace `/_next/static/_vinext_fonts`
+  // before the CSS string is handed off to the bundle. The plugin's
+  // writeBundle hook then copies the cached font files into the matching
+  // `dist/client/_next/static/_vinext_fonts/` location so the rewritten
+  // URLs actually resolve against the origin.
+  //
+  // Next.js emits font URLs under /_next/static/media rather than leaking
+  // the build machine's filesystem path:
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/next-font/index.test.ts
 
   it("rewrites absolute cache-dir paths in url() references to served URLs", () => {
     const cacheDir = "/home/user/project/.vinext/fonts";
@@ -1525,12 +1592,66 @@ describe("_rewriteCachedFontCssToServedUrls", () => {
     );
   });
 
-  it("is a no-op when cacheDir is empty", () => {
+  it("does not split on an empty cacheDir (would insert the prefix between every character)", () => {
     // Defensive guard: before Vite's configResolved hook runs, `cacheDir`
     // is the empty string. A naive split/join on "" would insert the URL
     // namespace between every character in the CSS.
-    const css = "src: url(/home/user/project/.vinext/fonts/geist/a.woff2);";
+    const css = "src: url(/other/fonts/geist/a.woff2);";
     expect(rewriteCachedFontCssToServedUrls(css, "")).toBe(css);
+  });
+
+  it("rewrites stale .vinext/fonts prefixes even when cacheDir is empty", () => {
+    const css = "src: url(/home/user/project/.vinext/fonts/geist/a.woff2);";
+    expect(rewriteCachedFontCssToServedUrls(css, "")).toBe(
+      "src: url(/_next/static/_vinext_fonts/geist/a.woff2);",
+    );
+  });
+
+  it("rewrites stale relocated cache prefixes that do not match the current cacheDir", () => {
+    const cacheDir = "/new/checkout/.vinext/fonts";
+    const css = "src: url(/old/checkout/.vinext/fonts/geist/a.woff2);";
+    const out = rewriteCachedFontCssToServedUrls(css, cacheDir);
+    expect(out).toBe("src: url(/_next/static/_vinext_fonts/geist/a.woff2);");
+    expect(out).not.toContain("/old/checkout");
+  });
+
+  it("rewrites a stale prefix that contains spaces and parentheses", () => {
+    // Walking back to the first `(` would stop inside `(1)` and leave
+    // `/tmp/build ` behind. The helper finds the enclosing `url(` instead.
+    const cacheDir = "/new/checkout/.vinext/fonts";
+    const css = "src: url(/tmp/build (1)/.vinext/fonts/inter-xyz/inter-abc.woff2);";
+    expect(rewriteCachedFontCssToServedUrls(css, cacheDir)).toBe(
+      "src: url(/_next/static/_vinext_fonts/inter-xyz/inter-abc.woff2);",
+    );
+  });
+
+  it("rewrites the portable /.vinext/fonts cache prefix", () => {
+    const cacheDir = "/new/checkout/.vinext/fonts";
+    const css = "src: url(/.vinext/fonts/geist/a.woff2);";
+    expect(rewriteCachedFontCssToServedUrls(css, cacheDir)).toBe(
+      "src: url(/_next/static/_vinext_fonts/geist/a.woff2);",
+    );
+  });
+
+  it("rewrites quoted url() values and Windows backslash caches from a previous machine", () => {
+    const cacheDir = "/new/checkout/.vinext/fonts";
+    const css = [
+      `src: url("/old/checkout/.vinext/fonts/geist/a.woff2");`,
+      String.raw`src: url(C:\old\checkout\.vinext\fonts\geist\b.woff2);`,
+      "src: url(file:///C:/old/checkout/.vinext/fonts/geist/c.woff2);",
+    ].join("\n");
+
+    const out = rewriteCachedFontCssToServedUrls(css, cacheDir);
+
+    expect(out).toBe(
+      [
+        'src: url("/_next/static/_vinext_fonts/geist/a.woff2");',
+        "src: url(/_next/static/_vinext_fonts/geist/b.woff2);",
+        "src: url(/_next/static/_vinext_fonts/geist/c.woff2);",
+      ].join("\n"),
+    );
+    expect(out).not.toContain("C:");
+    expect(out).not.toContain("/old/checkout");
   });
 
   it("uses a custom assetsDir when passed through from plugin state", () => {

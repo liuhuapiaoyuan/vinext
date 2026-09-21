@@ -82,9 +82,8 @@ const GOOGLE_FONT_UTILITY_EXPORTS = new Set([
  *
  * `fetchAndCacheFont()` downloads .woff2 files into `<root>/.vinext/fonts/`
  * and writes an `@font-face` CSS snippet whose `src: url(...)` references
- * the files by absolute filesystem path — convenient for disk, unusable at
- * runtime because browsers resolve relative to the origin. Before the CSS
- * is embedded in the bundle as `_vinext.font.selfHostedCSS`, the filesystem
+ * the files under the location-independent prefix `/.vinext/fonts/`. Before
+ * the CSS is embedded in the bundle as `_vinext.font.selfHostedCSS`, that
  * prefix is rewritten to this URL prefix by `_rewriteCachedFontCssToServedUrls()`,
  * and the matching `writeBundle` hook in `createGoogleFontsPlugin` copies
  * the font files into `<clientOutDir>/<assetsDir>/_vinext_fonts/` so the
@@ -95,6 +94,12 @@ const GOOGLE_FONT_UTILITY_EXPORTS = new Set([
  * user-provided public files.
  */
 const VINEXT_FONT_URL_NAMESPACE = "_vinext_fonts";
+/**
+ * On-disk portable prefix written into cached `@font-face` CSS. Must not
+ * include a project-root absolute path — those break as soon as the
+ * checkout is relocated, copied into Docker, or restored on CI.
+ */
+const VINEXT_FONT_CACHE_URL_PREFIX = "/.vinext/fonts";
 const MAX_GOOGLE_FONTS_ERROR_BODY_LENGTH = 500;
 
 function formatGoogleFontsErrorBody(body: string): string {
@@ -106,9 +111,8 @@ function formatGoogleFontsErrorBody(body: string): string {
 }
 
 /**
- * Rewrite absolute filesystem paths in cached Google Fonts CSS so the
- * `@font-face { src: url(...) }` references point at the served URL the
- * plugin's `writeBundle` hook copies the font files to.
+ * Rewrite cached Google Fonts CSS `src: url(...)` references so they point
+ * at the served URL the plugin's `writeBundle` hook copies the font files to.
  *
  * This is called once per transform, before the CSS string is embedded in
  * the bundle as `_vinext.font.selfHostedCSS`. Every downstream consumer reads
@@ -117,9 +121,18 @@ function formatGoogleFontsErrorBody(body: string): string {
  * in `shims/font-google-base.ts`), and the HTTP `Link:` response header
  * (via `buildAppPageFontLinkHeader` in `server/app-page-execution.ts`).
  *
- * Without this rewrite, all three emit the dev-machine filesystem path
+ * Without this rewrite, all three emit a filesystem path
  * (e.g. `/home/user/project/.vinext/fonts/geist-<hash>/geist-<hash>.woff2`)
  * and any production request fetches `<origin>/home/user/...` → 404.
+ *
+ * The helper must accept three on-disk shapes:
+ * - portable `/.vinext/fonts/<relative>` (current writer)
+ * - the current `cacheDir` absolute prefix
+ * - a *stale* absolute prefix from a relocated checkout / Docker / CI cache,
+ *   which still ends in `/.vinext/fonts` but does not equal `cacheDir`
+ *
+ * Matching only `split(cacheDir)` is not enough for the third shape: the
+ * cached `style.css` is reused as-is, and the old prefix never matches.
  *
  * `assetsDir` must match whatever Vite has resolved for
  * `build.assetsDir` on the client environment — otherwise the embedded
@@ -129,20 +142,94 @@ function formatGoogleFontsErrorBody(body: string): string {
  * passes the resolved value through from plugin state. The default is
  * kept only so the exported helper can be driven directly from unit
  * tests without synthesizing a full plugin context.
- *
- * Uses split/join rather than regex because `cacheDir` is an absolute
- * filesystem path that may contain regex metacharacters on unusual
- * filesystems.
  */
 export function _rewriteCachedFontCssToServedUrls(
   css: string,
   cacheDir: string,
   assetsDir: string = DEFAULT_ASSETS_DIR,
 ): string {
-  const normalizedCacheDir = toSlash(cacheDir);
-  if (!normalizedCacheDir || !css.includes(normalizedCacheDir)) return css;
+  return rewriteFontCachePrefixes(css, cacheDir, servedFontUrlPrefix(assetsDir));
+}
+
+function servedFontUrlPrefix(assetsDir: string): string {
   const prefix = assetsDir || DEFAULT_ASSETS_DIR;
-  return css.split(normalizedCacheDir).join(`/${prefix}/${VINEXT_FONT_URL_NAMESPACE}`);
+  return `/${prefix}/${VINEXT_FONT_URL_NAMESPACE}`;
+}
+
+/**
+ * Normalize CSS url() values that were written as filesystem paths so
+ * Windows backslash caches match the forward-slash `cacheDir` / marker.
+ * This is URL-space hygiene for cached `@font-face` CSS, not a filesystem
+ * conversion of source ids.
+ */
+function normalizeCssUrlSeparators(css: string): string {
+  if (!css.includes("\\")) return css;
+  return css.replaceAll("\\", "/");
+}
+
+/**
+ * Replace any `url(...)` path that contains `/.vinext/fonts` — including
+ * stale absolute prefixes from a relocated checkout — with `replacement`,
+ * preserving the relative suffix (`/geist-hash/file.woff2`).
+ *
+ * Finds the enclosing `url(` rather than walking character-by-character
+ * so paths containing spaces or parentheses (e.g. `/tmp/build (1)/.vinext/fonts`)
+ * still rewrite correctly. Does not use a constructed RegExp on `cacheDir`,
+ * which may contain regex metacharacters.
+ */
+function rewriteFontCacheUrlPrefixes(css: string, replacement: string): string {
+  const marker = VINEXT_FONT_CACHE_URL_PREFIX;
+  let out = css;
+  let searchFrom = 0;
+  while (true) {
+    const markerIdx = out.indexOf(marker, searchFrom);
+    if (markerIdx === -1) break;
+
+    const urlOpen = out.lastIndexOf("url(", markerIdx);
+    if (urlOpen === -1 || urlOpen < searchFrom) {
+      searchFrom = markerIdx + marker.length;
+      continue;
+    }
+
+    let pathStart = urlOpen + 4;
+    while (
+      pathStart < markerIdx &&
+      (out[pathStart] === " " ||
+        out[pathStart] === "\t" ||
+        out[pathStart] === "\n" ||
+        out[pathStart] === "\r")
+    ) {
+      pathStart++;
+    }
+    if (out[pathStart] === '"' || out[pathStart] === "'") {
+      pathStart++;
+    }
+
+    out = out.slice(0, pathStart) + replacement + out.slice(markerIdx + marker.length);
+    searchFrom = pathStart + replacement.length;
+  }
+  return out;
+}
+
+function rewriteFontCachePrefixes(css: string, cacheDir: string, replacement: string): string {
+  let out = normalizeCssUrlSeparators(css);
+  const normalizedCacheDir = toSlash(cacheDir).replace(/\/+$/, "");
+  // Exact current-cacheDir replace first. split/join is safe for paths that
+  // contain regex metacharacters; skip when cacheDir is empty so we never
+  // split on "" (which would insert `replacement` between every character).
+  if (normalizedCacheDir && out.includes(normalizedCacheDir)) {
+    out = out.split(normalizedCacheDir).join(replacement);
+  }
+  return rewriteFontCacheUrlPrefixes(out, replacement);
+}
+
+/**
+ * Convert cached CSS to the location-independent `/.vinext/fonts/<relative>`
+ * form so a relocated checkout's on-disk cache is healed, not just rewritten
+ * at embed time.
+ */
+function toPortableFontCacheCss(css: string, cacheDir: string): string {
+  return rewriteFontCachePrefixes(css, cacheDir, VINEXT_FONT_CACHE_URL_PREFIX);
 }
 
 /**
@@ -425,7 +512,7 @@ function propertyNameToGoogleFontFamily(prop: string): string {
  * @font-face CSS with local file references.
  *
  * Cache dir structure: .vinext/fonts/<family-hash>/
- *   - style.css (the rewritten @font-face CSS)
+ *   - style.css (`@font-face` CSS with portable `/.vinext/fonts/<relative>` urls)
  *   - *.woff2 (downloaded font files)
  */
 async function fetchAndCacheFont(
@@ -438,10 +525,21 @@ async function fetchAndCacheFont(
   const urlHash = createHash("md5").update(cssUrl).digest("hex").slice(0, 12);
   const fontDir = path.join(cacheDir, `${family.toLowerCase().replace(/\s+/g, "-")}-${urlHash}`);
 
-  // Check if already cached
+  // Check if already cached. Heal pre-fix caches that baked an absolute
+  // project path into style.css — those prefixes no longer match after
+  // the checkout is relocated, so embed-time split(cacheDir) would miss.
   const cachedCSSPath = path.join(fontDir, "style.css");
   if (fs.existsSync(cachedCSSPath)) {
-    return fs.readFileSync(cachedCSSPath, "utf-8");
+    const cached = fs.readFileSync(cachedCSSPath, "utf-8");
+    const portable = toPortableFontCacheCss(cached, cacheDir);
+    if (portable !== cached) {
+      try {
+        fs.writeFileSync(cachedCSSPath, portable);
+      } catch {
+        // Best-effort heal; embed-time rewrite still covers this request.
+      }
+    }
+    return portable;
   }
 
   // Fetch CSS from Google Fonts (woff2 user-agent gives woff2 URLs)
@@ -488,20 +586,19 @@ async function fetchAndCacheFont(
         fs.writeFileSync(filePath, buffer);
       }
     }
-    // Rewrite every remote Google Fonts CDN URL in the cached CSS to the
-    // absolute filesystem path of the locally-downloaded font file. This
-    // cache file is read back by the plugin and then run through
-    // `_rewriteCachedFontCssToServedUrls()` at embed time, which replaces
-    // the absolute `cacheDir` prefix with the served URL namespace under
-    // `/<assetsDir>/_vinext_fonts/`. The filesystem path is only the
-    // on-disk intermediate form — it must never reach the bundle, the
-    // injected `<style data-vinext-fonts>` block, the HTML `<link
-    // rel="preload">` tags, or the HTTP `Link:` response header. An
-    // earlier version of this code claimed "Vite will resolve /@fs/ for
+    // Rewrite every remote Google Fonts CDN URL to the location-independent
+    // cache prefix plus the path relative to `cacheDir`. Never write the
+    // absolute `filePath` — a relocated checkout, Docker COPY, or CI cache
+    // restore would leave a prefix that `split(currentCacheDir)` cannot
+    // match. `_rewriteCachedFontCssToServedUrls()` at embed time replaces
+    // `/.vinext/fonts` (and any stale absolute prefix still ending in it)
+    // with the served URL namespace under `/<assetsDir>/_vinext_fonts/`.
+    // An earlier version of this code claimed "Vite will resolve /@fs/ for
     // dev, or asset for build", which was never true: the CSS is
     // embedded as a JavaScript string literal and Vite's asset pipeline
     // does not scan string literals. Do not resurrect that assumption.
-    css = css.split(fontUrl).join(filePath);
+    const relative = toSlash(path.relative(cacheDir, filePath));
+    css = css.split(fontUrl).join(`${VINEXT_FONT_CACHE_URL_PREFIX}/${relative}`);
   }
 
   // Cache the rewritten CSS
@@ -902,8 +999,8 @@ export function createGoogleFontsPlugin(fontGoogleShimPath: string, shimsDir: st
             }
           }
 
-          // Rewrite absolute `.vinext/fonts/` filesystem paths in the cached
-          // CSS to served URLs under `/<assetsDir>/_vinext_fonts/` so the
+          // Rewrite `/.vinext/fonts/` cache prefixes (portable or stale
+          // absolute) to served URLs under `/<assetsDir>/_vinext_fonts/` so the
           // embedded `_vinext.font.selfHostedCSS` string has origin-relative URLs that
           // the browser can actually resolve. The plugin's writeBundle hook
           // copies the referenced font files to the matching location under
