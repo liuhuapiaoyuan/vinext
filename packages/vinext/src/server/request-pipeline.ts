@@ -564,15 +564,7 @@ export function rememberBufferedRequestBody(request: Request, body: Uint8Array):
 }
 
 function copyPrivateRequestMetadata(source: Request, target: Request): void {
-  const cf = getRequestCf(source);
-  if (cf !== undefined) {
-    // new Request() does not copy Workers-specific cf, so re-attach it.
-    Object.defineProperty(target, "cf", {
-      value: cf,
-      enumerable: true,
-      configurable: true,
-    });
-  }
+  attachRequestCfMetadata(target, source);
 
   const rawRequest = getRawNodeRequest(source);
   if (rawRequest !== undefined) {
