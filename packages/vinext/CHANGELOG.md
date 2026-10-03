@@ -1,5 +1,13 @@
 # vinext
 
+## 1.0.0-beta.0.34
+
+### Performance
+
+- **Build:** reduce RSC metadata and repeated scans
+- **Build:** memoize OG filesystem ownership lookups
+- **Build:** skip OG scans and cache asset boundaries
+
 ## 1.0.0-beta.0.33
 
 ### Performance
