@@ -70,6 +70,9 @@ export function createOgInlineFetchAssetsPlugin(): Plugin {
   // restarting the Vite server.
   const cache = new Map<string, string>(); // absPath -> base64
   const ownership = new OgAssetOwnership();
+  // One nested resolve per specifier. The same bare import is seen from every
+  // importer, and each `this.resolve` re-enters the full plugin pipeline.
+  const trackedSpecifiers = new Map<string, Promise<boolean>>();
   let isBuild = false;
 
   return {
@@ -85,16 +88,33 @@ export function createOgInlineFetchAssetsPlugin(): Plugin {
       if (isBuild) {
         cache.clear();
       }
+      trackedSpecifiers.clear();
       ownership.reset();
     },
 
-    async resolveId(source, importer, options) {
-      if (!ownership.shouldTrackImport(source)) return null;
+    resolveId: {
+      // Relative, absolute, and virtual ids are never package specifiers.
+      // Bare imports and aliases still enter the handler.
+      filter: { id: /^(?![./\0]|[A-Za-z]:[\\/])/ },
+      async handler(source, importer, options) {
+        if (!ownership.shouldTrackImport(source)) return null;
 
-      const resolved = await this.resolve(source, importer, { ...options, skipSelf: true });
-      if (resolved === null || resolved.external) return null;
-      await ownership.recordResolvedImport(source, resolved.id);
-      return null;
+        let pending = trackedSpecifiers.get(source);
+        if (pending === undefined) {
+          pending = (async () => {
+            const resolved = await this.resolve(source, importer, { ...options, skipSelf: true });
+            if (resolved === null || resolved.external) return false;
+            await ownership.recordResolvedImport(source, resolved.id);
+            return true;
+          })();
+          trackedSpecifiers.set(source, pending);
+        }
+        const tracked = await pending;
+        // A failed lookup can succeed from another importer. Drop it so the
+        // next one retries; a successful lookup stays cached for the pass.
+        if (!tracked) trackedSpecifiers.delete(source);
+        return null;
+      },
     },
 
     transform: {
