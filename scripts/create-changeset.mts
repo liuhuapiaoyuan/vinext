@@ -28,7 +28,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 type Bump = "major" | "minor" | "patch";
 
@@ -673,4 +673,4 @@ export function run(): { written: string | null; bumps: Record<string, Bump> } {
   return { written: filePath, bumps: pkgBumps };
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) run();
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) run();
