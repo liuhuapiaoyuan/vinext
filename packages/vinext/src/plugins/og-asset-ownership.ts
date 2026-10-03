@@ -145,10 +145,17 @@ export class OgAssetOwnership {
   // the lookup only depends on that pair and the configuration. Cleared with
   // the linked package roots on every reset and reconfigure.
   private readonly resolvedImportPackageRoots = new Map<string, Promise<string | null>>();
+  // Module boundaries are stable for a build. Cache only successful results so
+  // a linked package discovered by a later environment can still become an
+  // ownership root after an earlier lookup returned null.
+  private readonly moduleBoundaries = new Map<string, Promise<OgAssetModuleBoundary | null>>();
+  private readonly containedAssets = new Map<string, Promise<string | null>>();
 
   configure(projectRoot: string, aliases: readonly Alias[]): void {
     this.projectRoot = path.resolve(projectRoot);
     this.resolvedImportPackageRoots.clear();
+    this.moduleBoundaries.clear();
+    this.containedAssets.clear();
     this.dependencyPackageNames.clear();
     try {
       const manifest = JSON.parse(
@@ -189,6 +196,9 @@ export class OgAssetOwnership {
   reset(): void {
     this.linkedPackageRoots.clear();
     this.resolvedImportPackageRoots.clear();
+    // Keep positive module boundary results across the five RSC environments;
+    // they are independent of the per-environment linked package roots.
+    this.containedAssets.clear();
   }
 
   shouldTrackImport(source: string): boolean {
@@ -209,6 +219,20 @@ export class OgAssetOwnership {
   }
 
   async resolveModuleBoundary(moduleId: string): Promise<OgAssetModuleBoundary | null> {
+    const cacheKey = stripViteModuleQuery(moduleId);
+    const cached = this.moduleBoundaries.get(cacheKey);
+    if (cached !== undefined) return cached;
+
+    const pending = this.resolveModuleBoundaryUncached(moduleId);
+    this.moduleBoundaries.set(cacheKey, pending);
+    const boundary = await pending;
+    if (boundary === null) this.moduleBoundaries.delete(cacheKey);
+    return boundary;
+  }
+
+  private async resolveModuleBoundaryUncached(
+    moduleId: string,
+  ): Promise<OgAssetModuleBoundary | null> {
     const modulePath = path.resolve(stripViteModuleQuery(moduleId));
     let realProjectRoot: string;
     let realModulePath: string;
@@ -274,6 +298,21 @@ export class OgAssetOwnership {
   }
 
   async resolveContainedAsset(assetRoot: string, assetPath: string): Promise<string | null> {
+    const cacheKey = `${assetRoot}\0${assetPath}`;
+    const cached = this.containedAssets.get(cacheKey);
+    if (cached !== undefined) return cached;
+
+    const pending = this.resolveContainedAssetUncached(assetRoot, assetPath);
+    this.containedAssets.set(cacheKey, pending);
+    const resolved = await pending;
+    if (resolved === null) this.containedAssets.delete(cacheKey);
+    return resolved;
+  }
+
+  private async resolveContainedAssetUncached(
+    assetRoot: string,
+    assetPath: string,
+  ): Promise<string | null> {
     try {
       const realPath = await realpathNative(assetPath);
       return isPathInsideOrEqual(assetRoot, realPath) ? realPath : null;

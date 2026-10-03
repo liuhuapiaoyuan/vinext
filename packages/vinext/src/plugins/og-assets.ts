@@ -97,6 +97,10 @@ export function createOgInlineFetchAssetsPlugin(): Plugin {
       // Bare imports and aliases still enter the handler.
       filter: { id: /^(?![./\0]|[A-Za-z]:[\\/])/ },
       async handler(source, importer, options) {
+        // RSC reference scans only need the import graph. Asset ownership is
+        // consumed by the write-enabled bundles, and doing nested resolution
+        // here makes every scan retain extra resolver state for no output.
+        if (this.environment?.name && this.environment.config.build.write === false) return null;
         if (!ownership.shouldTrackImport(source)) return null;
 
         let pending = trackedSpecifiers.get(source);
@@ -120,6 +124,10 @@ export function createOgInlineFetchAssetsPlugin(): Plugin {
     transform: {
       filter: { code: "import.meta.url" },
       async handler(code, id) {
+        // Scan builds do not emit runnable code. Inlining fonts/WASM there
+        // only creates large base64 strings and MagicString results that live
+        // until the next environment, while it cannot affect import discovery.
+        if (this.environment?.name && this.environment.config.build.write === false) return null;
         const useCache = isBuild;
         const boundary = await ownership.resolveModuleBoundary(id);
         if (boundary === null) return null;
