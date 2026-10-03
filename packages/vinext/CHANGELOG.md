@@ -1,5 +1,11 @@
 # vinext
 
+## 1.0.0-beta.0.31
+
+### Performance
+
+- **Build:** cache OG specifier resolves and reuse action-owner graph walks
+
 ## 1.0.1
 
 ### Bug Fixes
