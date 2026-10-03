@@ -74,6 +74,7 @@ export function createOgInlineFetchAssetsPlugin(): Plugin {
   // importer, and each `this.resolve` re-enters the full plugin pipeline.
   const trackedSpecifiers = new Map<string, Promise<boolean>>();
   let isBuild = false;
+  let buildSessionStarted = false;
 
   return {
     name: "vinext:og-inline-fetch-assets",
@@ -85,11 +86,30 @@ export function createOgInlineFetchAssetsPlugin(): Plugin {
     },
 
     buildStart() {
-      if (isBuild) {
+      const environment = this.environment;
+      const isReferenceScan = environment?.config.build.write === false;
+      const startsAppBuild = environment?.name === "rsc" && isReferenceScan;
+      // plugin-rsc builds five environments in one process. The ownership
+      // roots and successful specifier resolutions are valid for all of the
+      // write-enabled environments after the initial scan, so clearing them
+      // at every environment boundary causes duplicate nested resolution and
+      // repeated filesystem walks. A scan-start marks the next full build;
+      // dev and standalone builds still get a fresh session on their first
+      // buildStart.
+      if (!isBuild || startsAppBuild || !buildSessionStarted) {
+        buildSessionStarted = true;
         cache.clear();
+        trackedSpecifiers.clear();
+        ownership.reset();
       }
-      trackedSpecifiers.clear();
-      ownership.reset();
+    },
+
+    buildEnd() {
+      // Allow a programmatic builder to start a new production build with a
+      // fresh ownership session after the final SSR environment completes.
+      if (this.environment?.name === "ssr" && this.environment.config.build.write !== false) {
+        buildSessionStarted = false;
+      }
     },
 
     resolveId: {

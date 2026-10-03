@@ -95,6 +95,19 @@ function memoizeModuleInfo(
   };
 }
 
+function memoizeModuleIdCanonicalizer(
+  canonicalizeModuleId: (id: string) => string,
+): (id: string) => string {
+  const cache = new Map<string, string>();
+  return (id) => {
+    const cached = cache.get(id);
+    if (cached !== undefined) return cached;
+    const canonicalId = canonicalizeModuleId(id);
+    cache.set(id, canonicalId);
+    return canonicalId;
+  };
+}
+
 export function collectReachableActionReferences(
   options: {
     canonicalizeModuleId?: (id: string) => string;
@@ -135,7 +148,8 @@ export function collectReachableActionReferences(
       ...(info?.importedIds ?? []),
       ...(info?.dynamicallyImportedIds ?? []),
     ]) {
-      if (!visited.has(importedId)) queue.push(importedId);
+      const canonicalId = canonicalizeModuleId(importedId);
+      if (!visited.has(canonicalId)) queue.push(canonicalId);
     }
   }
 
@@ -151,11 +165,14 @@ export function collectRscActionReachability(
   } & ActionOwnerReferenceMaps,
 ): ActionOwnerRouteReachability {
   const getModuleInfo = memoizeModuleInfo(options.getModuleInfo);
+  const canonicalizeModuleId = memoizeModuleIdCanonicalizer(
+    options.canonicalizeModuleId ?? ((id: string) => id),
+  );
   const routeReachability: ActionOwnerRouteReachability = new Map(
     options.routes.map((route) => [
       route.pattern,
       collectReachableActionReferences({
-        canonicalizeModuleId: options.canonicalizeModuleId,
+        canonicalizeModuleId,
         clientReferenceMetaMap: options.clientReferenceMetaMap,
         getModuleInfo,
         roots: actionOwnerRouteEntryIds(route),
@@ -167,7 +184,7 @@ export function collectRscActionReachability(
     routeReachability.set(
       "*",
       collectReachableActionReferences({
-        canonicalizeModuleId: options.canonicalizeModuleId,
+        canonicalizeModuleId,
         clientReferenceMetaMap: options.clientReferenceMetaMap,
         getModuleInfo,
         roots: options.sharedRoots,
@@ -223,9 +240,12 @@ export function addClientActionReachability(
   } & ActionOwnerReferenceMaps,
 ): void {
   const getModuleInfo = memoizeModuleInfo(options.getModuleInfo);
+  const canonicalizeModuleId = memoizeModuleIdCanonicalizer(
+    options.canonicalizeModuleId ?? ((id: string) => id),
+  );
   for (const reachability of options.routeReachability.values()) {
     const clientReachability = collectReachableActionReferences({
-      canonicalizeModuleId: options.canonicalizeModuleId,
+      canonicalizeModuleId,
       clientReferenceMetaMap: options.clientReferenceMetaMap,
       getModuleInfo,
       roots: [...reachability.clientReferenceImportIds],

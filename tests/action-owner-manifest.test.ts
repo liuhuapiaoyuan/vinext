@@ -223,12 +223,15 @@ describe("server action owner manifest", () => {
       canonicalizeModuleId: (id) => id.replace("/private/app", "/app"),
       getModuleInfo(id) {
         return id === "/app/page.tsx"
-          ? { importedIds: [], dynamicallyImportedIds: ["/private/app/action.ts"] }
+          ? {
+              importedIds: ["/private/app/action.ts"],
+              dynamicallyImportedIds: ["/private/app/action.ts"],
+            }
           : { importedIds: [], dynamicallyImportedIds: [] };
       },
       ...referenceMaps({
         servers: {
-          "/private/app/action.ts": { exportNames: ["submit"], referenceKey: "action" },
+          "/app/action.ts": { exportNames: ["submit"], referenceKey: "action" },
         },
       }),
       roots: ["/private/app/page.tsx"],

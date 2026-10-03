@@ -100,6 +100,7 @@ import {
 } from "./build/report.js";
 import { planRouteClassificationInjection } from "./build/route-classification-injector.js";
 import { createActionOwnerManifestPlugin } from "./plugins/action-owner-manifest.js";
+import { createRscBuildOptimizationsPlugin } from "./plugins/rsc-build-optimizations.js";
 import { normalizePathnameForRouteMatchStrict } from "./routing/utils.js";
 import { hasBasePath, stripBasePath } from "./utils/base-path.js";
 import {
@@ -8785,6 +8786,16 @@ export const loadServerActionClient = ${
     plugins.push(rscPluginPromise);
   }
   if (earlyAppDirExists) {
+    if (rscPluginPromise) {
+      plugins.push(
+        createRscBuildOptimizationsPlugin({
+          async getManager(config) {
+            const rscPluginModule = await rscPluginModulePromise;
+            return rscPluginModule?.getPluginApi(config)?.manager;
+          },
+        }),
+      );
+    }
     plugins.push(
       createActionOwnerManifestPlugin({
         canonicalizeModuleId: canonicalize,
