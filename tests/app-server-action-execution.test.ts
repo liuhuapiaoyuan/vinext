@@ -78,6 +78,26 @@ type TestActionModel = {
   root?: string;
 };
 
+function registerTestServerReference(value: unknown, id: string | null): unknown {
+  if (
+    typeof value !== "function" ||
+    id === null ||
+    typeof Reflect.get(value, "$$id") === "string"
+  ) {
+    return value;
+  }
+  Object.defineProperty(value, "$$id", { configurable: true, value: id });
+  return value;
+}
+
+function getDirectTestActionId(body: FormData): string | null {
+  let actionId: string | null = null;
+  for (const key of body.keys()) {
+    if (key.startsWith("$ACTION_ID_")) actionId = key.slice("$ACTION_ID_".length);
+  }
+  return actionId;
+}
+
 function createMultipartRequest(headers?: HeadersInit): Request {
   const requestHeaders = new Headers({
     "content-type": "multipart/form-data; boundary=vinext",
@@ -128,7 +148,7 @@ function createStreamBodyRequest(body: string, headers?: HeadersInit): Request {
 function createOptions(
   overrides: Partial<HandleProgressiveServerActionRequestOptions> = {},
 ): HandleProgressiveServerActionRequestOptions {
-  return {
+  const options: HandleProgressiveServerActionRequestOptions = {
     actionId: null,
     allowedOrigins: [],
     cleanPathname: "/action-source",
@@ -158,6 +178,10 @@ function createOptions(
     setHeadersAccessPhase,
     ...overrides,
   };
+  const decodeAction = options.decodeAction;
+  options.decodeAction = async (body) =>
+    registerTestServerReference(await decodeAction(body), getDirectTestActionId(body));
+  return options;
 }
 
 type ProgressiveActionRequestResult = Awaited<
@@ -251,7 +275,12 @@ function createRscOptions(
     (({ route: matchedRoute, params, interceptOpts }) =>
       `${matchedRoute.id}:${JSON.stringify(params)}:${interceptOpts?.slot ?? "none"}`);
 
-  return {
+  const options: HandleServerActionRscRequestOptions<
+    string,
+    TestRoute,
+    TestInterceptOptions,
+    TestTemporaryReferences
+  > = {
     actionId: "action-id",
     allowedOrigins: [],
     buildPageElement,
@@ -356,6 +385,10 @@ function createRscOptions(
     currentRoutePathname: overrides.currentRoutePathname ?? cleanPathname,
     matchRoute,
   };
+  const loadServerAction = options.loadServerAction;
+  options.loadServerAction = async (actionId) =>
+    registerTestServerReference(await loadServerAction(actionId), actionId);
+  return options;
 }
 
 describe("app server action execution helpers", () => {
@@ -1824,6 +1857,26 @@ describe("app server action execution helpers", () => {
     expect(response?.headers.get("x-action-revalidated")).toBe("1");
   });
 
+  it("sends the path and query an action re-render rendered with", async () => {
+    const response = await handleServerActionRscRequest(
+      createRscOptions({
+        loadServerAction() {
+          return Promise.resolve(async () => {
+            await Promise.resolve(revalidatePath("/dashboard"));
+            return "revalidated";
+          });
+        },
+        // The query a rewrite resolved, not the one in the page URL.
+        searchParams: new URLSearchParams("q=rewritten value"),
+      }),
+    );
+
+    expect(response?.status).toBe(200);
+    expect(response?.headers.get("X-Vinext-Rendered-Path-And-Search")).toBe(
+      encodeURIComponent("/dashboard?q=rewritten+value"),
+    );
+  });
+
   it("renders same-origin action redirects as a single-pass Flight response", async () => {
     // Ported from Next.js: test/e2e/app-dir/actions/app-action.test.ts
     // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/actions/app-action.test.ts
@@ -1856,7 +1909,11 @@ describe("app server action execution helpers", () => {
   });
 
   it("passes empty request APIs to force-static action rerender targets", async () => {
-    const buildInputs: Array<{ query: string; header: string | null }> = [];
+    const buildInputs: Array<{
+      query: string;
+      header: string | null;
+      isForceStatic: boolean | undefined;
+    }> = [];
     const targetRoute: TestRoute = {
       id: "dashboard",
       page: {},
@@ -1865,10 +1922,11 @@ describe("app server action execution helpers", () => {
     };
     const response = await handleServerActionRscRequest(
       createRscOptions({
-        buildPageElement({ searchParams }) {
+        buildPageElement({ isForceStatic, searchParams }) {
           buildInputs.push({
             query: searchParams.toString(),
             header: getHeadersContext()?.headers.get("x-request-value") ?? null,
+            isForceStatic,
           });
           return "force-static-target";
         },
@@ -1890,7 +1948,8 @@ describe("app server action execution helpers", () => {
     );
 
     expect(response?.status).toBe(200);
-    expect(buildInputs).toEqual([{ query: "", header: null }]);
+    // Client pages also read an empty query in the browser.
+    expect(buildInputs).toEqual([{ query: "", header: null, isForceStatic: true }]);
   });
 
   it("observes searchParams access for dynamic-error action rerender targets", async () => {
@@ -2883,6 +2942,102 @@ describe("app server action execution helpers", () => {
     expect(response?.headers.get("x-nextjs-action-not-found")).toBe("1");
     expect(await response?.text()).toBe("Server action not found.");
     expect(decodeReply).not.toHaveBeenCalled();
+  });
+
+  it("accepts plugin-rsc's hoisted registration for the requested source export", async () => {
+    const action = vi.fn(() => "saved");
+    Object.defineProperty(action, "$$id", {
+      value: "/app/actions.ts#$$hoist_0_save",
+    });
+
+    const response = await handleServerActionRscRequest(
+      createRscOptions({
+        actionId: "/app/actions.ts#save",
+        loadServerAction() {
+          return Promise.resolve(action);
+        },
+      }),
+    );
+
+    expect(response?.status).toBe(200);
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts a hoisted registration for a default-exported action", async () => {
+    const action = vi.fn(() => "saved");
+    Object.defineProperty(action, "$$id", {
+      value: "/app/actions.ts#$$hoist_0_save",
+    });
+
+    const response = await handleServerActionRscRequest(
+      createRscOptions({
+        actionId: "/app/actions.ts#default",
+        loadServerAction() {
+          return Promise.resolve(action);
+        },
+      }),
+    );
+
+    expect(response?.status).toBe(200);
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts a server action registered under another export alias", async () => {
+    const action = vi.fn(() => "saved");
+    Object.defineProperty(action, "$$id", {
+      value: "/app/actions.ts#submit",
+    });
+
+    const response = await handleServerActionRscRequest(
+      createRscOptions({
+        actionId: "/app/actions.ts#save",
+        loadServerAction() {
+          return Promise.resolve(action);
+        },
+      }),
+    );
+
+    expect(response?.status).toBe(200);
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not mistake a cache-like user export alias for an opaque cache reference", async () => {
+    const action = vi.fn(() => "saved");
+    Object.defineProperty(action, "$$id", {
+      value: "/app/actions.ts#$$vinext_cache_custom",
+    });
+
+    const response = await handleServerActionRscRequest(
+      createRscOptions({
+        actionId: "/app/actions.ts#save",
+        loadServerAction() {
+          return Promise.resolve(action);
+        },
+      }),
+    );
+
+    expect(response?.status).toBe(200);
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a source export whose registered server-reference id is different", async () => {
+    const hidden = vi.fn(() => "private");
+    Object.defineProperty(hidden, "$$id", {
+      value: `/app/records.ts#$$vinext_cache_${"a".repeat(64)}`,
+    });
+
+    const response = await handleServerActionRscRequest(
+      createRscOptions({
+        actionId: "/app/records.ts#readRecord",
+        loadServerAction() {
+          return Promise.resolve(hidden);
+        },
+      }),
+    );
+
+    expect(response?.status).toBe(404);
+    expect(response?.headers.get("x-nextjs-action-not-found")).toBe("1");
+    expect(hidden).not.toHaveBeenCalled();
   });
 
   // Reproduces the prod-build error path where the @vitejs/plugin-rsc server

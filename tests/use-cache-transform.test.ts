@@ -6,7 +6,7 @@
  */
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 import { parseAst, type Plugin } from "vite";
 import vinext from "../packages/vinext/src/index.js";
 import { APP_FIXTURE_DIR, RSC_ENTRIES } from "./helpers.js";
@@ -42,6 +42,8 @@ const fileCacheCode = [
   `  return 1;`,
   `}`,
 ].join("\n");
+
+const SECURE_CACHE_EXPORT_RE = /^\$\$vinext_cache_[0-9a-f]{64}$/;
 
 async function configurePluginRsc(plugins: Plugin[]) {
   const minimal = plugins.find((plugin) => plugin.name === "rsc:minimal")!;
@@ -82,6 +84,17 @@ async function transformRsc(source: string): Promise<string> {
     moduleId,
   );
   return result!.code;
+}
+
+/** Map each registered cache function's name to its wrapper options. */
+function getCacheWrapperOptionsByName(code: string): Record<string, Record<string, unknown>> {
+  const options: Record<string, Record<string, unknown>> = {};
+  for (const match of code.matchAll(
+    /registerCachedFunction\(.*?, "[^"]*:([^":]+)", "[^"]*", (\{[^}]*\})\)/g,
+  )) {
+    options[match[1]!] = JSON.parse(match[2]!);
+  }
+  return options;
 }
 
 describe("plugin-rsc inline use-cache references", () => {
@@ -137,7 +150,7 @@ describe("plugin-rsc inline use-cache references", () => {
     await unwrapHook(plugins[useServerIndex]!.transform)!.call(ssrContext, proxied!.code, moduleId);
     expect(manager.serverReferences.metaMap.get(moduleId)).toMatchObject({
       importId: moduleId,
-      exportNames: expect.arrayContaining(["getData"]),
+      exportNames: [expect.stringMatching(SECURE_CACHE_EXPORT_RE)],
     });
   });
 
@@ -177,7 +190,7 @@ describe("plugin-rsc inline use-cache references", () => {
     const merged = manager.serverReferences.metaMap.get(moduleId)!;
     expect(merged.importId).toBe(moduleId);
     expect(merged.exportNames).toContainEqual(expect.stringMatching(/action/));
-    expect(merged.exportNames).toContainEqual(expect.stringMatching(/getData/));
+    expect(merged.exportNames).toContainEqual(expect.stringMatching(SECURE_CACHE_EXPORT_RE));
     expect(merged.exportNames).toHaveLength(new Set(merged.exportNames).size);
   });
 
@@ -289,18 +302,21 @@ describe("plugin-rsc inline use-cache references", () => {
     expect(result!.code).toContain("$$VinextReactServer.registerServerReference");
     expect(result!.code).toContain("registerCachedFunction");
     expect(result!.code).toContain(JSON.stringify(expectedKey));
+    const [secureExportName] = manager.serverReferences.metaMap.get(moduleId)!.exportNames;
+    expect(secureExportName).toMatch(SECURE_CACHE_EXPORT_RE);
     expect(result!.code).toContain(
       JSON.stringify({
         acceptsSecondArgument: false,
         argumentCount: 0,
-        serverReferenceId: `${expectedKey}#$$hoist_0_getData`,
+        serverReferenceId: `${expectedKey}#${secureExportName}`,
       }),
     );
     expect(manager.serverReferences.metaMap.get(moduleId)).toEqual({
       importId: moduleId,
       referenceKey: expectedKey,
-      exportNames: ["$$hoist_0_getData"],
+      exportNames: [secureExportName],
     });
+    expect(result!.code).not.toContain(`${expectedKey}#$$hoist_0_getData`);
   });
 
   it("removes its claim when the directive is removed", async () => {
@@ -450,9 +466,10 @@ describe("plugin-rsc inline use-cache references", () => {
     expect(result!.code).toContain("registerCachedFunction(alias");
     expect(result!.code).toContain("registerCachedFunction(named");
     expect(result!.code).toContain("registerCachedFunction(imported");
-    expect(manager.serverReferences.metaMap.get(moduleId)!.exportNames).toEqual(
-      expect.arrayContaining(["direct", "alias", "named", "renamed", "default"]),
-    );
+    const exportNames = manager.serverReferences.metaMap.get(moduleId)!.exportNames;
+    expect(exportNames).toHaveLength(5);
+    for (const exportName of exportNames) expect(exportName).toMatch(SECURE_CACHE_EXPORT_RE);
+    expect(new Set(exportNames).size).toBe(5);
   });
 
   it("rejects statically known synchronous inline cached functions", async () => {
@@ -663,9 +680,20 @@ describe("plugin-rsc inline use-cache references", () => {
       "rsc:use-server",
     ]);
     const exportNames = manager.serverReferences.metaMap.get(moduleId)!.exportNames;
-    expect(exportNames).toContain("cached");
+    expect(exportNames).toContainEqual(expect.stringMatching(SECURE_CACHE_EXPORT_RE));
     expect(exportNames).toContainEqual(expect.stringMatching(/uncached/));
     expect(exportNames).toHaveLength(new Set(exportNames).size);
+
+    const ssrContext = { environment: { name: "ssr", mode: "build" } };
+    const proxyResult = await unwrapHook(plugin.transform)!.call(ssrContext, source, moduleId);
+    expect(proxyResult?.code).toContain("createServerReference");
+    expect(proxyResult?.code).toContain("#uncached");
+    expect(proxyResult?.code.match(/[$]{2}vinext_cache_[0-9a-f]{64}/g)).toHaveLength(1);
+    expect(() => parseAst(proxyResult!.code)).not.toThrow();
+    expect(manager.serverReferences.claimMap.get(moduleId).get(plugin.name).exportNames).toEqual([
+      expect.stringMatching(SECURE_CACHE_EXPORT_RE),
+      "uncached",
+    ]);
   });
 
   it("rejects conflicting file-level cache and use-server directives", async () => {
@@ -737,25 +765,102 @@ describe("plugin-rsc inline use-cache references", () => {
     expect(result!.code).toContain("$$VinextReactServer.registerServerReference");
     expect(result!.code).toContain("registerCachedFunction");
     expect(result!.code).toContain('"use cache";');
-    expect(manager.serverReferences.metaMap.get(moduleId)!.exportNames).toEqual(["getData"]);
+    const claim = manager.serverReferences.metaMap.get(moduleId)!;
+    expect(claim.exportNames).toEqual([expect.stringMatching(SECURE_CACHE_EXPORT_RE)]);
+
+    // The runtime recognizes cache functions, including bound ones, by this
+    // server reference id (`registerServerReference` sets `$$id`).
+    const { isUseCacheFunctionReference } =
+      await import("../packages/vinext/src/shims/internal/app-page-props-cache-key.js");
+    const reference = Object.assign(async () => null, {
+      $$typeof: Symbol.for("react.server.reference"),
+      $$id: `${claim.referenceKey}#${claim.exportNames[0]}`,
+    });
+    expect(isUseCacheFunctionReference(reference)).toBe(true);
   });
 
-  it("marks file-level App Page default exports after Vinext resolves the app directory", async () => {
-    const plugins = await getPlugins();
-    await configureVinext(plugins);
-    await configurePluginRsc(plugins);
-    const plugin = plugins.find(
-      (candidate) => candidate.name === "vinext:server-function-directives",
-    )!;
-    const pageId = path.join(APP_FIXTURE_DIR, "app", "page.tsx");
-    const result = await unwrapHook(plugin.transform)!.call(
-      { environment: { name: "rsc", mode: "build" } },
-      [`"use cache";`, `export default async function Page() { return null; }`].join("\n"),
-      pageId,
-    );
+  // Like Next.js (use-cache-wrapper.ts `isPageSegmentFunction`), page
+  // semantics come only from the `$$isPage` invocation marker. A cache function
+  // defined in a page module but called directly, without the marker, is an
+  // ordinary cache call: its key and Response Store replay args keep
+  // searchParams, so different queries do not collide.
+  it.each([
+    [
+      "file-level",
+      [
+        `"use cache";`,
+        `export async function generateMetadata(props) { return {}; }`,
+        `export default async function Page(props) { return null; }`,
+      ].join("\n"),
+      ["default", "generateMetadata"],
+    ],
+    [
+      "inline",
+      [
+        `export async function generateMetadata(props) { "use cache"; return {}; }`,
+        `export default async function Page(props) { "use cache"; return null; }`,
+      ].join("\n"),
+      ["$$hoist_0_generateMetadata", "$$hoist_1_Page"],
+    ],
+  ])(
+    "keeps searchParams for unmarked direct calls of %s page module cache functions",
+    async (_label, code, expectedNames) => {
+      const plugins = await getPlugins();
+      await configureVinext(plugins);
+      await configurePluginRsc(plugins);
+      const plugin = plugins.find(
+        (candidate) => candidate.name === "vinext:server-function-directives",
+      )!;
+      const pageId = path.join(APP_FIXTURE_DIR, "app", "direct-call", "page.tsx");
+      const result = await unwrapHook(plugin.transform)!.call(
+        { environment: { name: "rsc", mode: "build" } },
+        code,
+        pageId,
+      );
 
-    expect(result?.code).toContain('"appPageDefaultExport":true');
-  });
+      // The transform emits no page-specific wrapper metadata.
+      const wrapperOptions = getCacheWrapperOptionsByName(result!.code);
+      expect(Object.keys(wrapperOptions).sort()).toEqual(expectedNames);
+      for (const options of Object.values(wrapperOptions)) {
+        expect(Object.keys(options).sort()).toEqual([
+          "acceptsSecondArgument",
+          "argumentCount",
+          "serverReferenceId",
+        ]);
+      }
+
+      const { registerCachedFunction } =
+        await import("../packages/vinext/src/shims/cache-runtime.js");
+      const { setCacheHandler, MemoryCacheHandler } =
+        await import("../packages/vinext/src/shims/cache.js");
+      const { makeThenableParams } =
+        await import("../packages/vinext/src/shims/thenable-params.js");
+      setCacheHandler(new MemoryCacheHandler());
+      for (const [name, options] of Object.entries(wrapperOptions)) {
+        let calls = 0;
+        const encodeInvocationArgs = vi.fn(async (_args: unknown[]) => "encrypted");
+        const cached = registerCachedFunction(
+          async (props: { searchParams: Promise<Record<string, string>> }) => {
+            calls++;
+            return (await props.searchParams).q;
+          },
+          `${pageId}:${name}`,
+          "",
+          { ...options, encodeInvocationArgs },
+        );
+        const pageProps = (q: string) => ({
+          params: makeThenableParams({}),
+          searchParams: makeThenableParams({ q }),
+        });
+
+        await expect(cached(pageProps("first"))).resolves.toBe("first");
+        await expect(cached(pageProps("second"))).resolves.toBe("second");
+        expect(calls).toBe(2);
+        const [[replayProps]] = encodeInvocationArgs.mock.calls[0] as [[Record<string, unknown>]];
+        expect(Object.keys(replayProps)).toEqual(["params", "searchParams"]);
+      }
+    },
+  );
 
   it.each(["ssr", "client"])(
     "emits server-reference proxies for file-level cache exports in the %s graph",
@@ -773,7 +878,8 @@ describe("plugin-rsc inline use-cache references", () => {
       );
       expect(result).not.toBeNull();
       expect(result!.code).toContain("createServerReference");
-      expect(result!.code).toContain("#getData");
+      expect(result!.code).toMatch(/#[$]{2}vinext_cache_[0-9a-f]{64}/);
+      expect(result!.code).not.toContain("#getData");
       expect(result!.code).not.toContain("registerCachedFunction");
       expect(result!.code).not.toContain("registerCachedServerReference");
     },

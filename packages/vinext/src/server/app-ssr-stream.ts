@@ -10,7 +10,7 @@ import {
   RSC_EMBEDDED_BINARY_CHUNK,
   type RscEmbeddedChunk,
 } from "./app-rsc-embedded-chunks.js";
-import { NAVIGATION_RUNTIME_SYMBOL_DESCRIPTION } from "../client/navigation-runtime.js";
+import { NAVIGATION_RUNTIME_SYMBOL_DESCRIPTION } from "../client/browser-globals.js";
 
 type RscEmbedTransform = {
   flush(): string;
@@ -40,6 +40,8 @@ type InlineCssRewriteResult = {
   html: string;
   consumedPrependCss: boolean;
 };
+
+const RSC_EMBED_TEXT_BATCH_MAX_LENGTH = 64 * 1024;
 
 // React's edge renderer schedules render continuations on timer tasks. Dynamic
 // SSR must let one such task run before the first stream pull, or fast Suspense
@@ -75,6 +77,20 @@ export function createNavigationRuntimeRscMetadataScript(
     (dynamicStaleTimeSeconds === undefined
       ? ""
       : ",dynamicStaleTimeSeconds:" + safeJsonStringify(dynamicStaleTimeSeconds)) +
+    "})"
+  );
+}
+
+/**
+ * The query a client page read during SSR, for a render that turned dynamic
+ * after its head told the browser to read the query from its own URL.
+ */
+export function createNavigationRuntimeRenderedSearchScript(search: string): string {
+  return (
+    "Object.assign(" +
+    navigationRuntimeRscBootstrapExpression() +
+    ",{renderedSearch:" +
+    safeJsonStringify(search) +
     "})"
   );
 }
@@ -134,6 +150,7 @@ export function createRscEmbedTransform(
   const rawChunks: Uint8Array[] = [];
   let reading = false;
   let mirroredNextFlightBootstrap = false;
+  const textDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
   async function pumpReader(): Promise<void> {
     if (reading) return;
@@ -144,9 +161,7 @@ export function createRscEmbedTransform(
         if (result.done) break;
         rawChunks.push(result.value);
         try {
-          const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-          const text = decoder.decode(result.value);
-          pendingChunks.push(text);
+          pendingChunks.push(textDecoder.decode(result.value));
         } catch {
           pendingChunks.push([RSC_EMBEDDED_BINARY_CHUNK, bytesToBase64(result.value)]);
         }
@@ -170,8 +185,38 @@ export function createRscEmbedTransform(
       const chunks = pendingChunks;
       pendingChunks = [];
 
-      let scripts = "";
+      // React commonly emits one small Flight row per byte chunk. Embedding
+      // each row in its own script makes large trees pay for thousands of
+      // script wrappers, JSON serializations, and browser script executions.
+      // Coalesce adjacent text here while preserving binary chunk boundaries.
+      const embeddedChunks: RscEmbeddedChunk[] = [];
+      let textChunks: string[] = [];
+      let textLength = 0;
+      const flushTextChunks = (): void => {
+        if (textChunks.length === 0) return;
+        embeddedChunks.push(textChunks.join(""));
+        textChunks = [];
+        textLength = 0;
+      };
       for (const chunk of chunks) {
+        if (typeof chunk === "string") {
+          // Flush only between React chunks so a single unusually large chunk
+          // is never split at an unsafe UTF-16 boundary. Such a chunk is no
+          // larger than the script vinext emitted before batching.
+          if (textLength > 0 && textLength + chunk.length > RSC_EMBED_TEXT_BATCH_MAX_LENGTH) {
+            flushTextChunks();
+          }
+          textChunks.push(chunk);
+          textLength += chunk.length;
+        } else {
+          flushTextChunks();
+          embeddedChunks.push(chunk);
+        }
+      }
+      flushTextChunks();
+
+      let scripts = "";
+      for (const chunk of embeddedChunks) {
         scripts += createInlineScriptTag(
           createNavigationRuntimeRscChunkScript(chunk),
           options.scriptNonce,

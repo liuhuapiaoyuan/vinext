@@ -1,6 +1,6 @@
 {
   "name": "@vinext/cloudflare",
-  "version": "1.0.0-beta.8",
+  "version": "1.0.1",
   "description": "Cloudflare cache and image adapters for vinext.",
   "homepage": "https://vinext.dev/",
   "license": "MIT",
@@ -51,13 +51,14 @@
     "build": "vp pack",
     "prepack": "vp run build",
     "dev": "vp pack --watch",
-    "test": "vp run vinext#build && vp run @cloudflare/workers-response-store#build && vp run @vinext/cloudflare#build && VINEXT_RESPONSE_STORE_MODE=self-contained pnpm --filter response-store-demo run build && pnpm --filter response-store-demo run build && vitest run"
+    "test": "vp run vinext#build && vp run @cloudflare/workers-response-store#build && vp run @vinext/cloudflare#build && VINEXT_RESPONSE_STORE_MODE=self-contained VINEXT_RESPONSE_STORE_LOCATION_HINT=weur pnpm --filter response-store-demo run build && VINEXT_RESPONSE_STORE_LOCATION_HINT=wnam pnpm --filter response-store-demo run build && vitest run"
   },
   "dependencies": {
     "@cloudflare/workers-response-store": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "catalog:",
+    "cf": "catalog:cloudflare-vite-v2",
     "miniflare": "catalog:",
     "vinext": "workspace:*",
     "vite": "catalog:",
@@ -65,7 +66,17 @@
     "vitest": "catalog:"
   },
   "peerDependencies": {
+    "@cloudflare/vite-plugin": "*",
+    "cf": "*",
     "vinext": "workspace:^"
+  },
+  "peerDependenciesMeta": {
+    "@cloudflare/vite-plugin": {
+      "optional": true
+    },
+    "cf": {
+      "optional": true
+    }
   },
   "engines": {
     "node": ">=22"

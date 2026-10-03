@@ -85,6 +85,7 @@ type RouteHandlerBackgroundRegenerator = (
 
 type DispatchAppRouteHandlerOptions = {
   basePath?: string;
+  bypassSharedCache?: boolean;
   cleanPathname: string;
   clearRequestContext: () => void;
   draftModeSecret: string;
@@ -254,6 +255,7 @@ async function dispatchAppRouteHandlerImpl(
 
   const resolvedHandlerFn = isAppRouteHandlerFunction(handlerFn) ? handlerFn : undefined;
   const shouldReadRouteCache =
+    options.bypassSharedCache !== true &&
     revalidateSeconds !== null &&
     !getRouteCacheabilityDynamicReason() &&
     shouldReadAppRouteHandlerCache({
@@ -270,7 +272,7 @@ async function dispatchAppRouteHandlerImpl(
     options.request.headers.get(PRERENDER_REVALIDATE_HEADER),
   )
     ? "on-demand"
-    : shouldReadRouteCache
+    : shouldReadRouteCache && revalidateSeconds !== Infinity
       ? "stale"
       : undefined;
 
@@ -286,6 +288,7 @@ async function dispatchAppRouteHandlerImpl(
   setCurrentFetchRevalidate(configuredRevalidateSeconds);
   setCurrentForceDynamicFetchDefault(handler.dynamic === "force-dynamic");
 
+  let isRevalidation = false;
   if (shouldReadRouteCache && resolvedHandlerFn) {
     const cachedRouteResponse = await readAppRouteHandlerCacheResponse({
       basePath: options.basePath,
@@ -303,7 +306,11 @@ async function dispatchAppRouteHandlerImpl(
       isAutoHead,
       appendResponseLink,
       isrDebug: options.isrDebug,
-      isrGet: options.isrGet,
+      async isrGet(key) {
+        const entry = await options.isrGet(key);
+        isRevalidation = entry?.value.value?.kind === "APP_ROUTE";
+        return entry;
+      },
       isrRouteKey: options.isrRouteKey,
       isrSet: options.isrSet,
       markDynamicUsage,
@@ -345,7 +352,9 @@ async function dispatchAppRouteHandlerImpl(
 
   if (resolvedHandlerFn) {
     const response = await executeAppRouteHandler({
+      isRevalidation,
       basePath: options.basePath,
+      bypassSharedCache: options.bypassSharedCache,
       buildPageCacheTags(pathname, extraTags) {
         return buildRouteHandlerPageCacheTags(pathname, extraTags, route.routeSegments);
       },

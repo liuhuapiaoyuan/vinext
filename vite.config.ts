@@ -1,6 +1,7 @@
 import path from "node:path";
 import { defineConfig } from "vite-plus";
 import { randomUUID } from "node:crypto";
+import { createOgHarfbuzzPlugin } from "./packages/vinext/src/plugins/og-harfbuzz.js";
 
 const SHIMS_SRC = path.resolve(import.meta.dirname, "packages/vinext/src/shims");
 const VINEXT_SRC = path.resolve(import.meta.dirname, "packages/vinext/src");
@@ -173,11 +174,13 @@ export default defineConfig({
 
     projects: [
       {
+        plugins: [createOgHarfbuzzPlugin()],
         resolve: {
           alias: WORKSPACE_SRC_ALIAS,
         },
         test: {
           name: "unit",
+          server: { deps: { inline: ["@vercel/og"] } },
           setupFiles: [MSW_SETUP],
           // `scripts/**` covers the release-tooling unit tests
           // (scripts/create-changeset.test.ts, scripts/version.test.ts), which
@@ -193,6 +196,7 @@ export default defineConfig({
             "tests/app-router-client-preloading.test.ts",
             "tests/app-router-deployment-id.test.ts",
             "tests/app-router-dev-server.test.ts",
+            "tests/app-router-dev-externals.test.ts",
             "tests/app-router-external-rewrite.test.ts",
             "tests/app-router-font-google-prod.test.ts",
             "tests/app-router-isr-codegen.test.ts",
@@ -210,10 +214,12 @@ export default defineConfig({
             "tests/app-router-rsc-plugin.test.ts",
             "tests/app-router-static-export.test.ts",
             "tests/app-router-worker-entry.test.ts",
+            "tests/app-search-params-gate-production.test.ts",
             "tests/api-handler.test.ts",
             "tests/cjs-globals-runtime.test.ts",
             "tests/cjs.test.ts",
             "tests/client-global-define.test.ts",
+            "tests/dep-scan-bundled-deps.test.ts",
             "tests/dev-route-discovery.test.ts",
             "tests/dynamic-requests-build.test.ts",
             "tests/ecosystem.test.ts",
@@ -223,7 +229,10 @@ export default defineConfig({
             "tests/favicon-short-circuit.test.ts",
             "tests/hybrid-i18n-api-handoff.test.ts",
             "tests/image-optimization-parity.test.ts",
+            "tests/instrumentation-dev.test.ts",
+            "tests/invalid-static-asset-404.test.ts",
             "tests/middleware-matcher-auth.test.ts",
+            "tests/next-intl-cloudflare.test.ts",
             "tests/node-modules-css.test.ts",
             "tests/optimize-deps-jsx-in-js.test.ts",
             "tests/optimize-imports-integration.test.ts",
@@ -246,11 +255,13 @@ export default defineConfig({
         },
       },
       {
+        plugins: [createOgHarfbuzzPlugin()],
         resolve: {
           alias: WORKSPACE_SRC_ALIAS,
         },
         test: {
           name: "integration",
+          server: { deps: { inline: ["@vercel/og"] } },
           env: {
             VINEXT_PARALLEL_INTEGRATION: "true",
           },
@@ -270,6 +281,7 @@ export default defineConfig({
             "tests/app-router-client-preloading.test.ts",
             "tests/app-router-deployment-id.test.ts",
             "tests/app-router-dev-server.test.ts",
+            "tests/app-router-dev-externals.test.ts",
             "tests/app-router-external-rewrite.test.ts",
             "tests/app-router-font-google-prod.test.ts",
             "tests/app-router-isr-codegen.test.ts",
@@ -287,10 +299,12 @@ export default defineConfig({
             "tests/app-router-rsc-plugin.test.ts",
             "tests/app-router-static-export.test.ts",
             "tests/app-router-worker-entry.test.ts",
+            "tests/app-search-params-gate-production.test.ts",
             "tests/api-handler.test.ts",
             "tests/cjs-globals-runtime.test.ts",
             "tests/cjs.test.ts",
             "tests/client-global-define.test.ts",
+            "tests/dep-scan-bundled-deps.test.ts",
             "tests/dev-route-discovery.test.ts",
             "tests/dynamic-requests-build.test.ts",
             "tests/ecosystem.test.ts",
@@ -300,8 +314,11 @@ export default defineConfig({
             "tests/features.test.ts",
             "tests/hybrid-i18n-api-handoff.test.ts",
             "tests/image-optimization-parity.test.ts",
+            "tests/instrumentation-dev.test.ts",
+            "tests/invalid-static-asset-404.test.ts",
             "tests/kv-cache-handler.test.ts",
             "tests/middleware-matcher-auth.test.ts",
+            "tests/next-intl-cloudflare.test.ts",
             "tests/node-modules-css.test.ts",
             "tests/optimize-deps-jsx-in-js.test.ts",
             "tests/optimize-imports-integration.test.ts",

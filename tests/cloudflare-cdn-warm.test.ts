@@ -190,6 +190,7 @@ describe("Cloudflare CDN warmup", () => {
           { kind: "app-route", pattern: "/api/posts/:slug" },
           { kind: "pages-page", pattern: "/legacy/:slug" },
         ],
+        loadingBoundaryRoutePatterns: ["/dashboard", "/posts/:slug"],
         loadingShellPaths: ["/dashboard"],
         pagesDataPaths: ["/docs/_next/data/build-a/pages.json"],
         paths: ["/dashboard", "/dynamic", "/pages"],
@@ -214,6 +215,8 @@ describe("Cloudflare CDN warmup", () => {
         { kind: "app-route", pattern: "/api/posts/:slug" },
         { kind: "pages-page", pattern: "/legacy/:slug" },
       ],
+      // Route patterns, so neither the basePath nor trailingSlash applies.
+      loadingBoundaryRoutePatterns: ["/dashboard", "/posts/:slug"],
       loadingShellPaths: ["/docs/dashboard/"],
       pagesDataPaths: ["/docs/_next/data/build-a/pages.json"],
       paths: ["/docs/dashboard/", "/docs/dynamic/", "/docs/pages/"],
@@ -347,6 +350,20 @@ describe("Cloudflare CDN warmup", () => {
     expect(() => readPrerenderWarmPlan(tmpDir, { strict: true })).toThrow(
       "prerender path manifest not found",
     );
+  });
+
+  it("rejects malformed loading-boundary route patterns", () => {
+    writeFile("dist/server/BUILD_ID", "build-a\n");
+    for (const loadingBoundaryRoutePatterns of ["/posts/:slug", ["posts/:slug"], [1]]) {
+      writeFile(
+        "dist/server/vinext-prerender-paths.json",
+        JSON.stringify({ buildId: "build-a", loadingBoundaryRoutePatterns, paths: ["/"] }),
+      );
+
+      expect(() => readPrerenderWarmPlan(tmpDir, { strict: true })).toThrow(
+        "prerender path manifest not found",
+      );
+    }
   });
 
   it("warms canonical RSC, HTML, and Pages data with browser-identical requests", async () => {
@@ -1423,6 +1440,46 @@ describe("Cloudflare CDN warmup", () => {
         ["html", 2],
       ]),
     );
+  });
+
+  it("retries staged CDN certification until the admitted response is reusable", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response("cacheable", {
+          headers: {
+            "cache-control": "public, max-age=0, s-maxage=60",
+            "cf-cache-status": "BYPASS",
+            "content-type": "text/html",
+            [VINEXT_CDN_BUILD_ID_HEADER]: "build-a",
+          },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response("cacheable", {
+          headers: {
+            "cache-control": "public, max-age=0, s-maxage=60",
+            "cf-cache-status": "HIT",
+            "content-type": "text/html",
+            [VINEXT_CDN_BUILD_ID_HEADER]: "build-a",
+          },
+        }),
+      );
+
+    await expect(
+      warmCdnCache({
+        expectedBuildId: "build-a",
+        fetchImpl: fetchImpl as typeof fetch,
+        paths: ["/cached"],
+        propagatingTarget: true,
+        requireCacheHit: true,
+        retries: 1,
+        retryDelayMs: 0,
+        strict: true,
+        targetUrl: "https://app.example.com",
+      }),
+    ).resolves.toMatchObject({ warmed: 1, skipped: 0, failed: 0 });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
   it("does not retry permanent validation failures from the uploaded build", async () => {

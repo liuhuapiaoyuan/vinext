@@ -103,6 +103,20 @@ const nextConfig: NextConfig = {
   async rewrites() {
     return {
       beforeFiles: [
+        {
+          source: "/route-cache-choice",
+          destination: "/route-cache-identity/about",
+          has: [{ type: "query", key: "view", value: "about" }],
+        },
+        {
+          source: "/route-cache-choice",
+          destination: "/route-cache-identity/nested/about",
+          has: [{ type: "query", key: "view", value: "nested" }],
+        },
+        {
+          source: "/route-cache-rewrite/:slug*",
+          destination: "/route-handler-cache-identity/:slug*",
+        },
         // Encoded App Page params must have the same canonical representation
         // on direct requests and config rewrites.
         {
@@ -147,6 +161,27 @@ const nextConfig: NextConfig = {
         {
           source: "/rewrite-search-param/:term",
           destination: "/search?q=from-rewrite",
+        },
+        // Used by Playwright: app-router-prod/static-hydration.spec.ts — a
+        // client page's searchParams come from the rewritten query.
+        {
+          source: "/client-page-search-params/rewritten/:q",
+          destination: "/client-page-search-params?q=:q",
+        },
+        {
+          source: "/client-page-search-params/delayed-rewritten/:q",
+          destination: "/client-page-search-params/delayed?q=:q",
+        },
+        {
+          source: "/client-page-search-params/action",
+          has: [{ type: "header", key: "next-action" }],
+          destination: "/client-page-search-params/action?q=from-action",
+        },
+        // Used by Playwright: app-router/client-page-search-params-hmr.spec.ts
+        {
+          source: "/client-page-search-params/hmr",
+          has: [{ type: "cookie", key: "client-page-hmr-q" }],
+          destination: "/client-page-search-params/hmr?q=from-cookie",
         },
       ],
       afterFiles: [

@@ -339,7 +339,8 @@ export function createMultiStageCodeSplittingConfig(
 
 /**
  * Keep router stage chunks beside the server entry so their generated
- * `./vinext-client-assets.js` external continues to resolve. Other chunks keep
+ * `./vinext-client-assets.js` and deploy-filled cacheability externals continue
+ * to resolve. Other chunks keep
  * the host's existing output pattern (or vinext's server-assets default).
  */
 export function createMultiStageChunkFileNames(
@@ -361,6 +362,7 @@ export function createMultiStageChunkFileNames(
         "vinext-request-stage",
         "vinext-response-stage",
         "virtual_vinext-rsc-entry",
+        "virtual_vinext-request-stage",
         "virtual_vinext-response-stage",
       ].some((entryName) => name.includes(entryName))
     ) {

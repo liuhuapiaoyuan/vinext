@@ -6,12 +6,12 @@
  *    module across the no-config / data-only / cdn-only / both permutations,
  *    including inlined descriptor options.
  *  - The Cloudflare adapter modules: their config-time builders (kvDataAdapter,
- *    cdnAdapter) and their runtime factory default exports.
+ *    workersCacheCdnAdapter) and their runtime factory default exports.
  */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, it, expect } from "vite-plus/test";
+import { describe, it, expect, expectTypeOf } from "vite-plus/test";
 import {
   findVinextCacheConfigInPlugins,
   generateCdnCacheAdapterModule,
@@ -38,7 +38,11 @@ import { resolveNextConfig } from "../packages/vinext/src/config/next-config.js"
 import { createValidFileMatcher } from "../packages/vinext/src/routing/file-matcher.js";
 import { kvDataAdapter } from "../packages/cloudflare/src/cache/kv-data-adapter.js";
 import { cdnAdapter } from "../packages/cloudflare/src/cache/cdn-adapter.js";
-import { responseStoreAdapter } from "../packages/cloudflare/src/cache/response-store-adapter.js";
+import { workersCacheCdnAdapter } from "../packages/cloudflare/src/cache/workers-cache-cdn-adapter.js";
+import {
+  responseStoreAdapter,
+  type ResponseStoreAdapterOptions,
+} from "../packages/cloudflare/src/cache/response-store-adapter.js";
 import createKvDataCacheAdapter, {
   KVCacheHandler,
 } from "../packages/cloudflare/src/cache/kv-data-adapter.runtime.js";
@@ -130,10 +134,10 @@ describe("generateCacheAdaptersModule", () => {
 
   it("wires both adapters and guards against double registration", () => {
     const code = generateCacheAdaptersModule({
-      cdn: { adapter: "@vinext/cloudflare/cache/cdn-adapter" },
+      cdn: { adapter: "@vinext/cloudflare/cache/workers-cache-cdn-adapter" },
       data: { adapter: "@vinext/cloudflare/cache/kv-data-adapter" },
     });
-    expect(code).toContain(`from "@vinext/cloudflare/cache/cdn-adapter";`);
+    expect(code).toContain(`from "@vinext/cloudflare/cache/workers-cache-cdn-adapter";`);
     expect(code).toContain(`from "@vinext/cloudflare/cache/kv-data-adapter";`);
     expect(code).toContain("registerDataCacheHandler(() => __vinextDataAdapterFactory(");
     expect(code).toContain("registerCdnCacheAdapter(() => __vinextCdnAdapterFactory(");
@@ -158,7 +162,7 @@ describe("generateCacheAdaptersModule", () => {
 
   it("logs registration failures without printing raw Error stack traces", () => {
     const code = generateCacheAdaptersModule({
-      cdn: { adapter: "@vinext/cloudflare/cache/cdn-adapter" },
+      cdn: { adapter: "@vinext/cloudflare/cache/workers-cache-cdn-adapter" },
       data: { adapter: "@vinext/cloudflare/cache/kv-data-adapter" },
     });
     expect(code).toContain("function __vinextFormatAdapterError(error)");
@@ -382,9 +386,13 @@ describe("registration is wired into every router/runtime entry", () => {
   });
 });
 
-describe("cdnAdapter builder + factory", () => {
-  it("builder resolves the runtime factory to an absolute path", () => {
-    const descriptor = cdnAdapter();
+describe("workersCacheCdnAdapter builder + factory", () => {
+  it("builder resolves the runtime factory to an absolute path", async () => {
+    expect(cdnAdapter).toBe(workersCacheCdnAdapter);
+    expect(
+      await import("../packages/cloudflare/src/cache/workers-cache-cdn-adapter.js"),
+    ).not.toHaveProperty("cdnAdapter");
+    const descriptor = workersCacheCdnAdapter();
     expect(path.isAbsolute(descriptor.adapter)).toBe(true);
     expect(descriptor.adapter.endsWith("cdn-adapter.runtime.js")).toBe(true);
     expect(descriptor.options).toBeUndefined();
@@ -452,10 +460,10 @@ describe("cdnAdapter builder + factory", () => {
   });
 
   it("forwards a custom version metadata binding", () => {
-    expect(cdnAdapter({ versionMetadataBinding: "CUSTOM_VERSION" }).options).toEqual({
+    expect(workersCacheCdnAdapter({ versionMetadataBinding: "CUSTOM_VERSION" }).options).toEqual({
       versionMetadataBinding: "CUSTOM_VERSION",
     });
-    expect(() => cdnAdapter({ versionMetadataBinding: "" })).toThrow(
+    expect(() => workersCacheCdnAdapter({ versionMetadataBinding: "" })).toThrow(
       "must be a non-empty string binding name",
     );
   });
@@ -497,6 +505,27 @@ describe("responseStoreAdapter builder", () => {
     expect(responseStoreAdapter().cdn.options).toBeUndefined();
     expect(() => responseStoreAdapter({ shards: 1 })).toThrow(
       "Workers Response Store shards must be an integer greater than 1",
+    );
+  });
+
+  it.each(["service-binding", "self-contained"] as const)(
+    "passes a metadata location hint into %s mode",
+    (mode) => {
+      const descriptor = responseStoreAdapter({ locationHint: "weur", mode });
+      expect(descriptor.cdn.options).toEqual({ locationHint: "weur" });
+      expect(descriptor.data.options).toEqual({ locationHint: "weur" });
+      expectTypeOf(descriptor.cdn.options?.locationHint).toEqualTypeOf<
+        ResponseStoreAdapterOptions["locationHint"]
+      >();
+    },
+  );
+
+  it("rejects unsupported metadata location hints", () => {
+    expect(() => responseStoreAdapter({ locationHint: "moon" as never })).toThrow(
+      "Workers Response Store locationHint is not supported by Cloudflare",
+    );
+    expect(() => responseStoreAdapter({ locationHint: ["weur"] as never })).toThrow(
+      "Workers Response Store locationHint is not supported by Cloudflare",
     );
   });
 });

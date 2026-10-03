@@ -1,3 +1,4 @@
+import { createHmac, randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
 import path from "pathslash";
 import { pathToFileURL } from "node:url";
@@ -7,7 +8,7 @@ import type {
   TransformHoistInlineDirectiveMeta,
 } from "@vitejs/plugin-rsc/transforms";
 import { parseAstAsync, type Plugin } from "vite";
-import { isPathInside, NODE_MODULES_PATH_RE, stripViteModuleQuery } from "../utils/path.js";
+import { NODE_MODULES_PATH_RE } from "../utils/path.js";
 import { magicStringTransformResult } from "./transform-result.js";
 
 type RscTransforms = typeof import("@vitejs/plugin-rsc/transforms");
@@ -16,14 +17,11 @@ type Program = Awaited<ReturnType<typeof parseAstAsync>>;
 type Options = {
   projectRoot: string;
   cacheRuntime: string;
-  getAppDir: () => string | undefined;
-  matchesPageExtension: (fileName: string) => boolean;
   allowMissingRsc?: boolean;
 };
 
 type CacheWrapperOptions = {
   acceptsSecondArgument: boolean;
-  appPageDefaultExport?: boolean;
   argumentCount?: number;
   serverReferenceId?: string;
 };
@@ -104,23 +102,6 @@ function acceptsSecondArgument(
   );
 }
 
-function isAppPageDefaultExport(
-  options: Options,
-  id: string,
-  name: string,
-  isModuleDirective: boolean,
-): boolean {
-  const appDir = options.getAppDir();
-  if (!isModuleDirective || name !== "default" || !appDir) return false;
-  const modulePath = stripViteModuleQuery(id);
-  const moduleFileName = path.basename(modulePath);
-  return (
-    isPathInside(appDir, modulePath) &&
-    path.parse(moduleFileName).name === "page" &&
-    options.matchesPageExtension(moduleFileName)
-  );
-}
-
 function shouldTransformModuleExport(name: string, id: string, meta: ModuleExportMeta): boolean {
   if (
     meta.isFunction === false &&
@@ -166,19 +147,36 @@ function hasFunctionDirective(
   );
 }
 
+function getFunctionDirectiveExportNames(
+  transforms: RscTransforms,
+  ast: Program,
+  directive: string,
+): Set<string> {
+  const names = new Set<string>();
+  for (const group of transforms.scanModuleExports(ast)) {
+    const entries =
+      group.type === "declaration"
+        ? [group.export]
+        : group.type === "variable-declaration"
+          ? group.declarators.flatMap((declarator) => declarator.exports)
+          : group.type === "specifiers"
+            ? group.exports
+            : group.type === "default"
+              ? [{ exportName: "default", meta: group.meta }]
+              : [];
+    for (const entry of entries) {
+      if (hasFunctionDirective(entry.meta, directive)) names.add(entry.exportName);
+    }
+  }
+  return names;
+}
+
 function getCacheWrapperOptions(
-  options: Options,
-  id: string,
-  name: string,
-  isModuleDirective: boolean,
   meta: Pick<ModuleExportMeta, "valueNode"> | TransformHoistInlineDirectiveMeta,
 ): CacheWrapperOptions {
   const argumentCount = getArgumentCount(meta);
   return {
     acceptsSecondArgument: acceptsSecondArgument(meta),
-    ...(isAppPageDefaultExport(options, id, name, isModuleDirective)
-      ? { appPageDefaultExport: true }
-      : {}),
     ...(argumentCount === undefined ? {} : { argumentCount }),
   };
 }
@@ -193,6 +191,13 @@ export async function createUseCacheCallablePlugin(options: Options): Promise<Pl
     pathToFileURL(rscModulePath).href
   );
   const transforms: RscTransforms = await import(pathToFileURL(transformsPath).href);
+  // Cache functions use React's server-reference transport when they are passed
+  // to Client Components or invoked by the Response Store. The upstream RSC
+  // plugin's reference key is a public, deterministic module-path hash, so the
+  // original export name must not also be the remotely addressable name. A
+  // per-plugin secret keeps aliases stable across every environment/build pass
+  // in one Vite build without making sibling exports derivable from each other.
+  const referenceSecret = randomBytes(32);
   let manager: RscPluginManager | undefined;
 
   return {
@@ -241,6 +246,13 @@ export async function createUseCacheCallablePlugin(options: Options): Promise<Pl
         }
 
         const reference = manager.serverReferences.resolve(id, "rsc");
+        const relativeImportId = manager.toRelativeId(reference.importId);
+        const secureExportName = (name: string) =>
+          `$$vinext_cache_${createHmac("sha256", referenceSecret)
+            .update(relativeImportId)
+            .update("\0")
+            .update(name)
+            .digest("hex")}`;
         const isRsc = this.environment.name === "rsc";
 
         if (!isRsc) {
@@ -263,6 +275,11 @@ export async function createUseCacheCallablePlugin(options: Options): Promise<Pl
             return;
           }
 
+          const useServerExportNames = getFunctionDirectiveExportNames(
+            transforms,
+            ast,
+            "use server",
+          );
           const result = transforms.transformDirectiveProxyExport(ast, {
             code,
             directive: moduleDirective,
@@ -272,7 +289,7 @@ export async function createUseCacheCallablePlugin(options: Options): Promise<Pl
               return true;
             },
             runtime: (name) =>
-              `$$ReactClient.createServerReference(${JSON.stringify(`${reference.referenceKey}#${name}`)},$$ReactClient.callServer,undefined,${this.environment.mode === "dev" ? "$$ReactClient.findSourceMapURL" : "undefined"},${JSON.stringify(name)})`,
+              `$$ReactClient.createServerReference(${JSON.stringify(`${reference.referenceKey}#${useServerExportNames.has(name) ? name : secureExportName(name)}`)},$$ReactClient.callServer,undefined,${this.environment.mode === "dev" ? "$$ReactClient.findSourceMapURL" : "undefined"},${JSON.stringify(name)})`,
           });
           if (!result?.output.hasChanged()) {
             manager.serverReferences.deleteClaim(PLUGIN_NAME, id);
@@ -281,7 +298,9 @@ export async function createUseCacheCallablePlugin(options: Options): Promise<Pl
 
           manager.serverReferences.replaceClaim(PLUGIN_NAME, id, {
             ...reference,
-            exportNames: result.exportNames,
+            exportNames: result.exportNames.map((name) =>
+              useServerExportNames.has(name) ? name : secureExportName(name),
+            ),
           });
           const runtimeEnvironment = this.environment.name === "client" ? "browser" : "ssr";
           result.output.prepend(
@@ -290,17 +309,22 @@ export async function createUseCacheCallablePlugin(options: Options): Promise<Pl
           return magicStringTransformResult(result.output, { hires: "boundary", source: id });
         }
 
+        // Page semantics (omitting searchParams) are not decided here: like
+        // Next.js, the page and page metadata call sites pass `$$isPage` to a
+        // cache function, wherever it is defined (see cache-runtime.ts).
+        const secureExports = new Set<string>();
         const wrap = (
           value: string,
           name: string,
           directiveMatch: RegExpMatchArray,
           meta: Pick<ModuleExportMeta, "valueNode"> | TransformHoistInlineDirectiveMeta,
-          isModuleDirective: boolean,
         ) => {
           const variant = directiveMatch[1] ?? "";
+          const secureName = secureExportName(name);
+          secureExports.add(secureName);
           const wrapperOptions = {
-            ...getCacheWrapperOptions(options, id, name, isModuleDirective, meta),
-            serverReferenceId: `${reference.referenceKey}#${name}`,
+            ...getCacheWrapperOptions(meta),
+            serverReferenceId: `${reference.referenceKey}#${secureName}`,
           };
           return `$$cacheRuntime.registerCachedFunction(${value}, ${JSON.stringify(`${id}:${name}`)}, ${JSON.stringify(variant)}, ${JSON.stringify(wrapperOptions)})`;
         };
@@ -310,11 +334,11 @@ export async function createUseCacheCallablePlugin(options: Options): Promise<Pl
           name: string,
           directiveMatch: RegExpMatchArray,
           meta: Pick<ModuleExportMeta, "valueNode"> | TransformHoistInlineDirectiveMeta,
-          isModuleDirective: boolean,
         ) => {
-          const cached = wrap(value, name, directiveMatch, meta, isModuleDirective);
+          const cached = wrap(value, name, directiveMatch, meta);
+          const secureName = secureExportName(name);
           needsReactServer = true;
-          return `$$VinextReactServer.registerServerReference(${cached}, ${JSON.stringify(reference.referenceKey)}, ${JSON.stringify(name)})`;
+          return `(${secureName} = $$VinextReactServer.registerServerReference(${cached}, ${JSON.stringify(reference.referenceKey)}, ${JSON.stringify(secureName)}))`;
         };
 
         const result = moduleDirective
@@ -330,14 +354,15 @@ export async function createUseCacheCallablePlugin(options: Options): Promise<Pl
                 return true;
               },
               runtime: (value, name, meta) =>
-                runtime(value, name, matchUseCacheDirective(moduleDirective), meta, true),
+                runtime(value, name, matchUseCacheDirective(moduleDirective), meta),
             })
           : transforms.transformHoistInlineDirective(code, ast, {
               directive: USE_CACHE_DIRECTIVE_CANDIDATE,
               rejectNonAsyncFunction: true,
               hoistRuntime: true,
+              noExport: true,
               runtime: (value, name, meta) =>
-                runtime(value, name, matchUseCacheDirective(meta.directiveMatch[0]), meta, false),
+                runtime(value, name, matchUseCacheDirective(meta.directiveMatch[0]), meta),
               encode: (value) => `$$cacheRuntime.encryptCacheCaptures(${value})`,
               decode: (value) => value,
             });
@@ -348,7 +373,7 @@ export async function createUseCacheCallablePlugin(options: Options): Promise<Pl
 
         manager.serverReferences.replaceClaim(PLUGIN_NAME, id, {
           ...reference,
-          exportNames: "names" in result ? result.names : result.exportNames,
+          exportNames: [...secureExports],
         });
         const importPosition =
           ast.body.find((node) => !("directive" in node))?.start ?? code.length;
@@ -358,10 +383,14 @@ export async function createUseCacheCallablePlugin(options: Options): Promise<Pl
             `import * as $$cacheRuntime from ${JSON.stringify(options.cacheRuntime)};`,
             needsReactServer &&
               `import * as $$VinextReactServer from "@vitejs/plugin-rsc/react/rsc/server";`,
+            secureExports.size > 0 && `let ${[...secureExports].join(",")};`,
           ]
             .filter(Boolean)
             .join("\n") + "\n",
         );
+        if (secureExports.size > 0) {
+          result.output.append(`\nexport { ${[...secureExports].join(",")} };\n`);
+        }
         return magicStringTransformResult(result.output, { hires: "boundary", source: id });
       },
     },

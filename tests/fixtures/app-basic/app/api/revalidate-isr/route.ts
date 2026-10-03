@@ -1,11 +1,21 @@
 import { revalidatePath } from "next/cache";
 
 const RESETTABLE_ISR_PATHS = new Set([
+  "/api/storage-policy/no-store",
+  "/metadata-storage/no-store/opengraph-image",
   "/isr-test",
   "/client-isr-test",
   "/revalidate-test",
   "/revalidate-tag-test",
   "/revalidate-tag-test/nested",
+  "/route-cache-identity",
+  "/route-cache-identity/about",
+  "/route-cache-identity/nested/about",
+  "/route-handler-cache-identity/about",
+  "/route-handler-cache-identity/dynamic/alpha",
+  "/route-handler-cache-identity/rewrite",
+  "/api/route-cache-identity/trailing",
+  "/api/route-cache-identity/trailing/",
 ]);
 
 export async function GET(request: Request) {

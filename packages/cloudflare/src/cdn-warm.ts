@@ -112,6 +112,7 @@ export type PrerenderWarmPlan = {
   buildIdentity?: string;
   deploymentId?: string;
   fallbackRoutePatterns?: PrerenderRoutePattern[];
+  loadingBoundaryRoutePatterns?: string[];
   loadingShellPaths: string[];
   pagesDataPaths?: string[];
   pagesPaths?: string[];
@@ -213,11 +214,18 @@ function readPrerenderPathManifest(manifestPath: string): PrerenderPathManifest 
                   (route.cacheabilityProbe.routeMayResolve === undefined ||
                     typeof route.cacheabilityProbe.routeMayResolve === "boolean") &&
                   (route.cacheabilityProbe.requestStageMayTerminate === undefined ||
-                    typeof route.cacheabilityProbe.requestStageMayTerminate === "boolean"))),
+                    typeof route.cacheabilityProbe.requestStageMayTerminate === "boolean") &&
+                  (route.cacheabilityProbe.unlisted === undefined ||
+                    typeof route.cacheabilityProbe.unlisted === "boolean"))),
           ))) ||
       (manifest.loadingShellPaths !== undefined &&
         (!Array.isArray(manifest.loadingShellPaths) ||
           !manifest.loadingShellPaths.every((pathname) => typeof pathname === "string"))) ||
+      (manifest.loadingBoundaryRoutePatterns !== undefined &&
+        (!Array.isArray(manifest.loadingBoundaryRoutePatterns) ||
+          !manifest.loadingBoundaryRoutePatterns.every(
+            (pattern) => typeof pattern === "string" && pattern.startsWith("/"),
+          ))) ||
       (manifest.basePath !== undefined && typeof manifest.basePath !== "string") ||
       (manifest.buildIdentity !== undefined && typeof manifest.buildIdentity !== "string") ||
       (manifest.deploymentId !== undefined && typeof manifest.deploymentId !== "string") ||
@@ -323,6 +331,9 @@ export function createPrerenderWarmPlan(
     ...(manifest.deploymentId ? { deploymentId: manifest.deploymentId } : {}),
     ...(manifest.fallbackRoutePatterns
       ? { fallbackRoutePatterns: manifest.fallbackRoutePatterns }
+      : {}),
+    ...(manifest.loadingBoundaryRoutePatterns
+      ? { loadingBoundaryRoutePatterns: manifest.loadingBoundaryRoutePatterns }
       : {}),
     loadingShellPaths: supportsCanonicalRsc
       ? (manifest.loadingShellPaths ?? []).map(applyConfig)
@@ -1253,14 +1264,16 @@ function shouldRetryValidationFailure(
   return isRetryableStatus(response.status, options.retryNotFound);
 }
 
-function isRetryableCertificationMiss(
+function isRetryableCertificationFailure(
   response: Response,
   statusSource: "cloudflare" | "data-cache" | "vinext",
+  retryPropagationFailures: boolean,
 ): boolean {
   if (statusSource === "cloudflare") {
     const status = response.headers.get("CF-Cache-Status")?.trim().toUpperCase();
     return (
-      ADMITTED_CF_CACHE_STATUSES.has(status ?? "") && !REUSABLE_CF_CACHE_STATUSES.has(status ?? "")
+      !REUSABLE_CF_CACHE_STATUSES.has(status ?? "") &&
+      (retryPropagationFailures || ADMITTED_CF_CACHE_STATUSES.has(status ?? ""))
     );
   }
   const status = response.headers.get(VINEXT_CACHE_HEADER)?.trim().toUpperCase();
@@ -1379,7 +1392,11 @@ async function warmOnePath(
         lastError = validation.error;
         lastRetryable =
           (options.requireCacheHit &&
-            isRetryableCertificationMiss(response, options.statusSource)) ||
+            isRetryableCertificationFailure(
+              response,
+              options.statusSource,
+              options.retryPropagationFailures,
+            )) ||
           shouldRetryValidationFailure(response, target, options);
         if (!lastRetryable) break;
         if (!canRetry(attempt)) break;
@@ -1421,7 +1438,12 @@ async function warmOnePath(
       lastSkippedReason = null;
       lastError = validation.error;
       lastRetryable =
-        (options.requireCacheHit && isRetryableCertificationMiss(response, options.statusSource)) ||
+        (options.requireCacheHit &&
+          isRetryableCertificationFailure(
+            response,
+            options.statusSource,
+            options.retryPropagationFailures,
+          )) ||
         shouldRetryValidationFailure(response, target, options);
       if (!lastRetryable) break;
     } catch (error) {

@@ -8,9 +8,11 @@
  * Previously housed in server/app-dev-server.ts.
  */
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
 import { buildAppRscManifestCode } from "./app-rsc-manifest.js";
 import { resolveEntryPath } from "./runtime-entry-module.js";
 import { toSlash } from "pathslash";
+import { extractExportConstString } from "../build/report.js";
 import type {
   NextHeader,
   NextI18nConfig,
@@ -94,10 +96,6 @@ const appRscRouteMatchingPath = resolveEntryPath(
 );
 const appRscResponseStagePath = resolveEntryPath(
   "../server/app-rsc-response-stage.js",
-  import.meta.url,
-);
-const appRscCombinedHandlerPath = resolveEntryPath(
-  "../server/app-rsc-combined-handler.js",
   import.meta.url,
 );
 const rscStreamHintsPath = resolveEntryPath("../server/rsc-stream-hints.js", import.meta.url);
@@ -185,6 +183,8 @@ type AppRouterConfig = {
    * @see https://nextjs.org/docs/app/api-reference/config/next-config-js/assetPrefix
    */
   assetPrefix?: string;
+  /** CORS mode for framework-managed assets from next.config. */
+  crossOrigin?: "anonymous" | "use-credentials";
   /** Route-level expire fallback in seconds for ISR entries with numeric revalidate. */
   expireTime?: number;
   /**
@@ -236,8 +236,42 @@ type AppRouterConfig = {
 };
 
 function buildAppRequestRouteMetadata(routes: AppRoute[]): unknown[] {
+  const sourceCache = new Map<string, string | null>();
+  const forcesDynamic = (filePath: string | null | undefined): boolean => {
+    if (!filePath) return false;
+    let source = sourceCache.get(filePath);
+    if (source === undefined) {
+      try {
+        source = fs.readFileSync(filePath, "utf8");
+      } catch {
+        source = null;
+      }
+      sourceCache.set(filePath, source);
+    }
+    return source !== null && extractExportConstString(source, "dynamic") === "force-dynamic";
+  };
+
   return routes.map((route) => ({
     canUseCanonicalLoadingShell: appRouteHasMainTreeLoadingBoundary(route),
+    forceDynamic: route.routePath
+      ? forcesDynamic(route.routePath)
+      : [
+          ...route.layouts,
+          route.pagePath,
+          ...route.parallelSlots.flatMap((slot) => [
+            slot.layoutPath,
+            ...(slot.configLayoutPaths ?? []),
+            slot.pagePath ?? slot.defaultPath,
+            ...slot.interceptingRoutes.flatMap((intercept) => [
+              ...intercept.layoutPaths,
+              intercept.pagePath,
+            ]),
+          ]),
+          ...route.siblingIntercepts.flatMap((intercept) => [
+            ...intercept.layoutPaths,
+            intercept.pagePath,
+          ]),
+        ].some(forcesDynamic),
     ids: route.ids ?? null,
     pattern: route.pattern,
     patternParts: route.patternParts,
@@ -325,6 +359,7 @@ export function generateAppRequestRscEntry(
   return `
 import ${JSON.stringify(serverGlobalsPath)};
 import { createAppRscRequestHandler } from "vinext/server/app-rsc-handler";
+import __cacheabilityRequestProjection from "virtual:vinext-cacheability-request-projection";
 import { createAppRscRouteMatcher as __createAppRscRouteMatcher } from ${JSON.stringify(appRscRouteMatchingPath)};
 import { dispatchAppRequestStage as __dispatchAppRequestStage } from ${JSON.stringify(appRequestStageDispatchPath)};
 import { registerConfiguredCacheAdapters as __registerConfiguredCacheAdapters } from "virtual:vinext-cdn-cache-adapter";
@@ -376,6 +411,7 @@ const __trailingSlash = ${JSON.stringify(ts)};
 const __draftModeSecret = ${JSON.stringify(config?.draftModeSecret ?? "")};
 export const __prerenderSecret = ${JSON.stringify(config?.prerenderSecret ?? "")};
 export const __assetPrefix = ${JSON.stringify(config?.assetPrefix ?? "")};
+export const __crossOrigin = ${JSON.stringify(config?.crossOrigin ?? "")};
 export { __basePath };
 export const __imageAllowedWidths = ${JSON.stringify([
     ...(config?.imageConfig?.deviceSizes ?? DEFAULT_DEVICE_SIZES),
@@ -427,8 +463,10 @@ function __isMetadataPath(pathname) {
 ${generateDevOriginCheckCode(config?.allowedDevOrigins)}
 
 const __requestHandler = createAppRscRequestHandler({
+  assetPrefix: __assetPrefix,
   basePath: __basePath,
   buildId: process.env.__VINEXT_BUILD_ID ?? null,
+  cacheabilityRequestProjection: __cacheabilityRequestProjection,
   clearRequestContext: __clearRequestContext,
   configHeaders: ${JSON.stringify(config?.headers ?? [])},
   configRedirects: ${JSON.stringify(config?.redirects ?? [])},
@@ -572,6 +610,7 @@ export function generateRscEntry(
   const htmlLimitedBots = config?.htmlLimitedBots;
   const clientTraceMetadata = config?.clientTraceMetadata;
   const assetPrefix = config?.assetPrefix ?? "";
+  const crossOrigin = config?.crossOrigin ?? "";
   const expireTime = config?.expireTime ?? DEFAULT_EXPIRE_TIME;
   const reactMaxHeadersLength = config?.reactMaxHeadersLength ?? DEFAULT_REACT_MAX_HEADERS_LENGTH;
   const cacheMaxMemorySize = config?.cacheMaxMemorySize;
@@ -722,7 +761,7 @@ ${
 ${
   responseStageOnly
     ? `import { renderAppWorkerResponseStage as __renderAppWorkerResponseStage } from ${JSON.stringify(appRscResponseStagePath)};`
-    : `import { createAppRscHandler } from ${JSON.stringify(appRscCombinedHandlerPath)};`
+    : `import { createAppRscHandler } from "vinext/server/app-rsc-combined-handler";`
 }
 import { registerConfiguredCacheAdapters as __registerConfiguredCacheAdapters } from "virtual:vinext-cache-adapters";
 import __pagesClientAssets from "virtual:vinext-pages-client-assets";
@@ -797,9 +836,13 @@ import {
   resolveAppPageGenerateStaticParamsSources as __resolveAppPageGenerateStaticParamsSources,
 } from ${JSON.stringify(appPageRequestPath)};
 import {
+  collectAppPageStaticGenerationRuntimes as __collectAppPageStaticGenerationRuntimes,
+  hasAppPageGenerateStaticParamsAtLastDynamicSegment as __hasAppPageGenerateStaticParamsAtLastDynamicSegment,
+  isAppPageStaticEligible as __isAppPageStaticEligible,
   isEdgeRuntime as __isEdgeRuntime,
   resolveAppPageFetchCacheMode as __resolveAppPageFetchCacheMode,
   resolveAppPageSegmentConfig as __resolveAppPageSegmentConfig,
+  resolveAppPageStaticGenerationRuntime as __resolveAppPageStaticGenerationRuntime,
 } from ${JSON.stringify(appSegmentConfigPath)};
 import { makeThenableParams } from ${JSON.stringify(thenableParamsShimPath)};
 import {
@@ -922,6 +965,70 @@ function __resolveRouteRuntime(route) {
       slot.page ?? slot.default,
     ]),
   }).runtime ?? null;
+}
+
+function __resolveRouteSegmentConfigBranches(route) {
+  return Object.values(route.slots ?? {}).map((slot) => ({
+    layout: slot.layout,
+    configLayouts: slot.configLayouts,
+    configLayoutTreePositions: slot.configLayoutTreePositions,
+    isDefault: !slot.page,
+    name: slot.name,
+    ownerTreePosition: slot.ownerTreePosition,
+    page: slot.page ?? slot.default,
+    routeSegments: slot.routeSegments,
+  }));
+}
+
+function __resolveRouteSegmentConfig(route, segmentConfigBranches) {
+  return __resolveAppPageSegmentConfig({
+    layouts: route.layouts,
+    layoutTreePositions: route.layoutTreePositions,
+    page: route.page,
+    parallelBranches: segmentConfigBranches,
+    parallelPages: Object.values(route.slots ?? {}).map((slot) => slot.page ?? slot.default),
+    routeSegments: route.routeSegments,
+  });
+}
+
+// The parts of a route's static generation classification that come from its
+// module tree rather than its effective segment config.
+function __resolveRouteStaticGeneration(route, segmentConfigBranches) {
+  return {
+    hasGenerateStaticParams: __hasAppPageGenerateStaticParamsAtLastDynamicSegment({
+      childrenSlot: route.childrenSlot,
+      layouts: route.layouts,
+      layoutTreePositions: route.layoutTreePositions,
+      page: route.page,
+      parallelBranches: segmentConfigBranches,
+      routeSegments: route.routeSegments,
+    }),
+    isStaticGenerationEdgeRuntime: __isEdgeRuntime(
+      __resolveAppPageStaticGenerationRuntime(
+        __collectAppPageStaticGenerationRuntimes({
+          childrenSlot: route.childrenSlot,
+          layouts: route.layouts,
+          layoutTreePositions: route.layoutTreePositions,
+          page: route.page,
+          parallelBranches: segmentConfigBranches,
+          routeSegments: route.routeSegments,
+        }),
+      ),
+    ),
+  };
+}
+
+// Whether Next.js classifies a route as static or SSG, from the same inputs
+// dispatch reads for the matched route.
+function __resolveRouteStaticEligible(route) {
+  const segmentConfigBranches = __resolveRouteSegmentConfigBranches(route);
+  const segmentConfig = __resolveRouteSegmentConfig(route, segmentConfigBranches);
+  return __isAppPageStaticEligible({
+    ...__resolveRouteStaticGeneration(route, segmentConfigBranches),
+    dynamicConfig: segmentConfig.dynamicConfig,
+    isDynamicRoute: route.isDynamic,
+    revalidateSeconds: segmentConfig.revalidateSeconds,
+  });
 }
 
 ${imports.join("\n")}
@@ -1130,6 +1237,7 @@ const __reactMaxHeadersLength = ${JSON.stringify(reactMaxHeadersLength)};
 // mirrors the embedded \`__basePath\` pattern (and Pages Router's
 // \`vinextConfig\` export). Empty string when unset.
 export const __assetPrefix = ${JSON.stringify(assetPrefix)};
+export const __crossOrigin = ${JSON.stringify(crossOrigin)};
 export const __imageAllowedWidths = ${JSON.stringify(imageAllowedWidths)};
 export const __imageConfig = ${JSON.stringify(imageConfig)};
 export const __inlineCss = ${JSON.stringify(inlineCss)};
@@ -1189,6 +1297,7 @@ ${rootParamNameEntries.join("\n")}
 __setPagesClientAssets(__pagesClientAssets);
 function __VINEXT_ACTION_OWNERS() { return ${actionOwners === undefined ? "__vinextActionOwners" : safeJsonStringify(actionOwners)}; }
 ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandler = createAppRscHandler({"}
+  assetPrefix: __assetPrefix,
   basePath: __basePath,
   buildId: process.env.__VINEXT_BUILD_ID ?? null,
   ensureRouteLoaded: __ensureRouteLoaded,
@@ -1212,6 +1321,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
   draftModeSecret: __draftModeSecret,
   dispatchMatchedPage({
     bypassInterceptionContextCache,
+    cachePathname,
     clientReuseManifest,
     cleanPathname,
     displayPathname,
@@ -1241,20 +1351,9 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
     renderMode,
   }) {
     const PageComponent = route.page?.default;
-    const __segmentConfig = __resolveAppPageSegmentConfig({
-      layouts: route.layouts,
-      layoutTreePositions: route.layoutTreePositions,
-      page: route.page,
-      parallelBranches: Object.values(route.slots ?? {}).map((slot) => ({
-        layout: slot.layout,
-        configLayouts: slot.configLayouts,
-        configLayoutTreePositions: slot.configLayoutTreePositions,
-        page: slot.page ?? slot.default,
-        routeSegments: slot.routeSegments,
-      })),
-      parallelPages: Object.values(route.slots ?? {}).map((slot) => slot.page ?? slot.default),
-      routeSegments: route.routeSegments,
-    });
+    const __segmentConfigBranches = __resolveRouteSegmentConfigBranches(route);
+    const __segmentConfig = __resolveRouteSegmentConfig(route, __segmentConfigBranches);
+    const __staticGeneration = __resolveRouteStaticGeneration(route, __segmentConfigBranches);
     const __generateStaticParams = __resolveAppPageGenerateStaticParamsSources({
       layouts: route.layouts,
       layoutTreePositions: route.layoutTreePositions,
@@ -1288,6 +1387,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
           renderMode,
           observeMetadataSearchParamsAccess: buildOptions?.observeMetadataSearchParamsAccess === true,
           observePageSearchParamsAccess: buildOptions?.observePageSearchParamsAccess === true,
+          isForceStatic: buildOptions?.isForceStatic === true,
           serveStreamingMetadata: buildOptions?.serveStreamingMetadata,
           isProduction: process.env.NODE_ENV === "production",
         }, layoutParamAccess, displayPathname, scriptNonce);
@@ -1308,6 +1408,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       dynamicParamsConfig: __segmentConfig.dynamicParamsConfig,
       fetchCache: __segmentConfig.fetchCache ?? null,
       isEdgeRuntime: __isEdgeRuntime(__segmentConfig.runtime),
+      isStaticGenerationEdgeRuntime: __staticGeneration.isStaticGenerationEdgeRuntime,
       findIntercept(pathname) {
         return findIntercept(
           pathname === cleanPathname ? interceptionPathname : pathname,
@@ -1324,7 +1425,8 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
         return routes[sourceRouteIndex];
       },
       hasCustomGlobalError: ${globalErrorVar ? `Boolean(${globalErrorVar}?.default)` : "false"},
-      hasGenerateStaticParams: __generateStaticParams.length > 0,
+      hasAnyGenerateStaticParams: __generateStaticParams.length > 0,
+      hasGenerateStaticParams: __staticGeneration.hasGenerateStaticParams,
       hasPageDefaultExport: !!PageComponent,
       hasPageModule: !!route.page,
       handlerStart,
@@ -1339,8 +1441,18 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       isRscRequest,
       isrDebug: __isrDebug,
       isrGet: __isrGet,
-      isrHtmlKey: __isrHtmlKey,
-      isrRscKey: __isrRscKey,
+      isrHtmlKey(pathname) {
+        return __isrHtmlKey(pathname === cleanPathname ? cachePathname : pathname);
+      },
+      isrRscKey(pathname, mountedSlots, requestedRenderMode, requestedInterceptionContext, requestedInterceptionId) {
+        return __isrRscKey(
+          pathname === cleanPathname ? cachePathname : pathname,
+          mountedSlots,
+          requestedRenderMode,
+          requestedInterceptionContext,
+          requestedInterceptionId,
+        );
+      },
       isrSet: __isrSet,
       loadSsrHandler() {
         return import.meta.viteRsc.loadModule("ssr", "index");
@@ -1430,6 +1542,9 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       resolveRouteDynamicConfig(targetRoute) {
         return __resolveRouteDynamicConfig(targetRoute);
       },
+      resolveRouteStaticEligible(targetRoute) {
+        return __resolveRouteStaticEligible(targetRoute);
+      },
       rootForbiddenModule,
       rootNotFoundModule,
       rootUnauthorizedModule,
@@ -1447,6 +1562,8 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
     });
   },
   async dispatchMatchedRouteHandler({
+    bypassInterceptionContextCache,
+    cachePathname,
     cleanPathname,
     middlewareContext,
     params,
@@ -1458,6 +1575,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       await __loadAppRouteHandlerDispatch();
     return __dispatchAppRouteHandler({
       basePath: __basePath,
+      bypassSharedCache: bypassInterceptionContextCache,
       cleanPathname,
       clearRequestContext() {
         __clearRequestContext();
@@ -1467,7 +1585,9 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       trailingSlash: __trailingSlash,
       isrDebug: __isrDebug,
       isrGet: __isrGet,
-      isrRouteKey: __isrRouteKey,
+      isrRouteKey(pathname) {
+        return __isrRouteKey(pathname === cleanPathname ? cachePathname : pathname);
+      },
       isrSet: __isrSet,
       middlewareContext,
       middlewareRequestHeaders: middlewareContext.requestHeaders,
@@ -1656,6 +1776,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
         renderMode: actionRenderMode,
         observeMetadataSearchParamsAccess,
         observePageSearchParamsAccess,
+        isForceStatic,
         scriptNonce: targetScriptNonce,
       }) {
         return buildPageElements(actionRoute, actionParams, actionCleanPathname, {
@@ -1667,6 +1788,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
           renderMode: actionRenderMode,
           observeMetadataSearchParamsAccess: observeMetadataSearchParamsAccess === true,
           observePageSearchParamsAccess: observePageSearchParamsAccess === true,
+          isForceStatic: isForceStatic === true,
         }, undefined, actionCleanPathname, targetScriptNonce ?? scriptNonce);
       },
       cleanPathname,
@@ -1793,7 +1915,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
   }
   ${
     (metadataRoutes?.length ?? 0) > 0
-      ? `async handleMetadataRouteRequest(cleanPathname) {
+      ? `async handleMetadataRouteRequest(cleanPathname, routePathname) {
     const { handleMetadataRouteRequest: __handleMetadataRouteRequest } =
       await __loadMetadataRouteResponse();
     return __handleMetadataRouteRequest({
@@ -1803,6 +1925,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       isrRouteKey: __isrRouteKey,
       isrSet: __isrSet,
       makeThenableParams,
+      routePathname,
       scheduleBackgroundRegeneration: __triggerBackgroundRegeneration,
     });
   },`

@@ -15,7 +15,9 @@ import {
 } from "../packages/vinext/src/shims/cdn-cache.js";
 import {
   VINEXT_EXPECTED_WORKER_VERSION_HEADER,
+  VINEXT_PARAMS_HEADER,
   VINEXT_PRERENDER_READINESS_HEADER,
+  VINEXT_RENDERED_PATH_AND_SEARCH_HEADER,
 } from "../packages/vinext/src/server/headers.js";
 import { markFrameworkLinkHeaders } from "../packages/vinext/src/server/app-response-header-provenance.js";
 import { setFrameworkRequestRoute } from "../packages/vinext/src/server/request-tracing.js";
@@ -213,10 +215,62 @@ describe("App Worker response stage", () => {
     expect(response.headers.get("x-vinext-app-stage-post-config-link")).toBe("1");
   });
 
+  it("drops the request-scoped headers of a shared App page RSC response", async () => {
+    const pageStage = {
+      ...notFoundStage,
+      bypassInterceptionContextCache: false,
+      cachePathname: "/missing",
+      canUseCanonicalLoadingShell: false,
+      interceptionContext: null,
+      interceptionId: null,
+      kind: "app-page" as const,
+      matchKind: "request" as const,
+      params: {},
+      routePattern: "/missing",
+      routePathname: "/missing",
+    } satisfies AppWorkerResponseStageProps;
+    const rendered = () =>
+      new Response("rsc", {
+        headers: {
+          [VINEXT_PARAMS_HEADER]: encodeURIComponent("{}"),
+          [VINEXT_RENDERED_PATH_AND_SEARCH_HEADER]: encodeURIComponent("/missing?q=1"),
+        },
+      });
+    const render = (props: AppWorkerResponseStageProps, cache: "bypass" | "shared") => {
+      stages.renderResponse.mockImplementationOnce(async () => rendered());
+      return handleResponseStage(
+        new Request("https://example.com/missing?q=1"),
+        undefined,
+        undefined,
+        props,
+        async () => new Response("request-stage"),
+        { cache },
+      );
+    };
+
+    const shared = await render({ ...pageStage, isRscRequest: true }, "shared");
+    expect(shared.headers.has(VINEXT_PARAMS_HEADER)).toBe(false);
+    expect(shared.headers.has(VINEXT_RENDERED_PATH_AND_SEARCH_HEADER)).toBe(false);
+    await expect(shared.text()).resolves.toBe("rsc");
+
+    // Bypassed responses reach no shared cache, and HTML responses and
+    // not-found renders are not recomposed by the request stage.
+    for (const response of [
+      await render({ ...pageStage, isRscRequest: true }, "bypass"),
+      await render(pageStage, "shared"),
+      await render({ ...notFoundStage, isRscRequest: true }, "shared"),
+    ]) {
+      expect(response.headers.get(VINEXT_RENDERED_PATH_AND_SEARCH_HEADER)).toBe(
+        encodeURIComponent("/missing?q=1"),
+      );
+    }
+  });
+
   it("rejects matched-stage payloads missing interception cache-safety fields", () => {
     const matchedStage = {
       ...notFoundStage,
       bypassInterceptionContextCache: false,
+      cachePathname: "/missing",
       canUseCanonicalLoadingShell: false,
       interceptionContext: null,
       interceptionId: null,
@@ -227,13 +281,30 @@ describe("App Worker response stage", () => {
       routePathname: "/missing",
     } satisfies AppWorkerResponseStageProps;
     const { bypassInterceptionContextCache: _bypass, ...withoutBypassProof } = matchedStage;
+    const { cachePathname: _cachePathname, ...withoutCachePathname } = matchedStage;
     const { canUseCanonicalLoadingShell: _loading, ...withoutLoadingCapability } = matchedStage;
     const { interceptionId: _interceptionId, ...withoutInterceptionId } = matchedStage;
 
     expect(isAppWorkerResponseStageProps(matchedStage)).toBe(true);
     expect(isAppWorkerResponseStageProps(withoutBypassProof)).toBe(false);
+    expect(isAppWorkerResponseStageProps(withoutCachePathname)).toBe(false);
     expect(isAppWorkerResponseStageProps(withoutLoadingCapability)).toBe(false);
     expect(isAppWorkerResponseStageProps(withoutInterceptionId)).toBe(false);
+  });
+
+  it("rejects response-stage payloads from the previous protocol", async () => {
+    const response = await handleResponseStage(
+      new Request("https://example.com/missing"),
+      undefined,
+      undefined,
+      { ...notFoundStage, protocolVersion: 9 } as unknown as AppWorkerResponseStageProps,
+      async () => new Response("request-stage"),
+      { cache: "shared" },
+    );
+
+    expect(response.status).toBe(400);
+    expect(stages.ensureInstrumentation).not.toHaveBeenCalled();
+    expect(stages.renderResponse).not.toHaveBeenCalled();
   });
 
   it.each([

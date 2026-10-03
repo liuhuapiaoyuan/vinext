@@ -13,9 +13,14 @@ import {
   createEmptyAppPageRenderObservationState,
   type AppPageRenderObservationState,
 } from "./app-page-render-observation.js";
-import { buildAppPageCacheValue, isrCacheControl, type AppPageCacheSetter } from "./isr-cache.js";
+import {
+  buildAppPageCacheValue,
+  isrCacheControl,
+  resolveRouteExpireSeconds,
+  type AppPageCacheSetter,
+} from "./isr-cache.js";
 import type { CacheControlMetadata } from "vinext/shims/cache-handler";
-import type { RenderObservation } from "./cache-proof.js";
+import { hasQueryInvariantRenderProof, type RenderObservation } from "./cache-proof.js";
 import { resolveClientStaleTimeSeconds } from "../utils/cache-control-metadata.js";
 import { readStreamAsText } from "../utils/text-stream.js";
 import { markFrameworkLinkHeaders } from "./app-response-header-provenance.js";
@@ -53,10 +58,16 @@ type FinalizeAppPageCacheabilityEvaluationOptions = {
   getPageTags: () => string[];
   getRequestCacheLife?: () => AppPageRequestCacheLife | null;
   expireSeconds?: number;
+  /**
+   * `false` for routes Next.js classifies as dynamic (ƒ), which are never
+   * cacheable even when a cacheLife resolves during the render.
+   */
+  isStaticEligible: boolean;
   revalidateSeconds: number | null;
 };
 
 type FinalizeAppPageHtmlCacheResponseOptions = {
+  bypassInterceptionContextCache?: boolean;
   capturedDynamicUsageBeforeContextCleanup?: () => boolean;
   capturedRscDataPromise: Promise<ArrayBuffer> | null;
   cleanPathname: string;
@@ -64,8 +75,8 @@ type FinalizeAppPageHtmlCacheResponseOptions = {
   clientTraceMetadataMarker?: string;
   consumeDynamicUsage: () => boolean;
   consumeRenderObservationState?: () => AppPageRenderObservationState;
-  createHtmlRenderObservation?: BuildAppPageCacheRenderObservation;
-  createRscRenderObservation?: BuildAppPageCacheRenderObservation;
+  createHtmlRenderObservation: BuildAppPageCacheRenderObservation;
+  createRscRenderObservation: BuildAppPageCacheRenderObservation;
   getPageTags: () => string[];
   getRequestCacheLife?: () => AppPageRequestCacheLife | null;
   isrDebug?: AppPageDebugLogger;
@@ -77,6 +88,7 @@ type FinalizeAppPageHtmlCacheResponseOptions = {
   omitPendingDynamicCacheState?: boolean;
   preserveClientResponseHeaders?: boolean;
   expireSeconds?: number;
+  isStaticEligible: boolean;
   revalidateSeconds: number | null;
   linkHeader: string | null;
   waitUntil?: (promise: Promise<void>) => void;
@@ -88,7 +100,7 @@ type ScheduleAppPageRscCacheWriteOptions = {
   cleanPathname: string;
   consumeDynamicUsage: () => boolean;
   consumeRenderObservationState?: () => AppPageRenderObservationState;
-  createRscRenderObservation?: BuildAppPageCacheRenderObservation;
+  createRscRenderObservation: BuildAppPageCacheRenderObservation;
   dynamicUsedDuringBuild: boolean;
   getPageTags: () => string[];
   getRequestCacheLife?: () => AppPageRequestCacheLife | null;
@@ -102,6 +114,7 @@ type ScheduleAppPageRscCacheWriteOptions = {
   renderMode?: AppRscRenderMode;
   preserveClientResponseHeaders?: boolean;
   expireSeconds?: number;
+  isStaticEligible: boolean;
   revalidateSeconds: number | null;
   waitUntil?: (promise: Promise<void>) => void;
 };
@@ -116,7 +129,7 @@ function applyPendingDynamicCdnHeaders(
   finalizePendingCacheStateHeaders(headers, options);
 }
 
-function applyUncacheableRscVariantNoStoreHeaders(
+function applyUncacheableVariantNoStoreHeaders(
   headers: Headers,
   options: { omitCacheState?: boolean } = {},
 ): void {
@@ -159,7 +172,6 @@ function resolveAppPageCacheControl(options: {
   revalidateSeconds: number | null;
 }): CacheControlMetadata | null {
   let revalidateSeconds = options.revalidateSeconds;
-  let expireSeconds = options.expireSeconds;
   const requestCacheLife = options.requestCacheLife;
 
   if (requestCacheLife?.revalidate !== undefined) {
@@ -168,9 +180,8 @@ function resolveAppPageCacheControl(options: {
         ? requestCacheLife.revalidate
         : Math.min(revalidateSeconds, requestCacheLife.revalidate);
   }
-  if (requestCacheLife?.expire !== undefined) {
-    expireSeconds = requestCacheLife.expire;
-  }
+  const expireSeconds =
+    requestCacheLife?.expire ?? resolveRouteExpireSeconds(revalidateSeconds, options.expireSeconds);
 
   if (revalidateSeconds === null || Number.isNaN(revalidateSeconds) || revalidateSeconds <= 0) {
     return null;
@@ -204,6 +215,7 @@ function finalizeEvaluatedAppPageResponse(
     if (completed) return;
     completed = true;
 
+    const observationState = options.consumeRenderObservationState?.();
     let outcome: RouteCacheabilityOutcome;
     if (
       options.capturedDynamicUsageBeforeContextCleanup?.() === true ||
@@ -214,6 +226,8 @@ function finalizeEvaluatedAppPageResponse(
         dynamicUsage: true,
         reason: "dynamic API used during render",
       };
+    } else if (options.isStaticEligible === false) {
+      outcome = { cacheable: false, reason: "route is not statically generated" };
     } else if (
       response.headers.has("set-cookie") ||
       hasExplicitNonCacheableResponsePolicy(response.headers)
@@ -229,11 +243,13 @@ function finalizeEvaluatedAppPageResponse(
         ? {
             cacheable: true,
             cacheControl: appPageCacheControlHeader(cacheControl),
+            ...(observationState && !observationState.requestApis.includes("searchParams")
+              ? { searchParamsUnread: true }
+              : {}),
             tags: options.getPageTags(),
           }
         : { cacheable: false, reason: "render did not produce a cache policy" };
     }
-    options.consumeRenderObservationState?.();
     complete(outcome);
   };
 
@@ -274,6 +290,20 @@ export function finalizeAppPageHtmlCacheResponse(
       }
     }
     return probeResponse;
+  }
+  if (options.bypassInterceptionContextCache === true) {
+    void options.capturedRscDataPromise?.catch(() => {});
+    const headers = new Headers(response.headers);
+    applyUncacheableVariantNoStoreHeaders(headers, {
+      omitCacheState: options.omitPendingDynamicCacheState === true,
+    });
+    const clientResponse = new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+    markFrameworkLinkHeaders(clientResponse.headers, options.linkHeader);
+    return clientResponse;
   }
   if (!response.body) {
     return response;
@@ -325,15 +355,24 @@ export function finalizeAppPageHtmlCacheResponse(
       const pageTags = options.getPageTags();
       const observationState =
         options.consumeRenderObservationState?.() ?? createEmptyAppPageRenderObservationState();
-      const htmlRenderObservation = options.createHtmlRenderObservation?.({
+      const htmlRenderObservation = options.createHtmlRenderObservation({
         cacheTags: pageTags,
         state: observationState,
       });
-      const rscRenderObservation = options.createRscRenderObservation?.({
+      const rscRenderObservation = options.createRscRenderObservation({
         cacheTags: pageTags,
         state: observationState,
       });
       const linkHeader = options.linkHeader;
+      // Every query shares these entries, so a render not proven to leave the
+      // query unread is never stored.
+      if (
+        !hasQueryInvariantRenderProof(htmlRenderObservation) ||
+        !hasQueryInvariantRenderProof(rscRenderObservation)
+      ) {
+        options.isrDebug?.("HTML cache write skipped (searchParams not proven unread)", htmlKey);
+        return;
+      }
       const writes = [
         options.isrSet(
           htmlKey,
@@ -402,7 +441,7 @@ export function finalizeAppPageRscCacheResponse(
 
   const clientHeaders = new Headers(response.headers);
   if (isUncacheableVariant) {
-    applyUncacheableRscVariantNoStoreHeaders(clientHeaders, {
+    applyUncacheableVariantNoStoreHeaders(clientHeaders, {
       omitCacheState: options.omitPendingDynamicCacheState === true,
     });
   } else {
@@ -460,10 +499,16 @@ export function scheduleAppPageRscCacheWrite(
       const pageTags = options.getPageTags();
       const observationState =
         options.consumeRenderObservationState?.() ?? createEmptyAppPageRenderObservationState();
-      const rscRenderObservation = options.createRscRenderObservation?.({
+      const rscRenderObservation = options.createRscRenderObservation({
         cacheTags: pageTags,
         state: observationState,
       });
+      // Every query shares this entry, so a render not proven to leave the
+      // query unread is never stored.
+      if (!hasQueryInvariantRenderProof(rscRenderObservation)) {
+        options.isrDebug?.("RSC cache write skipped (searchParams not proven unread)", rscKey);
+        return;
+      }
       await options.isrSet(rscKey, buildAppPageCacheValue("", rscData, 200, rscRenderObservation), {
         cacheControl,
         tags: pageTags,

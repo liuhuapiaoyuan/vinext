@@ -1,10 +1,14 @@
 import http from "node:http";
 import fsp from "node:fs/promises";
+import { createRequire } from "node:module";
 import path from "node:path";
-import { type ViteDevServer } from "vite";
+import { stripVTControlCharacters } from "node:util";
+import { createLogger, createServer, type ViteDevServer } from "vite";
 import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
 import { APP_FIXTURE_DIR, fetchHtml, startFixtureServer } from "./helpers.js";
 import { getAppRouterDevWarmupTargets } from "../packages/vinext/src/server/app-router-dev-warmup.js";
+import { createExternalStoreFixture } from "./use-sync-external-store-fixture.js";
+import vinext from "../packages/vinext/src/index.js";
 
 const ROOT_LAYOUT_NOT_FOUND_REDIRECT_FIXTURE_DIR = path.resolve(
   import.meta.dirname,
@@ -2190,6 +2194,57 @@ describe("App Router integration", () => {
     expect(res.headers.get("x-nextjs-action-not-found")).toBe("1");
   });
 
+  it("invokes every export alias for the same server action", async () => {
+    for (const exportName of [
+      "firstAliasedAction",
+      "secondAliasedAction",
+      "$$vinext_cache_custom",
+    ]) {
+      const res = await fetch(`${baseUrl}/actions.rsc`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "text/plain",
+          "x-rsc-action": `/app/actions/actions.ts#${exportName}`,
+        },
+        body: JSON.stringify(["proof"]),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain("aliased:proof");
+    }
+  });
+
+  it("rejects hidden cache functions' original dev export names", async () => {
+    const anonymous = await fetch(`${baseUrl}/use-cache-hidden-reference?record=victim`);
+    expect(anonymous.status).toBe(200);
+    expect(await anonymous.text()).toContain("FORBIDDEN");
+
+    const defaultVictim = await fetch(
+      `${baseUrl}/use-cache-hidden-reference?record=victim&source=default`,
+      { headers: { Authorization: "Bearer fixture-victim-session" } },
+    );
+    expect(defaultVictim.status).toBe(200);
+    expect(await defaultVictim.text()).toContain("VICTIM_DEFAULT_PRIVATE_RECORD");
+
+    for (const [exportName, secret] of [
+      ["readRecord", "VICTIM_PRIVATE_RECORD"],
+      ["default", "VICTIM_DEFAULT_PRIVATE_RECORD"],
+    ] as const) {
+      const exploit = await fetch(`${baseUrl}/use-cache-hidden-reference.rsc`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "text/plain",
+          "x-rsc-action": `/app/use-cache-hidden-reference/records.ts#${exportName}`,
+        },
+        body: JSON.stringify(["victim"]),
+      });
+
+      expect(exploit.status).toBe(404);
+      expect(exploit.headers.get("x-nextjs-action-not-found")).toBe("1");
+      expect(await exploit.text()).not.toContain(secret);
+    }
+  });
+
   it("returns action-not-found for an MPA form POST to a page with no decodable action", async () => {
     // Ported from Next.js: test/e2e/app-dir/no-server-actions/no-server-actions.test.ts
     // ("should error when triggering an MPA action on an app with no server actions")
@@ -2582,4 +2637,123 @@ describe("App Router public files whose route starts with basePath in dev", () =
     expect(res.headers.get("allow")).toBe("GET, HEAD");
     expect(await res.text()).toBe("Method Not Allowed");
   });
+});
+
+describe("App Router client modules nested in packages in dev", () => {
+  let server: ViteDevServer;
+  let baseUrl: string;
+  let tmpDir: string;
+
+  beforeAll(async () => {
+    tmpDir = await createExternalStoreFixture();
+
+    ({ server, baseUrl } = await startFixtureServer(tmpDir, { appRouter: true }));
+  }, 30000);
+
+  afterAll(async () => {
+    await server?.close();
+    await fsp.rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("serves use-sync-external-store to the browser from pre-bundled deps (#1207)", async () => {
+    const { res, html } = await fetchHtml(baseUrl, "/");
+    expect(res.status).toBe(200);
+    expect(html).toContain('id="store-0"');
+    expect(html).toContain("server:0");
+
+    const clientModule = await server.environments.client.transformRequest(
+      "/node_modules/nested-client-store-lib/internal/store-1.js",
+    );
+    // The raw CommonJS file has no named ESM exports, so importing it in the
+    // browser fails with "does not provide an export named 'useSyncExternalStore'".
+    expect(clientModule?.code).not.toContain("/node_modules/use-sync-external-store/shim/index.js");
+    expect(clientModule?.code).toContain("/deps/use-sync-external-store_shim_index__js.js");
+  });
+});
+
+describe("optional external store dependency warnings", () => {
+  it.each(["none", "config", "configEnvironment"] as const)(
+    "keeps automatic includes quiet and later %s hook includes actionable",
+    async (laterHook) => {
+      const root = await createExternalStoreFixture("absent");
+      const requireFromProject = createRequire(path.join(root, "package.json"));
+      const warnings: string[] = [];
+      const logger = createLogger("warn");
+      logger.warn = (message) => {
+        warnings.push(stripVTControlCharacters(message));
+      };
+      logger.warnOnce = (message) => logger.warn(message);
+      let server: ViteDevServer | undefined;
+      try {
+        expect(() => requireFromProject.resolve("use-sync-external-store/shim")).toThrow();
+        server = await createServer({
+          root,
+          configFile: false,
+          cacheDir: path.join(root, ".vite"),
+          customLogger: logger,
+          plugins: [
+            vinext({ appDir: root }),
+            {
+              name: "explicit-store-include",
+              enforce: "post",
+              config() {
+                if (laterHook === "config") {
+                  return {
+                    environments: {
+                      client: { optimizeDeps: { include: ["use-sync-external-store/shim"] } },
+                    },
+                  };
+                }
+              },
+              configEnvironment: {
+                order: "post",
+                handler(name) {
+                  if (laterHook === "configEnvironment" && name === "client") {
+                    return { optimizeDeps: { include: ["use-sync-external-store/shim"] } };
+                  }
+                },
+              },
+            },
+          ],
+          server: { host: "127.0.0.1", port: 0 },
+        });
+        await server.listen();
+        const address = server.httpServer!.address();
+        if (!address || typeof address === "string") throw new Error("Missing fixture address");
+        const response = await fetch(`http://127.0.0.1:${address.port}/`);
+        expect(response.status).toBe(200);
+        expect(await response.text()).toContain("No external store dependency");
+        await server.environments.client.depsOptimizer?.scanProcessing;
+        if (laterHook === "none") {
+          expect(warnings).toEqual([]);
+          await server.close();
+          // The caller can reuse its logger for another server. Optional
+          // filtering must not hide that server's explicitly requested imports.
+          server = await createServer({
+            root,
+            configFile: false,
+            cacheDir: path.join(root, ".vite-logger-reuse"),
+            customLogger: logger,
+            optimizeDeps: { noDiscovery: true, include: ["use-sync-external-store/shim"] },
+            server: { host: "127.0.0.1", port: 0 },
+          });
+          await server.listen();
+          await server.environments.client.depsOptimizer?.scanProcessing;
+          expect(warnings).toContain(
+            "Failed to resolve dependency: use-sync-external-store/shim, present in client 'optimizeDeps.include'",
+          );
+        } else {
+          expect(warnings.length).toBeGreaterThan(0);
+          for (const warning of warnings) {
+            expect(warning).toContain("use-sync-external-store/shim,");
+            expect(warning).toContain("client 'optimizeDeps.include'");
+          }
+        }
+      } finally {
+        await server?.close();
+        await fsp.rm(root, { recursive: true, force: true });
+      }
+    },
+    30000,
+  );
 });

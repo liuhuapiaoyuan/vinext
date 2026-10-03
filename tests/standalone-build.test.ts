@@ -256,7 +256,7 @@ describe("emitStandaloneOutput", () => {
         root: appRoot,
         outDir: path.join(appRoot, "dist"),
       }),
-    ).toThrow("Run vinext build first.");
+    ).toThrow("Run vite build first.");
   });
 
   it("falls back when package.json is hidden by exports map", () => {

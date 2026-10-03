@@ -256,7 +256,7 @@ export async function renderAppWorkerResponseStage<TRoute extends AppRscHandlerR
             return new Response("Invalid vinext App response stage", { status: 400 });
           }
           let response =
-            (await options.handleMetadataRouteRequest(props.cleanPathname)) ??
+            (await options.handleMetadataRouteRequest(props.cleanPathname, props.routePathname)) ??
             new Response(null, {
               status: 204,
               headers: { [APP_METADATA_RESPONSE_STAGE_NO_MATCH_HEADER]: "1" },
@@ -376,6 +376,8 @@ export async function renderAppWorkerResponseStage<TRoute extends AppRscHandlerR
             );
           }
           return options.dispatchMatchedRouteHandler({
+            bypassInterceptionContextCache: props.bypassInterceptionContextCache,
+            cachePathname: props.cachePathname,
             cleanPathname: props.cleanPathname,
             middlewareContext,
             params: route.isDynamic ? renderParams : null,
@@ -404,6 +406,7 @@ export async function renderAppWorkerResponseStage<TRoute extends AppRscHandlerR
 
         return options.dispatchMatchedPage({
           bypassInterceptionContextCache: props.bypassInterceptionContextCache,
+          cachePathname: props.cachePathname,
           clientReuseManifest: normalized.clientReuseManifest,
           cleanPathname: props.cleanPathname,
           displayPathname: props.canonicalPathname,

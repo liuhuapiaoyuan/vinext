@@ -36,6 +36,49 @@ function buildISRCacheEntry(value: CachedRouteValue, isStale = false): ISRCacheE
 }
 
 describe("app route handler dispatch", () => {
+  it.each([400, 500])(
+    "retains established ISR eligibility after hard expiry for status %s",
+    async (status) => {
+      const write = vi.fn();
+      const response = await dispatchAppRouteHandler({
+        cleanPathname: "/api/expired-status",
+        clearRequestContext() {},
+        draftModeSecret: "test-secret",
+        isDevelopment: false,
+        isProduction: true,
+        isrGet: async () => ({
+          ...buildISRCacheEntry(buildCachedRouteValue("old")),
+          isExpired: true,
+        }),
+        isrRouteKey: (path) => path,
+        isrSet: write,
+        middlewareContext: { headers: null, status: null },
+        params: null,
+        request: new Request("https://example.com/api/expired-status"),
+        route: {
+          pattern: "/api/expired-status",
+          routeSegments: ["api", "expired-status"],
+          routeHandler: {
+            revalidate: 2,
+            GET: () =>
+              new Response("regenerated error", {
+                status,
+                headers: { "Cache-Control": "private, max-age=300" },
+              }),
+          },
+        },
+        scheduleBackgroundRegeneration() {
+          throw new Error("expired entries regenerate in the foreground");
+        },
+        searchParams: new URLSearchParams(),
+      });
+      expect(response.status).toBe(status);
+      expect(response.headers.get("Cache-Control")).toBe("private, max-age=300");
+      await expect.poll(() => write.mock.calls.length).toBe(1);
+      expect(write.mock.calls[0][1].status).toBe(status);
+    },
+  );
+
   // Ported from Next.js: test/e2e/on-request-error/isr/isr.test.ts
   // https://github.com/vercel/next.js/blob/canary/test/e2e/on-request-error/isr/isr.test.ts
   it.each([
@@ -162,7 +205,7 @@ describe("app route handler dispatch", () => {
         });
 
         expect(response.status).toBe(500);
-        expect(isrGet).not.toHaveBeenCalled();
+        expect(isrGet).toHaveBeenCalledTimes(revalidate === false ? 1 : 0);
         expect(onRequestError.mock.calls[0]?.[2]).toEqual({
           routerKind: "App Router",
           routePath: "/api/uncached",
@@ -437,6 +480,47 @@ describe("app route handler dispatch", () => {
     await expect(response.text()).resolves.toBe("from-cache");
     expect(handlerSpy).not.toHaveBeenCalled();
     expect(didClearRequestContext).toBe(true);
+  });
+
+  it("keeps route-identity-divergent handlers out of origin and CDN caches", async () => {
+    const isrGet = vi.fn(async () => buildISRCacheEntry(buildCachedRouteValue("victim")));
+    const isrSet = vi.fn();
+    const handlerSpy = vi.fn(
+      () =>
+        new Response("encoded catch-all", {
+          headers: { "Cache-Control": "public, s-maxage=3600" },
+        }),
+    );
+
+    const response = await dispatchAppRouteHandler({
+      bypassSharedCache: true,
+      cleanPathname: "/api/about",
+      clearRequestContext() {},
+      draftModeSecret: "test-draft-secret",
+      i18n: null,
+      isDevelopment: false,
+      isProduction: true,
+      isrGet,
+      isrRouteKey: (pathname) => `route:${pathname}`,
+      isrSet,
+      middlewareContext: { headers: null, status: null },
+      middlewareRequestHeaders: null,
+      params: { slug: ["about"] },
+      request: new Request("https://example.com/api/%61bout"),
+      route: {
+        pattern: "/api/:slug+",
+        routeHandler: { GET: handlerSpy, revalidate: 3600 },
+        routeSegments: ["api", "[...slug]"],
+      },
+      scheduleBackgroundRegeneration() {},
+      searchParams: new URLSearchParams(),
+    });
+
+    expect(isrGet).not.toHaveBeenCalled();
+    expect(isrSet).not.toHaveBeenCalled();
+    expect(handlerSpy).toHaveBeenCalledOnce();
+    expect(response.headers.get("Cache-Control")).toContain("no-store");
+    await expect(response.text()).resolves.toBe("encoded catch-all");
   });
 
   it("keeps mixed-method handlers out of the normal ISR cache path", async () => {
