@@ -95,46 +95,34 @@ function memoizeModuleInfo(
   };
 }
 
-type ReachableActionReferences = {
-  clientReferenceImportIds: Set<string>;
-  serverReferenceIds: Set<string>;
-};
-
-const EMPTY_REACHABLE_REFERENCES: ReachableActionReferences = {
-  clientReferenceImportIds: new Set(),
-  serverReferenceIds: new Set(),
-};
-
 export function collectReachableActionReferences(
   options: {
     canonicalizeModuleId?: (id: string) => string;
     getModuleInfo: (id: string) => ActionOwnerModuleInfo | null;
-    /**
-     * Reachable references from a module are the same for every route. Reuse
-     * this map across routes so a shared layout is walked once.
-     */
-    memo?: Map<string, ReachableActionReferences>;
     roots: readonly string[];
   } & ActionOwnerReferenceMaps,
-): ReachableActionReferences {
+): {
+  clientReferenceImportIds: Set<string>;
+  serverReferenceIds: Set<string>;
+} {
   const canonicalizeModuleId = options.canonicalizeModuleId ?? ((id: string) => id);
-  const memo = options.memo ?? new Map<string, ReachableActionReferences>();
-  const stack = new Set<string>();
+  const clientReferenceImportIds = new Set<string>();
+  const serverReferenceIds = new Set<string>();
+  // Visit each module once. A recursive walk re-enters cyclic and diamond
+  // imports and becomes exponential on a real route graph.
+  const visited = new Set<string>();
+  const queue = options.roots.map(canonicalizeModuleId);
 
-  const visit = (id: string): { cyclic: boolean; refs: ReachableActionReferences } => {
-    const cached = memo.get(id);
-    if (cached) return { cyclic: false, refs: cached };
-    // A back edge produces an empty partial. The ancestor that owns the cycle
-    // still unions every descendant's own references before returning.
-    if (stack.has(id)) return { cyclic: true, refs: EMPTY_REACHABLE_REFERENCES };
+  for (let index = 0; index < queue.length; index++) {
+    const id = queue[index]!;
+    if (visited.has(id)) continue;
+    visited.add(id);
 
-    stack.add(id);
-    const clientReferenceImportIds = new Set<string>();
-    const serverReferenceIds = new Set<string>();
     const clientReference = options.clientReferenceMetaMap[id];
     if (clientReference) {
       clientReferenceImportIds.add(clientReference.importId);
     }
+
     const serverReference = options.serverReferenceMetaMap.get(id);
     if (serverReference) {
       for (const exportName of serverReference.exportNames) {
@@ -142,37 +130,15 @@ export function collectReachableActionReferences(
       }
     }
 
-    let cyclic = false;
     const info = options.getModuleInfo(id);
     for (const importedId of [
       ...(info?.importedIds ?? []),
       ...(info?.dynamicallyImportedIds ?? []),
     ]) {
-      const child = visit(importedId);
-      cyclic = cyclic || child.cyclic;
-      for (const importId of child.refs.clientReferenceImportIds) {
-        clientReferenceImportIds.add(importId);
-      }
-      for (const actionId of child.refs.serverReferenceIds) {
-        serverReferenceIds.add(actionId);
-      }
+      if (!visited.has(importedId)) queue.push(importedId);
     }
-    stack.delete(id);
-
-    const refs = { clientReferenceImportIds, serverReferenceIds };
-    // Cycle participants are incomplete until the ancestor finishes, so only
-    // acyclic nodes are safe to reuse from another root.
-    if (!cyclic) memo.set(id, refs);
-    return { cyclic, refs };
-  };
-
-  const clientReferenceImportIds = new Set<string>();
-  const serverReferenceIds = new Set<string>();
-  for (const root of options.roots) {
-    const { refs } = visit(canonicalizeModuleId(root));
-    for (const importId of refs.clientReferenceImportIds) clientReferenceImportIds.add(importId);
-    for (const actionId of refs.serverReferenceIds) serverReferenceIds.add(actionId);
   }
+
   return { clientReferenceImportIds, serverReferenceIds };
 }
 
@@ -185,7 +151,6 @@ export function collectRscActionReachability(
   } & ActionOwnerReferenceMaps,
 ): ActionOwnerRouteReachability {
   const getModuleInfo = memoizeModuleInfo(options.getModuleInfo);
-  const memo = new Map<string, ReachableActionReferences>();
   const routeReachability: ActionOwnerRouteReachability = new Map(
     options.routes.map((route) => [
       route.pattern,
@@ -193,7 +158,6 @@ export function collectRscActionReachability(
         canonicalizeModuleId: options.canonicalizeModuleId,
         clientReferenceMetaMap: options.clientReferenceMetaMap,
         getModuleInfo,
-        memo,
         roots: actionOwnerRouteEntryIds(route),
         serverReferenceMetaMap: options.serverReferenceMetaMap,
       }),
@@ -206,7 +170,6 @@ export function collectRscActionReachability(
         canonicalizeModuleId: options.canonicalizeModuleId,
         clientReferenceMetaMap: options.clientReferenceMetaMap,
         getModuleInfo,
-        memo,
         roots: options.sharedRoots,
         serverReferenceMetaMap: options.serverReferenceMetaMap,
       }),
@@ -260,13 +223,11 @@ export function addClientActionReachability(
   } & ActionOwnerReferenceMaps,
 ): void {
   const getModuleInfo = memoizeModuleInfo(options.getModuleInfo);
-  const memo = new Map<string, ReachableActionReferences>();
   for (const reachability of options.routeReachability.values()) {
     const clientReachability = collectReachableActionReferences({
       canonicalizeModuleId: options.canonicalizeModuleId,
       clientReferenceMetaMap: options.clientReferenceMetaMap,
       getModuleInfo,
-      memo,
       roots: [...reachability.clientReferenceImportIds],
       serverReferenceMetaMap: options.serverReferenceMetaMap,
     });
