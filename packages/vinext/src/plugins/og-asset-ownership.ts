@@ -17,7 +17,7 @@ export type OgAssetModuleBoundary = {
   moduleDir: string;
 };
 
-async function findPackageRoot(
+async function findPackageRootUncached(
   moduleDir: string,
   expectedPackageName?: string,
 ): Promise<string | null> {
@@ -150,12 +150,16 @@ export class OgAssetOwnership {
   // ownership root after an earlier lookup returned null.
   private readonly moduleBoundaries = new Map<string, Promise<OgAssetModuleBoundary | null>>();
   private readonly containedAssets = new Map<string, Promise<string | null>>();
+  private readonly packageRoots = new Map<string, Promise<string | null>>();
+  private readonly realPaths = new Map<string, Promise<string>>();
 
   configure(projectRoot: string, aliases: readonly Alias[]): void {
     this.projectRoot = path.resolve(projectRoot);
     this.resolvedImportPackageRoots.clear();
     this.moduleBoundaries.clear();
     this.containedAssets.clear();
+    this.packageRoots.clear();
+    this.realPaths.clear();
     this.dependencyPackageNames.clear();
     try {
       const manifest = JSON.parse(
@@ -196,9 +200,12 @@ export class OgAssetOwnership {
   reset(): void {
     this.linkedPackageRoots.clear();
     this.resolvedImportPackageRoots.clear();
-    // Keep positive module boundary results across the five RSC environments;
-    // they are independent of the per-environment linked package roots.
+    // A module outside node_modules can become owned by a linked package
+    // discovered in this environment, so boundary results must not cross the
+    // per-environment ownership reset.
+    this.moduleBoundaries.clear();
     this.containedAssets.clear();
+    this.packageRoots.clear();
   }
 
   shouldTrackImport(source: string): boolean {
@@ -238,13 +245,13 @@ export class OgAssetOwnership {
     let realModulePath: string;
     try {
       [realProjectRoot, realModulePath] = await Promise.all([
-        realpathNative(this.projectRoot),
-        realpathNative(modulePath),
+        this.realpath(this.projectRoot),
+        this.realpath(modulePath),
       ]);
     } catch {
       try {
-        realProjectRoot = await realpathNative(this.projectRoot);
-        const realModuleDir = await realpathNative(path.dirname(modulePath));
+        realProjectRoot = await this.realpath(this.projectRoot);
+        const realModuleDir = await this.realpath(path.dirname(modulePath));
         realModulePath = path.join(realModuleDir, path.basename(modulePath));
       } catch {
         return null;
@@ -256,7 +263,7 @@ export class OgAssetOwnership {
     if (logicalPackageRoot !== null) {
       let realPackageRoot: string;
       try {
-        realPackageRoot = await realpathNative(logicalPackageRoot);
+        realPackageRoot = await this.realpath(logicalPackageRoot);
       } catch {
         return null;
       }
@@ -274,7 +281,7 @@ export class OgAssetOwnership {
       ) {
         return null;
       }
-      const canonicalPackageRoot = await findPackageRoot(moduleDir, declaredPackageName);
+      const canonicalPackageRoot = await this.findPackageRoot(moduleDir, declaredPackageName);
       if (canonicalPackageRoot === null) return null;
       if (path.relative(canonicalPackageRoot, realModulePath) !== logicalModuleRelativePath) {
         return null;
@@ -314,11 +321,30 @@ export class OgAssetOwnership {
     assetPath: string,
   ): Promise<string | null> {
     try {
-      const realPath = await realpathNative(assetPath);
+      const realPath = await this.realpath(assetPath);
       return isPathInsideOrEqual(assetRoot, realPath) ? realPath : null;
     } catch {
       return null;
     }
+  }
+
+  private findPackageRoot(moduleDir: string, expectedPackageName?: string): Promise<string | null> {
+    const key = `${moduleDir}\0${expectedPackageName ?? ""}`;
+    const cached = this.packageRoots.get(key);
+    if (cached !== undefined) return cached;
+    const pending = findPackageRootUncached(moduleDir, expectedPackageName);
+    this.packageRoots.set(key, pending);
+    return pending;
+  }
+
+  private realpath(target: string): Promise<string> {
+    const key = path.resolve(target);
+    const cached = this.realPaths.get(key);
+    if (cached !== undefined) return cached;
+    const pending = realpathNative(key);
+    this.realPaths.set(key, pending);
+    pending.catch(() => this.realPaths.delete(key));
+    return pending;
   }
 
   private findAlias(source: string): IndexedAlias | undefined {
@@ -346,7 +372,7 @@ export class OgAssetOwnership {
 
     let realResolvedPath: string;
     try {
-      realResolvedPath = await realpathNative(path.resolve(stripViteModuleQuery(resolvedId)));
+      realResolvedPath = await this.realpath(path.resolve(stripViteModuleQuery(resolvedId)));
     } catch {
       return null;
     }
@@ -359,7 +385,7 @@ export class OgAssetOwnership {
         realResolvedPath,
       );
     }
-    return findPackageRoot(path.dirname(realResolvedPath), expectedPackageName);
+    return this.findPackageRoot(path.dirname(realResolvedPath), expectedPackageName);
   }
 
   private async resolveAliasPackageRoot(
@@ -371,18 +397,18 @@ export class OgAssetOwnership {
     const aliasTarget = applyAlias(alias.find, alias.replacement, source);
     if (!path.isAbsolute(aliasTarget)) return null;
     try {
-      const realAliasTarget = await realpathNative(aliasTarget);
+      const realAliasTarget = await this.realpath(aliasTarget);
       const aliasTargetStat = await fs.promises.stat(realAliasTarget);
       const hasCapture = alias.find instanceof RegExp && alias.replacement.includes("$");
       let configuredDirectory: string | null = null;
       if (!hasCapture) {
-        const realReplacement = await realpathNative(alias.replacement);
+        const realReplacement = await this.realpath(alias.replacement);
         const replacementStat = await fs.promises.stat(realReplacement);
         if (replacementStat.isDirectory()) configuredDirectory = realReplacement;
       }
       if (configuredDirectory !== null || aliasTargetStat.isDirectory()) {
         const aliasBoundary = configuredDirectory ?? realAliasTarget;
-        const packageRoot = await findPackageRoot(path.dirname(realResolvedPath));
+        const packageRoot = await this.findPackageRoot(path.dirname(realResolvedPath));
         if (
           packageRoot === null ||
           !isPathInsideOrEqual(aliasBoundary, packageRoot) ||
@@ -393,7 +419,7 @@ export class OgAssetOwnership {
         return packageRoot;
       }
 
-      const packageRoot = await findPackageRoot(path.dirname(realResolvedPath));
+      const packageRoot = await this.findPackageRoot(path.dirname(realResolvedPath));
       if (
         packageRoot === null ||
         !(await packageOwnsAliasFile(packageRoot, sourcePackageName, realAliasTarget)) ||
@@ -408,7 +434,7 @@ export class OgAssetOwnership {
   }
 
   private async resolveConfiguredAliasRoot(realModulePath: string): Promise<string | null> {
-    const packageRoot = await findPackageRoot(path.dirname(realModulePath));
+    const packageRoot = await this.findPackageRoot(path.dirname(realModulePath));
     if (packageRoot === null || !isPathInsideOrEqual(packageRoot, realModulePath)) return null;
 
     for (const alias of this.configuredAliases) {
@@ -424,7 +450,7 @@ export class OgAssetOwnership {
         const aliasTarget = applyAlias(alias.find, alias.replacement, packageManifestName);
         if (!path.isAbsolute(aliasTarget)) continue;
         try {
-          const realAliasTarget = await realpathNative(aliasTarget);
+          const realAliasTarget = await this.realpath(aliasTarget);
           const aliasTargetStat = await fs.promises.stat(realAliasTarget);
           if (
             (aliasTargetStat.isDirectory() &&
@@ -438,7 +464,7 @@ export class OgAssetOwnership {
       }
 
       try {
-        const realReplacement = await realpathNative(alias.replacement);
+        const realReplacement = await this.realpath(alias.replacement);
         const replacementStat = await fs.promises.stat(realReplacement);
         if (replacementStat.isDirectory()) {
           if (
