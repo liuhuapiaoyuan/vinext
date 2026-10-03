@@ -1,5 +1,11 @@
 # vinext
 
+## 1.0.0-beta.0.32
+
+### Performance
+
+- **Build:** keep action-owner reachability walks linear on cyclic module graphs
+
 ## 1.0.0-beta.0.31
 
 ### Performance
