@@ -1,5 +1,11 @@
 # vinext
 
+## 1.0.0-beta.0.37
+
+### Bug Fixes
+
+- **CLI:** accept `-p` on `vinext dev` as Vite's `--port`
+
 ## 1.0.0-beta.0.36
 
 ### Performance
