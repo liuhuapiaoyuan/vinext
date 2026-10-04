@@ -176,6 +176,8 @@ import { readTrustedRevalidationHostname } from "./server/revalidation-host.js";
 import { installDevStackSourcemapMiddleware } from "./server/dev-stack-sourcemap.js";
 import { applyDevServerRestartPolicy } from "./server/dev-server-restart.js";
 import { getVinextDevWatchIgnored } from "./server/dev-watch-ignore.js";
+import { createDevWatchEventCoalescer } from "./server/dev-watch-coalescer.js";
+import { createTailwindContentHmrPlugin } from "./plugins/tailwind-content-hmr.js";
 import {
   handleNodeWebSocketUpgrade,
   isViteHmrWebSocketUpgrade,
@@ -6007,14 +6009,14 @@ export const loadServerActionClient = ${
          * also be invalidated so Vite re-calls the load() hook to
          * regenerate the entry with the updated route table.
          */
-        function invalidateRscEntryModule() {
+        function invalidateRscEntryModule(sendReload = true): boolean {
           const rscEnv = server.environments["rsc"];
-          if (!rscEnv) return;
+          if (!rscEnv) return false;
           const mod = rscEnv.moduleGraph.getModuleById(RESOLVED_RSC_ENTRY);
-          if (mod) {
-            rscEnv.moduleGraph.invalidateModule(mod);
-            rscEnv.hot.send({ type: "full-reload" });
-          }
+          if (!mod) return false;
+          rscEnv.moduleGraph.invalidateModule(mod);
+          if (sendReload) rscEnv.hot.send({ type: "full-reload" });
+          return true;
         }
 
         function invalidateRootParamsModule() {
@@ -6024,7 +6026,7 @@ export const loadServerActionClient = ${
           }
         }
 
-        function invalidateHybridClientEntries() {
+        function invalidateHybridClientEntries(sendReload = true) {
           if (!hasAppDir || !hasPagesDir) return;
           for (const env of Object.values(server.environments)) {
             for (const id of [RESOLVED_CLIENT_ENTRY, RESOLVED_APP_BROWSER_ENTRY]) {
@@ -6032,7 +6034,7 @@ export const loadServerActionClient = ${
               if (mod) env.moduleGraph.invalidateModule(mod);
             }
           }
-          server.ws.send({ type: "full-reload" });
+          if (sendReload) server.ws.send({ type: "full-reload" });
         }
 
         function invalidatePagesServerEntry() {
@@ -6065,11 +6067,12 @@ export const loadServerActionClient = ${
           }
         }
 
-        function invalidateAppRoutingModules() {
+        function invalidateAppRoutingModules(sendReload = true): boolean {
           invalidateAppRouteCache();
           invalidateMetadataFileCache();
-          invalidateRscEntryModule();
+          const rscEntryInvalidated = invalidateRscEntryModule(sendReload);
           invalidateRootParamsModule();
+          return rscEntryInvalidated;
         }
 
         let hybridRouteValidation: Promise<void> = Promise.resolve();
@@ -6234,9 +6237,9 @@ export const loadServerActionClient = ${
           }
           return publicFilePathVariants(`/${relativePath}`);
         };
-        const updatePublicFileRoute = (filePath: string, present: boolean): void => {
+        const updatePublicFileRoute = (filePath: string, present: boolean): boolean => {
           const routes = publicRoutesForFile(filePath);
-          if (routes === null || devPublicFileRoutes === null) return;
+          if (routes === null || devPublicFileRoutes === null) return false;
           let changed = false;
           for (const route of routes) {
             const routeChanged = present
@@ -6247,59 +6250,125 @@ export const loadServerActionClient = ${
             if (present) devPublicFileRoutes.add(route);
             else devPublicFileRoutes.delete(route);
           }
-          if (!changed) return;
-          if (hasAppDir) invalidateRscEntryModule();
-          if (hasCloudflarePlugin && hasPagesDir && !hasAppDir) invalidatePagesServerEntry();
+          return changed;
         };
+        let pendingPublicRouteInvalidation = false;
 
-        function invalidatePagesMiddlewareMatcher(filePath: string) {
-          if (!hasPagesDir || !middlewarePath || toSlash(filePath) !== middlewarePath) return;
+        function invalidatePagesMiddlewareMatcher(filePath: string, sendReload = true): boolean {
+          if (!hasPagesDir || !middlewarePath || toSlash(filePath) !== middlewarePath) {
+            return false;
+          }
           // The handler snapshots this matcher in each __NEXT_DATA__ response.
           // Editors may save via unlink/add instead of a change event.
           cachedSSRHandler = null;
-          server.ws.send({ type: "full-reload" });
+          if (sendReload) server.ws.send({ type: "full-reload" });
+          return true;
         }
 
+        const coalescedDevWatchEvents = createDevWatchEventCoalescer(
+          (events) => {
+            let routeChanged = false;
+            let pagesRouteChanged = false;
+            let appRouteChanged = false;
+            let pagesClientAssetsChanged = false;
+            const publicRouteChanged = pendingPublicRouteInvalidation;
+            pendingPublicRouteInvalidation = false;
+            let middlewareChanged = false;
+            let rscReloadNeeded = false;
+            let serverReloadNeeded = false;
+
+            for (const { filePath } of events) {
+              if (hasPagesDir && middlewarePath !== null && toSlash(filePath) === middlewarePath) {
+                middlewareChanged = true;
+              }
+
+              const pagesAppChanged = isPagesAppFile(filePath);
+              const pagesAssetGraphScriptChanged = isPotentialPagesAssetGraphScript(filePath);
+              if (
+                hasPagesDir &&
+                (pagesAppChanged ||
+                  STYLESHEET_FILE_RE.test(filePath) ||
+                  pagesAssetGraphScriptChanged)
+              ) {
+                pagesClientAssetsChanged = true;
+              }
+
+              // chokidar reports native separators on Windows; pagesDir is canonical slash.
+              if (
+                hasPagesDir &&
+                isPathInsideOrEqual(pagesDir, toSlash(filePath)) &&
+                pageExtensions.test(filePath)
+              ) {
+                devPageRouteDataKinds.delete(toSlash(filePath));
+                pagesRouteChanged = true;
+                routeChanged = true;
+              }
+              if (hasAppDir && shouldInvalidateAppRouteFile(appDir, filePath, fileMatcher)) {
+                appRouteChanged = true;
+                routeChanged = true;
+              }
+            }
+
+            if (publicRouteChanged && !routeChanged && !appRouteChanged) {
+              if (hasAppDir) {
+                if (invalidateRscEntryModule(false)) rscReloadNeeded = true;
+              }
+              if (hasCloudflarePlugin && hasPagesDir && !hasAppDir) {
+                invalidatePagesServerEntry();
+              }
+            }
+            if (pagesClientAssetsChanged) invalidatePagesClientAssetsModule();
+            if (appRouteChanged) {
+              if (invalidateAppRoutingModules(false)) rscReloadNeeded = true;
+              regenerateAppRouteTypes();
+            }
+            if (routeChanged) {
+              if (pagesRouteChanged) invalidateRouteCache(pagesDir);
+              invalidatePagesServerEntry();
+              if (hasPagesDir) invalidatePagesHydrationProxies();
+              if (!hasAppDir) {
+                serverReloadNeeded = true;
+              }
+              if (hasAppDir && hasPagesDir) {
+                invalidateHybridClientEntries(false);
+                serverReloadNeeded = true;
+              }
+              revalidateHybridRoutes();
+            }
+            if (middlewareChanged) serverReloadNeeded = true;
+            if (serverReloadNeeded) server.ws.send({ type: "full-reload" });
+            else if (rscReloadNeeded) {
+              server.environments["rsc"]?.hot.send({ type: "full-reload" });
+            }
+          },
+          {
+            normalize: (filePath) => {
+              const normalized = toSlash(filePath);
+              return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+            },
+          },
+        );
+        server.watcher.once("close", () => coalescedDevWatchEvents.dispose());
+        server.httpServer?.once("close", () => coalescedDevWatchEvents.dispose());
+
+        const enqueueDevWatchEvent = (kind: "add" | "unlink", filePath: string): void => {
+          // Keep request routing in sync immediately. The expensive module
+          // invalidation is deferred and coalesced below.
+          invalidatePagesMiddlewareMatcher(filePath, false);
+          if (updatePublicFileRoute(filePath, kind === "add")) {
+            pendingPublicRouteInvalidation = true;
+          }
+          coalescedDevWatchEvents.enqueue(kind, filePath);
+        };
+
         server.watcher.on("add", (filePath: string) => {
-          invalidatePagesMiddlewareMatcher(filePath);
-          updatePublicFileRoute(filePath, true);
-          let routeChanged = false;
-          const pagesAppChanged = isPagesAppFile(filePath);
-          const pagesAssetGraphScriptChanged = isPotentialPagesAssetGraphScript(filePath);
-          if (
-            hasPagesDir &&
-            (pagesAppChanged || STYLESHEET_FILE_RE.test(filePath) || pagesAssetGraphScriptChanged)
-          ) {
-            invalidatePagesClientAssetsModule();
-          }
-          // chokidar reports native separators on Windows; pagesDir is canonical slash.
-          if (
-            hasPagesDir &&
-            toSlash(filePath).startsWith(pagesDir) &&
-            pageExtensions.test(filePath)
-          ) {
-            devPageRouteDataKinds.delete(toSlash(filePath));
-            invalidateRouteCache(pagesDir);
-            routeChanged = true;
-          }
-          if (hasAppDir && shouldInvalidateAppRouteFile(appDir, filePath, fileMatcher)) {
-            invalidateAppRoutingModules();
-            regenerateAppRouteTypes();
-            routeChanged = true;
-          }
-          if (routeChanged) {
-            invalidatePagesServerEntry();
-            if (hasPagesDir) invalidatePagesHydrationProxies();
-            if (!hasAppDir) server.ws.send({ type: "full-reload" });
-            invalidateHybridClientEntries();
-            revalidateHybridRoutes();
-          }
+          enqueueDevWatchEvent("add", filePath);
         });
         server.watcher.on("change", (filePath: string) => {
           invalidatePagesMiddlewareMatcher(filePath);
           if (
             hasPagesDir &&
-            toSlash(filePath).startsWith(pagesDir) &&
+            isPathInsideOrEqual(pagesDir, toSlash(filePath)) &&
             pageExtensions.test(filePath)
           ) {
             // The handler snapshots each page's data-loading exports for the
@@ -6323,39 +6392,7 @@ export const loadServerActionClient = ${
           }
         });
         server.watcher.on("unlink", (filePath: string) => {
-          invalidatePagesMiddlewareMatcher(filePath);
-          updatePublicFileRoute(filePath, false);
-          let routeChanged = false;
-          const pagesAppChanged = isPagesAppFile(filePath);
-          const pagesAssetGraphScriptChanged = isPotentialPagesAssetGraphScript(filePath);
-          if (
-            hasPagesDir &&
-            (pagesAppChanged || STYLESHEET_FILE_RE.test(filePath) || pagesAssetGraphScriptChanged)
-          ) {
-            invalidatePagesClientAssetsModule();
-          }
-          // chokidar reports native separators on Windows; pagesDir is canonical slash.
-          if (
-            hasPagesDir &&
-            toSlash(filePath).startsWith(pagesDir) &&
-            pageExtensions.test(filePath)
-          ) {
-            devPageRouteDataKinds.delete(toSlash(filePath));
-            invalidateRouteCache(pagesDir);
-            routeChanged = true;
-          }
-          if (hasAppDir && shouldInvalidateAppRouteFile(appDir, filePath, fileMatcher)) {
-            invalidateAppRoutingModules();
-            regenerateAppRouteTypes();
-            routeChanged = true;
-          }
-          if (routeChanged) {
-            invalidatePagesServerEntry();
-            if (hasPagesDir) invalidatePagesHydrationProxies();
-            if (!hasAppDir) server.ws.send({ type: "full-reload" });
-            invalidateHybridClientEntries();
-            revalidateHybridRoutes();
-          }
+          enqueueDevWatchEvent("unlink", filePath);
         });
 
         type DevPagesMiddleware = (
@@ -8851,6 +8888,7 @@ export const loadServerActionClient = ${
     },
   });
   plugins.push(buildLifecyclePlugins[1]);
+  plugins.push(createTailwindContentHmrPlugin());
 
   return plugins;
 }

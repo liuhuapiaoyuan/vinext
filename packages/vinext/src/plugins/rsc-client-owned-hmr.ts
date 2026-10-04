@@ -1,3 +1,4 @@
+import { isCSSRequest } from "vite";
 import type { HotUpdateOptions, Plugin } from "vite";
 
 export type ClientReferenceLookup = (id: string) => boolean;
@@ -5,6 +6,8 @@ export type ClientReferenceLookup = (id: string) => boolean;
 export type GraphModule = {
   id?: string | null;
   importers?: Iterable<GraphModule>;
+  type?: string;
+  url?: string;
 };
 
 export type ClientModuleGraph = {
@@ -20,13 +23,13 @@ export function isInsideClientBoundary(
   mods: readonly GraphModule[],
   isClientReference: ClientReferenceLookup,
 ): boolean {
-  const visited = new Set<GraphModule>();
+  const visited = new Set<string>();
 
   function recurse(mod: GraphModule): boolean {
     if (!mod.id) return false;
     if (isClientReference(mod.id)) return true;
-    if (visited.has(mod)) return false;
-    visited.add(mod);
+    if (visited.has(mod.id)) return false;
+    visited.add(mod.id);
     if (!mod.importers) return false;
     for (const importer of mod.importers) {
       if (recurse(importer)) return true;
@@ -92,6 +95,48 @@ function getClientReferenceLookup(server: HotUpdateOptions["server"]): ClientRef
   return (id) => Object.hasOwn(map, id);
 }
 
+const SCRIPT_REQUEST_RE = /\.(?:[cm]?[jt]sx?)(?:\?|$)/i;
+
+function isScriptRequest(id: string): boolean {
+  return SCRIPT_REQUEST_RE.test(id);
+}
+
+function hasOnlyCssImporters(mods: readonly GraphModule[]): boolean {
+  if (mods.length === 0) return false;
+
+  return mods.every((mod) => {
+    if (!mod.id || !mod.importers) return false;
+    const importers = [...mod.importers];
+    return (
+      importers.length > 0 &&
+      importers.every((importer) => !!importer.id && isCSSRequest(importer.id))
+    );
+  });
+}
+
+function withoutCssImporters(ctx: HotUpdateOptions): HotUpdateOptions {
+  if (!isScriptRequest(ctx.file) || isCSSRequest(ctx.file)) return ctx;
+
+  let changed = false;
+  const modules = ctx.modules.map((mod) => {
+    const importers = [...mod.importers];
+    const filteredImporters = new Set(
+      importers.filter((importer) => !importer.id || !isCSSRequest(importer.id)),
+    );
+    if (filteredImporters.size === importers.length) return mod;
+
+    changed = true;
+    return new Proxy(mod, {
+      get(target, property, receiver) {
+        if (property === "importers") return filteredImporters;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+  });
+
+  return changed ? { ...ctx, modules } : ctx;
+}
+
 /**
  * plugin-rsc only inspects the *current* environment graph. An unmarked helper
  * imported from `"use client"` (and optionally importing `"use server"`) often
@@ -106,6 +151,8 @@ export function shouldSuppressRscHotUpdate(ctx: {
   modules: readonly GraphModule[];
   server: HotUpdateOptions["server"];
 }): boolean {
+  if (isCSSRequest(ctx.file)) return false;
+
   const isClientReference = getClientReferenceLookup(ctx.server);
   if (isInsideClientBoundary(ctx.modules, isClientReference)) {
     return false;
@@ -130,10 +177,20 @@ export function wrapRscHotUpdatePlugins(plugins: Plugin[]): Plugin[] {
     const originalHandler = typeof original === "function" ? original : original.handler;
 
     async function wrapped(this: ThisParameterType<typeof originalHandler>, ctx: HotUpdateOptions) {
-      if (this.environment?.name === "rsc" && shouldSuppressRscHotUpdate(ctx)) {
-        return [];
+      const environmentName = this.environment?.name;
+      if (environmentName === "rsc") {
+        if (
+          shouldSuppressRscHotUpdate(ctx) ||
+          (isScriptRequest(ctx.file) && hasOnlyCssImporters(ctx.modules))
+        ) {
+          return [];
+        }
       }
-      return originalHandler.call(this, ctx);
+
+      return originalHandler.call(
+        this,
+        environmentName === "client" ? withoutCssImporters(ctx) : ctx,
+      );
     }
 
     return {

@@ -35,6 +35,10 @@ const PAGES_APP_COMPONENT = `export default function App({ Component, pageProps 
 }
 `;
 
+async function waitForDevWatchFlush(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 100));
+}
+
 type ClientBuildManifestEntry = {
   file?: string;
   css?: string[];
@@ -2027,10 +2031,12 @@ export const config = { matcher: "${matcher}" };
         wsSend.mockClear();
         await fsp.rm(middlewareFile);
         devServer.watcher.emit("unlink", middlewareFile);
+        await waitForDevWatchFlush();
         expect(wsSend).toHaveBeenCalledWith({ type: "full-reload" });
         wsSend.mockClear();
         await fsp.writeFile(middlewareFile, previousSource("/c"));
         devServer.watcher.emit("add", middlewareFile);
+        await waitForDevWatchFlush();
         expect(wsSend).toHaveBeenCalledWith({ type: "full-reload" });
         expect(await readMatcher()).toEqual(
           expect.arrayContaining([expect.objectContaining({ source: "/c" })]),
@@ -4858,9 +4864,9 @@ describe("Virtual server entry generation", () => {
       wsSend.mockClear();
       testServer.watcher.emit("add", pagePath);
       testServer.watcher.emit("unlink", pagePath);
-      expect(wsSend).toHaveBeenCalledTimes(2);
-      expect(wsSend).toHaveBeenNthCalledWith(1, { type: "full-reload" });
-      expect(wsSend).toHaveBeenNthCalledWith(2, { type: "full-reload" });
+      await waitForDevWatchFlush();
+      expect(wsSend).toHaveBeenCalledTimes(1);
+      expect(wsSend).toHaveBeenCalledWith({ type: "full-reload" });
     } finally {
       wsSend.mockRestore();
       clientHotSend.mockRestore();

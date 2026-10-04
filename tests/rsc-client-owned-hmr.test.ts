@@ -115,6 +115,126 @@ describe("rsc client-owned HMR", () => {
     expect(shouldSuppressRscHotUpdate(ctx as never)).toBe(false);
   });
 
+  it("does not pass unchanged CSS importers to the client HMR hook", async () => {
+    let receivedImporters: GraphModule[] = [];
+    const cssImporter = node("/app/styles.css");
+    const changed = node("/app/page.tsx", [cssImporter]);
+    const wrapped = wrapRscHotUpdatePlugins([
+      {
+        name: "rsc",
+        hotUpdate(ctx) {
+          receivedImporters = [...(ctx.modules[0]?.importers ?? [])];
+        },
+      },
+    ]);
+
+    const hotUpdate = wrapped[0]?.hotUpdate;
+    expect(hotUpdate).toBeTypeOf("function");
+    if (typeof hotUpdate !== "function") throw new Error("expected function");
+
+    await hotUpdate.call(
+      { environment: { name: "client" } } as never,
+      {
+        file: "/app/page.tsx",
+        modules: [changed],
+        server: { environments: {}, config: { plugins: [] } },
+      } as never,
+    );
+
+    expect(receivedImporters).toEqual([]);
+    expect(changed.importers).toEqual([cssImporter]);
+  });
+
+  it("retains non-CSS importers while dropping unchanged CSS importers", async () => {
+    let receivedImporters: GraphModule[] = [];
+    const cssImporter = node("/app/styles.css");
+    const serverImporter = node("/app/layout.tsx");
+    const changed = node("/app/shared.ts", [cssImporter, serverImporter]);
+    const wrapped = wrapRscHotUpdatePlugins([
+      {
+        name: "rsc",
+        hotUpdate(ctx) {
+          receivedImporters = [...(ctx.modules[0]?.importers ?? [])];
+        },
+      },
+    ]);
+
+    const hotUpdate = wrapped[0]?.hotUpdate;
+    expect(hotUpdate).toBeTypeOf("function");
+    if (typeof hotUpdate !== "function") throw new Error("expected function");
+
+    await hotUpdate.call(
+      { environment: { name: "client" } } as never,
+      {
+        file: "/app/shared.ts",
+        modules: [changed],
+        server: { environments: {} },
+      } as never,
+    );
+
+    expect(receivedImporters).toEqual([serverImporter]);
+    expect(changed.importers).toEqual([cssImporter, serverImporter]);
+  });
+
+  it("does not short-circuit a direct CSS edit", async () => {
+    let called = false;
+    const cssImporter = node("/app/page.tsx");
+    const changed = node("/app/styles.css", [cssImporter]);
+    const wrapped = wrapRscHotUpdatePlugins([
+      {
+        name: "rsc",
+        hotUpdate(ctx) {
+          called = true;
+          expect(ctx.modules[0]?.importers).toEqual([cssImporter]);
+        },
+      },
+    ]);
+
+    const hotUpdate = wrapped[0]?.hotUpdate;
+    expect(hotUpdate).toBeTypeOf("function");
+    if (typeof hotUpdate !== "function") throw new Error("expected function");
+
+    await hotUpdate.call(
+      { environment: { name: "client" } } as never,
+      {
+        file: "/app/styles.css",
+        modules: [changed],
+        server: { environments: {} },
+      } as never,
+    );
+
+    expect(called).toBe(true);
+  });
+
+  it("skips RSC work when every changed script module has only CSS importers", async () => {
+    let called = false;
+    const changed = node("/app/page.tsx", [node("/app/styles.css")]);
+    const wrapped = wrapRscHotUpdatePlugins([
+      {
+        name: "rsc",
+        hotUpdate() {
+          called = true;
+        },
+      },
+    ]);
+
+    const hotUpdate = wrapped[0]?.hotUpdate;
+    expect(hotUpdate).toBeTypeOf("function");
+    if (typeof hotUpdate !== "function") throw new Error("expected function");
+
+    const result = await hotUpdate.call(
+      { environment: { name: "rsc" } } as never,
+      {
+        file: "/app/page.tsx",
+        modules: [changed],
+        server: { environments: {}, config: { plugins: [] } },
+      } as never,
+    );
+
+    expect(result).toEqual([]);
+    expect(called).toBe(false);
+  });
+
   it("wraps the rsc plugin hotUpdate hook", async () => {
     let called = false;
     const wrapped = wrapRscHotUpdatePlugins([
