@@ -1,6 +1,6 @@
 # vinext
 
-## 1.0.0-beta.0.37
+## 1.0.0-beta.0.38
 
 ### Bug Fixes
 
