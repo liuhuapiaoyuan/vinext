@@ -1,5 +1,11 @@
 # vinext
 
+## 1.0.0-beta.0.39
+
+### Bug Fixes
+
+- **Dev:** transform classic module URLs when the dev server uses the in-memory bundle
+
 ## 1.0.0-beta.0.38
 
 ### Bug Fixes
