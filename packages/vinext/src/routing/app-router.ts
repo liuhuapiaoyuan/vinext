@@ -39,6 +39,7 @@ let cachedGraph: AppRouteGraph | null = null;
 let cachedAppDir: string | null = null;
 let cachedPageExtensionsKey: string | null = null;
 let cacheGeneration = 0;
+const inFlightGraphScans = new Map<string, Promise<AppRouteGraph>>();
 
 export function invalidateAppRouteCache(): void {
   cacheGeneration++;
@@ -61,23 +62,38 @@ export async function appRouteGraph(
 ): Promise<AppRouteGraph> {
   matcher ??= createValidFileMatcher(pageExtensions);
   const pageExtensionsKey = JSON.stringify(matcher.extensions);
-  while (true) {
-    if (cachedGraph && cachedAppDir === appDir && cachedPageExtensionsKey === pageExtensionsKey) {
-      return cachedGraph;
+  const scanKey = JSON.stringify([cacheGeneration, appDir, pageExtensionsKey]);
+  const inFlight = inFlightGraphScans.get(scanKey);
+  if (inFlight) return inFlight;
+
+  const scanPromise = (async (): Promise<AppRouteGraph> => {
+    while (true) {
+      if (cachedGraph && cachedAppDir === appDir && cachedPageExtensionsKey === pageExtensionsKey) {
+        return cachedGraph;
+      }
+
+      const scanGeneration = cacheGeneration;
+      const graph = await buildAppRouteGraph(appDir, matcher);
+      // A watcher may invalidate while the async filesystem scan is still in
+      // flight. Retry instead of returning or caching that obsolete snapshot.
+      // Watcher invalidations arrive in finite bursts, so intentionally wait for
+      // a quiescent scan rather than bounding retries and publishing stale routes.
+      if (scanGeneration !== cacheGeneration) continue;
+
+      cachedGraph = graph;
+      cachedAppDir = appDir;
+      cachedPageExtensionsKey = pageExtensionsKey;
+      return graph;
     }
+  })();
+  inFlightGraphScans.set(scanKey, scanPromise);
 
-    const scanGeneration = cacheGeneration;
-    const graph = await buildAppRouteGraph(appDir, matcher);
-    // A watcher may invalidate while the async filesystem scan is still in
-    // flight. Retry instead of returning or caching that obsolete snapshot.
-    // Watcher invalidations arrive in finite bursts, so intentionally wait for
-    // a quiescent scan rather than bounding retries and publishing stale routes.
-    if (scanGeneration !== cacheGeneration) continue;
-
-    cachedGraph = graph;
-    cachedAppDir = appDir;
-    cachedPageExtensionsKey = pageExtensionsKey;
-    return graph;
+  try {
+    return await scanPromise;
+  } finally {
+    if (inFlightGraphScans.get(scanKey) === scanPromise) {
+      inFlightGraphScans.delete(scanKey);
+    }
   }
 }
 

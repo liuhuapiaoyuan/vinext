@@ -18,6 +18,7 @@
 import fs from "node:fs";
 import path from "pathslash";
 import { matchRoutePattern } from "../routing/route-pattern.js";
+import { clearMetadataRouteBuildDataCache } from "./metadata-route-build-data.js";
 
 // -------------------------------------------------------------------
 // Types matching Next.js MetadataRoute
@@ -641,6 +642,7 @@ let cachedMetadataAppDir: string | null = null;
 export function invalidateMetadataFileCache(): void {
   cachedMetadataRoutes = null;
   cachedMetadataAppDir = null;
+  clearMetadataRouteBuildDataCache();
 }
 
 /**

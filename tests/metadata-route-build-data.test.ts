@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
+import { invalidateMetadataFileCache } from "../packages/vinext/src/server/metadata-routes.js";
 import {
   createMetadataRouteEntriesSource,
   createMetadataRouteEntryData,
@@ -218,5 +219,100 @@ describe("metadata route build data", () => {
     expect(() => createMetadataRouteEntriesSource([route], new Map())).toThrow(
       `[vinext] Missing generated module import for dynamic metadata route ${imagePath}`,
     );
+  });
+
+  it("reuses static file facts across repeated source builds", () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-metadata-route-cache-"));
+    const filePath = path.join(tempDir, "opengraph-image.png");
+    const altFilePath = path.join(tempDir, "opengraph-image.alt.txt");
+    fs.copyFileSync(imagePath, filePath);
+    fs.writeFileSync(altFilePath, "Cached alt");
+    const route = createRoute({ filePath, altFilePath });
+    const readFileSpy = vi.spyOn(fs, "readFileSync");
+
+    createMetadataRouteEntriesSource([route], new Map());
+    createMetadataRouteEntriesSource([route], new Map());
+
+    expect(readFileSpy.mock.calls.filter(([file]) => file === filePath)).toHaveLength(1);
+    expect(readFileSpy.mock.calls.filter(([file]) => file === altFilePath)).toHaveLength(1);
+    readFileSpy.mockRestore();
+  });
+
+  it("does not share mutable entry data between cache hits", () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-metadata-route-immutable-"));
+    const filePath = path.join(tempDir, "opengraph-image.png");
+    const altFilePath = path.join(tempDir, "opengraph-image.alt.txt");
+    fs.copyFileSync(imagePath, filePath);
+    fs.writeFileSync(altFilePath, "Immutable alt");
+    const route = createRoute({ filePath, altFilePath });
+
+    const first = createMetadataRouteEntryData(route);
+    if (first.headData?.kind === "openGraph") first.headData.alt = "mutated";
+    const second = createMetadataRouteEntryData(route);
+
+    expect(second.headData).toMatchObject({ alt: "Immutable alt", width: 4, height: 3 });
+  });
+
+  it("revalidates alt text for edits, deletion, and replacement", () => {
+    // Next.js reference: packages/next/src/build/webpack/loaders/next-metadata-image-loader.ts
+    // checks existsSync for the sibling .alt.txt file on every loader evaluation.
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-metadata-route-alt-"));
+    const filePath = path.join(tempDir, "opengraph-image.png");
+    const altFilePath = path.join(tempDir, "opengraph-image.alt.txt");
+    fs.copyFileSync(imagePath, filePath);
+    fs.writeFileSync(altFilePath, "Alt one");
+    const route = createRoute({ filePath, altFilePath });
+
+    expect(createMetadataRouteEntryData(route).headData).toMatchObject({ alt: "Alt one" });
+    fs.writeFileSync(altFilePath, "Alt two");
+    expect(createMetadataRouteEntryData(route).headData).toMatchObject({ alt: "Alt two" });
+    fs.unlinkSync(altFilePath);
+    expect(createMetadataRouteEntryData(route).headData).toMatchObject({ alt: undefined });
+    fs.writeFileSync(altFilePath, "Alt three");
+    expect(createMetadataRouteEntryData(route).headData).toMatchObject({ alt: "Alt three" });
+  });
+
+  it("revalidates content, dimensions, and hash when a file is replaced", () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-metadata-route-replace-"));
+    const filePath = path.join(tempDir, "opengraph-image.png");
+    fs.copyFileSync(imagePath, filePath);
+    const route = createRoute({ filePath });
+
+    const first = createMetadataRouteEntryData(route);
+    fs.copyFileSync(path.resolve("tests/fixtures/images/test-8x6.jpg"), filePath);
+    const second = createMetadataRouteEntryData(route);
+
+    expect(second.contentHash).not.toBe(first.contentHash);
+    expect(second.headData).toMatchObject({ width: 8, height: 6 });
+    expect(second.fileDataBase64).toBe(fs.readFileSync(filePath).toString("base64"));
+  });
+
+  it("does not cache failed image parsing, allowing a same-process retry", () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-metadata-route-retry-"));
+    const filePath = path.join(tempDir, "opengraph-image.png");
+    fs.writeFileSync(filePath, "not an image");
+    const route = createRoute({ filePath });
+
+    expect(() => createMetadataRouteEntryData(route)).toThrow(
+      `[vinext] Failed to read metadata image dimensions for ${filePath}`,
+    );
+    fs.copyFileSync(imagePath, filePath);
+    expect(createMetadataRouteEntryData(route).headData).toMatchObject({ width: 4, height: 3 });
+  });
+
+  it("clears content facts when metadata routes are invalidated before a rebuild", () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-metadata-route-rebuild-"));
+    const filePath = path.join(tempDir, "opengraph-image.png");
+    fs.copyFileSync(imagePath, filePath);
+    const route = createRoute({ filePath });
+    const readFileSpy = vi.spyOn(fs, "readFileSync");
+
+    createMetadataRouteEntryData(route);
+    invalidateMetadataFileCache();
+    readFileSpy.mockClear();
+    createMetadataRouteEntryData(route);
+
+    expect(readFileSpy.mock.calls.filter(([file]) => file === filePath)).toHaveLength(1);
+    readFileSpy.mockRestore();
   });
 });

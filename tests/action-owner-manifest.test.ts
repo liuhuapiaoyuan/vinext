@@ -240,6 +240,28 @@ describe("server action owner manifest", () => {
     expect([...result.serverReferenceIds]).toEqual(["action#submit"]);
   });
 
+  it("propagates references through cyclic shared imports", () => {
+    const result = collectReachableActionReferences({
+      getModuleInfo(id) {
+        const graph: Record<string, string[]> = {
+          "/app/page.tsx": ["/app/shared-a.ts"],
+          "/app/shared-a.ts": ["/app/shared-b.ts"],
+          "/app/shared-b.ts": ["/app/shared-a.ts", "/app/action.ts"],
+          "/app/action.ts": [],
+        };
+        return { dynamicallyImportedIds: [], importedIds: graph[id] ?? [] };
+      },
+      ...referenceMaps({
+        servers: {
+          "/app/action.ts": { exportNames: ["submit"], referenceKey: "action" },
+        },
+      }),
+      roots: ["/app/page.tsx"],
+    });
+
+    expect([...result.serverReferenceIds]).toEqual(["action#submit"]);
+  });
+
   it("includes layouts, boundaries, slots, and intercepts as route roots", () => {
     expect(
       actionOwnerRouteEntryIds({

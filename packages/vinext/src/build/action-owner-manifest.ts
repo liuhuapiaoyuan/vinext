@@ -108,6 +108,214 @@ function memoizeModuleIdCanonicalizer(
   };
 }
 
+type ActionOwnerReachabilityIndex = {
+  collect(roots: readonly string[]): {
+    clientReferenceImportIds: Set<string>;
+    serverReferenceIds: Set<string>;
+  };
+};
+
+type ActionOwnerGraphNode = {
+  children: string[];
+  clientReferenceImportIds: Set<string>;
+  serverReferenceIds: Set<string>;
+};
+
+/**
+ * Build one reachability index for all route roots in a build pass.
+ *
+ * Routes share layouts, loading boundaries, and client components. Walking the
+ * Rolldown graph independently for every route made those shared subgraphs
+ * expensive in large applications. SCC compression keeps cyclic imports
+ * correct while allowing each shared component's action set to be computed
+ * once and reused by every route that reaches it.
+ */
+function createActionOwnerReachabilityIndex(
+  options: {
+    canonicalizeModuleId?: (id: string) => string;
+    getModuleInfo: (id: string) => ActionOwnerModuleInfo | null;
+    rootSets: readonly (readonly string[])[];
+  } & ActionOwnerReferenceMaps,
+): ActionOwnerReachabilityIndex {
+  const canonicalizeModuleId = memoizeModuleIdCanonicalizer(
+    options.canonicalizeModuleId ?? ((id: string) => id),
+  );
+  const graph = new Map<string, ActionOwnerGraphNode>();
+  const pending: string[] = [];
+  const scheduled = new Set<string>();
+
+  for (const roots of options.rootSets) {
+    for (const root of roots) {
+      const canonicalRoot = canonicalizeModuleId(root);
+      if (scheduled.has(canonicalRoot)) continue;
+      scheduled.add(canonicalRoot);
+      pending.push(canonicalRoot);
+    }
+  }
+
+  for (let index = 0; index < pending.length; index++) {
+    const id = pending[index]!;
+    if (graph.has(id)) continue;
+
+    const clientReferenceImportIds = new Set<string>();
+    const clientReference = options.clientReferenceMetaMap[id];
+    if (clientReference) clientReferenceImportIds.add(clientReference.importId);
+
+    const serverReferenceIds = new Set<string>();
+    const serverReference = options.serverReferenceMetaMap.get(id);
+    if (serverReference) {
+      for (const exportName of serverReference.exportNames) {
+        serverReferenceIds.add(`${serverReference.referenceKey}#${exportName}`);
+      }
+    }
+
+    const info = options.getModuleInfo(id);
+    const children: string[] = [];
+    const childIds = new Set<string>();
+    const addChild = (importedId: string) => {
+      const child = canonicalizeModuleId(importedId);
+      if (childIds.has(child)) return;
+      childIds.add(child);
+      children.push(child);
+      if (!scheduled.has(child)) {
+        scheduled.add(child);
+        pending.push(child);
+      }
+    };
+    for (const importedId of info?.importedIds ?? []) addChild(importedId);
+    for (const importedId of info?.dynamicallyImportedIds ?? []) addChild(importedId);
+
+    graph.set(id, { children, clientReferenceImportIds, serverReferenceIds });
+  }
+
+  // Tarjan's algorithm without recursion. A large app graph can exceed the
+  // JavaScript call stack, and the iterative form also avoids per-route stack
+  // allocations.
+  const indices = new Map<string, number>();
+  const lowLinks = new Map<string, number>();
+  const stack: string[] = [];
+  const onStack = new Set<string>();
+  const componentByNode = new Map<string, number>();
+  let componentCount = 0;
+  let nextIndex = 0;
+
+  for (const start of graph.keys()) {
+    if (indices.has(start)) continue;
+    indices.set(start, nextIndex);
+    lowLinks.set(start, nextIndex++);
+    stack.push(start);
+    onStack.add(start);
+    const frames: { id: string; nextChild: number }[] = [{ id: start, nextChild: 0 }];
+
+    while (frames.length > 0) {
+      const frame = frames[frames.length - 1]!;
+      const node = graph.get(frame.id)!;
+      const child = node.children[frame.nextChild++];
+
+      if (child !== undefined) {
+        if (!indices.has(child)) {
+          indices.set(child, nextIndex);
+          lowLinks.set(child, nextIndex++);
+          stack.push(child);
+          onStack.add(child);
+          frames.push({ id: child, nextChild: 0 });
+        } else if (onStack.has(child)) {
+          lowLinks.set(frame.id, Math.min(lowLinks.get(frame.id)!, indices.get(child)!));
+        }
+        continue;
+      }
+
+      frames.pop();
+      const parent = frames[frames.length - 1];
+      if (parent && onStack.has(frame.id)) {
+        lowLinks.set(parent.id, Math.min(lowLinks.get(parent.id)!, lowLinks.get(frame.id)!));
+      }
+      if (lowLinks.get(frame.id) !== indices.get(frame.id)) continue;
+
+      const component = componentCount++;
+      while (true) {
+        const member = stack.pop()!;
+        onStack.delete(member);
+        componentByNode.set(member, component);
+        if (member === frame.id) break;
+      }
+    }
+  }
+  indices.clear();
+  lowLinks.clear();
+  stack.length = 0;
+  onStack.clear();
+
+  const componentChildren = Array.from({ length: componentCount }, () => new Set<number>());
+  const componentClientReferences = Array.from({ length: componentCount }, () => new Set<string>());
+  const componentServerReferences = Array.from({ length: componentCount }, () => new Set<string>());
+  const componentIndegrees = Array.from({ length: componentCount }, () => 0);
+
+  for (const [id, node] of graph) {
+    const component = componentByNode.get(id)!;
+    for (const importId of node.clientReferenceImportIds) {
+      componentClientReferences[component]!.add(importId);
+    }
+    for (const actionId of node.serverReferenceIds) {
+      componentServerReferences[component]!.add(actionId);
+    }
+    for (const child of node.children) {
+      const childComponent = componentByNode.get(child)!;
+      if (childComponent === component || componentChildren[component]!.has(childComponent))
+        continue;
+      componentChildren[component]!.add(childComponent);
+      componentIndegrees[childComponent]!++;
+    }
+  }
+
+  // Component edges point from importer to imported module. Process the
+  // reverse topological order so every child summary is ready before its
+  // importer summary is assembled.
+  const componentQueue = componentIndegrees
+    .map((degree, component) => (degree === 0 ? component : -1))
+    .filter((component) => component !== -1);
+  const componentOrder: number[] = [];
+  for (let index = 0; index < componentQueue.length; index++) {
+    const component = componentQueue[index]!;
+    componentOrder.push(component);
+    for (const child of componentChildren[component]!) {
+      componentIndegrees[child]!--;
+      if (componentIndegrees[child] === 0) componentQueue.push(child);
+    }
+  }
+  for (const component of componentOrder.reverse()) {
+    for (const child of componentChildren[component]!) {
+      for (const importId of componentClientReferences[child]!) {
+        componentClientReferences[component]!.add(importId);
+      }
+      for (const actionId of componentServerReferences[child]!) {
+        componentServerReferences[component]!.add(actionId);
+      }
+    }
+  }
+  graph.clear();
+  componentChildren.length = 0;
+  componentIndegrees.length = 0;
+
+  return {
+    collect(roots) {
+      const clientReferenceImportIds = new Set<string>();
+      const serverReferenceIds = new Set<string>();
+      for (const root of roots) {
+        const component = componentByNode.get(canonicalizeModuleId(root));
+        if (component === undefined) continue;
+        for (const importId of componentClientReferences[component]!) {
+          clientReferenceImportIds.add(importId);
+        }
+        for (const actionId of componentServerReferences[component]!) {
+          serverReferenceIds.add(actionId);
+        }
+      }
+      return { clientReferenceImportIds, serverReferenceIds };
+    },
+  };
+}
+
 export function collectReachableActionReferences(
   options: {
     canonicalizeModuleId?: (id: string) => string;
@@ -118,42 +326,10 @@ export function collectReachableActionReferences(
   clientReferenceImportIds: Set<string>;
   serverReferenceIds: Set<string>;
 } {
-  const canonicalizeModuleId = options.canonicalizeModuleId ?? ((id: string) => id);
-  const clientReferenceImportIds = new Set<string>();
-  const serverReferenceIds = new Set<string>();
-  // Visit each module once. A recursive walk re-enters cyclic and diamond
-  // imports and becomes exponential on a real route graph.
-  const visited = new Set<string>();
-  const queue = options.roots.map(canonicalizeModuleId);
-
-  for (let index = 0; index < queue.length; index++) {
-    const id = queue[index]!;
-    if (visited.has(id)) continue;
-    visited.add(id);
-
-    const clientReference = options.clientReferenceMetaMap[id];
-    if (clientReference) {
-      clientReferenceImportIds.add(clientReference.importId);
-    }
-
-    const serverReference = options.serverReferenceMetaMap.get(id);
-    if (serverReference) {
-      for (const exportName of serverReference.exportNames) {
-        serverReferenceIds.add(`${serverReference.referenceKey}#${exportName}`);
-      }
-    }
-
-    const info = options.getModuleInfo(id);
-    for (const importedId of [
-      ...(info?.importedIds ?? []),
-      ...(info?.dynamicallyImportedIds ?? []),
-    ]) {
-      const canonicalId = canonicalizeModuleId(importedId);
-      if (!visited.has(canonicalId)) queue.push(canonicalId);
-    }
-  }
-
-  return { clientReferenceImportIds, serverReferenceIds };
+  return createActionOwnerReachabilityIndex({
+    ...options,
+    rootSets: [options.roots],
+  }).collect(options.roots);
 }
 
 export function collectRscActionReachability(
@@ -165,32 +341,23 @@ export function collectRscActionReachability(
   } & ActionOwnerReferenceMaps,
 ): ActionOwnerRouteReachability {
   const getModuleInfo = memoizeModuleInfo(options.getModuleInfo);
-  const canonicalizeModuleId = memoizeModuleIdCanonicalizer(
-    options.canonicalizeModuleId ?? ((id: string) => id),
-  );
+  const routeRoots = options.routes.map((route) => actionOwnerRouteEntryIds(route));
+  const rootSets = options.sharedRoots?.length ? [...routeRoots, options.sharedRoots] : routeRoots;
+  const reachabilityIndex = createActionOwnerReachabilityIndex({
+    canonicalizeModuleId: options.canonicalizeModuleId,
+    clientReferenceMetaMap: options.clientReferenceMetaMap,
+    getModuleInfo,
+    rootSets,
+    serverReferenceMetaMap: options.serverReferenceMetaMap,
+  });
   const routeReachability: ActionOwnerRouteReachability = new Map(
-    options.routes.map((route) => [
+    options.routes.map((route, routeIndex) => [
       route.pattern,
-      collectReachableActionReferences({
-        canonicalizeModuleId,
-        clientReferenceMetaMap: options.clientReferenceMetaMap,
-        getModuleInfo,
-        roots: actionOwnerRouteEntryIds(route),
-        serverReferenceMetaMap: options.serverReferenceMetaMap,
-      }),
+      reachabilityIndex.collect(routeRoots[routeIndex]!),
     ]),
   );
   if (options.sharedRoots?.length) {
-    routeReachability.set(
-      "*",
-      collectReachableActionReferences({
-        canonicalizeModuleId,
-        clientReferenceMetaMap: options.clientReferenceMetaMap,
-        getModuleInfo,
-        roots: options.sharedRoots,
-        serverReferenceMetaMap: options.serverReferenceMetaMap,
-      }),
-    );
+    routeReachability.set("*", reachabilityIndex.collect(options.sharedRoots));
   }
   return routeReachability;
 }
@@ -240,17 +407,20 @@ export function addClientActionReachability(
   } & ActionOwnerReferenceMaps,
 ): void {
   const getModuleInfo = memoizeModuleInfo(options.getModuleInfo);
-  const canonicalizeModuleId = memoizeModuleIdCanonicalizer(
-    options.canonicalizeModuleId ?? ((id: string) => id),
-  );
-  for (const reachability of options.routeReachability.values()) {
-    const clientReachability = collectReachableActionReferences({
-      canonicalizeModuleId,
-      clientReferenceMetaMap: options.clientReferenceMetaMap,
-      getModuleInfo,
-      roots: [...reachability.clientReferenceImportIds],
-      serverReferenceMetaMap: options.serverReferenceMetaMap,
-    });
+  const reachabilityEntries = [...options.routeReachability.values()];
+  const rootSets = reachabilityEntries.map((reachability) => [
+    ...reachability.clientReferenceImportIds,
+  ]);
+  const reachabilityIndex = createActionOwnerReachabilityIndex({
+    canonicalizeModuleId: options.canonicalizeModuleId,
+    clientReferenceMetaMap: options.clientReferenceMetaMap,
+    getModuleInfo,
+    rootSets,
+    serverReferenceMetaMap: options.serverReferenceMetaMap,
+  });
+
+  for (const [routeIndex, reachability] of reachabilityEntries.entries()) {
+    const clientReachability = reachabilityIndex.collect(rootSets[routeIndex]!);
     for (const actionId of clientReachability.serverReferenceIds) {
       reachability.serverReferenceIds.add(actionId);
     }
