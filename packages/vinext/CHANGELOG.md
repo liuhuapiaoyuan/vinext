@@ -1,5 +1,11 @@
 # vinext
 
+## 1.0.0-beta.0.36
+
+### Performance
+
+- **Dev:** reduce HMR and watcher invalidation churn
+
 ## 1.0.0-beta.0.35
 
 ### Performance
