@@ -174,6 +174,7 @@ import { collectInlineCssManifest, injectInlineCssManifestGlobal } from "./build
 import { validateDevRequest } from "./server/dev-origin-check.js";
 import { readTrustedRevalidationHostname } from "./server/revalidation-host.js";
 import { installDevStackSourcemapMiddleware } from "./server/dev-stack-sourcemap.js";
+import { installBundledDevTransformMiddleware } from "./server/bundled-dev-transform.js";
 import { applyDevServerRestartPolicy } from "./server/dev-server-restart.js";
 import { getVinextDevWatchIgnored } from "./server/dev-watch-ignore.js";
 import { createDevWatchEventCoalescer } from "./server/dev-watch-coalescer.js";
@@ -6463,6 +6464,10 @@ export const loadServerActionClient = ${
 
         // Return a function to register middleware AFTER Vite's built-in middleware
         return () => {
+          // After memory-file serving, before the App Router catch-all. Bundled
+          // dev does not transform `/src/*.css` or `/@id/` on its own.
+          installBundledDevTransformMiddleware(server);
+
           const viteFilesystemMiddlewares = server.middlewares.stack
             .filter(({ handle }) => {
               const name = typeof handle === "function" ? handle.name : "";

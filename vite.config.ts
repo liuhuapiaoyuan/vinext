@@ -194,6 +194,7 @@ export default defineConfig({
             // When adding a test that calls startFixtureServer() or createServer(),
             // move it here.
             "tests/app-router-client-preloading.test.ts",
+            "tests/bundled-dev-transform.test.ts",
             "tests/app-router-deployment-id.test.ts",
             "tests/app-router-dev-server.test.ts",
             "tests/app-router-dev-externals.test.ts",
@@ -279,6 +280,7 @@ export default defineConfig({
           // `setupServer` rather than reverting this exclusion.
           include: [
             "tests/app-router-client-preloading.test.ts",
+            "tests/bundled-dev-transform.test.ts",
             "tests/app-router-deployment-id.test.ts",
             "tests/app-router-dev-server.test.ts",
             "tests/app-router-dev-externals.test.ts",
