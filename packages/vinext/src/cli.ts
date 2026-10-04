@@ -70,6 +70,19 @@ function rejectRetiredVinextFlags(): void {
   }
 }
 
+/** Next.js `dev -p <port>` shortcut. Vite only accepts `--port`. */
+function rewriteDevPortShortcut(): void {
+  for (let index = 0; index < rawArgs.length; index++) {
+    const arg = rawArgs[index];
+    if (arg === "--") break;
+    if (arg === "-p") {
+      rawArgs[index] = "--port";
+      continue;
+    }
+    if (arg.startsWith("-p=")) rawArgs[index] = `--port=${arg.slice(3)}`;
+  }
+}
+
 function configPreflight(command: ViteCommand): { root: string; configPath?: string } {
   const cwd = process.cwd();
   const { root: positionalRoot, shouldPreflight } = findViteRoot(command, rawArgs);
@@ -126,6 +139,7 @@ function resolveProjectViteCli(root: string): string {
 async function proxyVite(command: ViteCommand): Promise<void> {
   printVinextStartupBanner({ version: VERSION, command });
   console.warn(`[vinext] Tip: migrate from \`vinext ${command}\` to \`vite ${command}\`.`);
+  if (command === "dev") rewriteDevPortShortcut();
   rejectRetiredVinextFlags();
   const { root, configPath } = configPreflight(command);
   const cliPath = resolveProjectViteCli(root);
@@ -466,6 +480,7 @@ function printHelp(cmd?: string) {
 
   Examples:
     vinext dev                         Start dev server on port 3000
+    vinext dev -p 4000                 Start dev server on port 4000
     vinext dev --port 4000             Start dev server on port 4000
     vinext build                       Build for production
     vinext typegen                     Generate route helper types
@@ -477,6 +492,7 @@ function printHelp(cmd?: string) {
     vp exec vinext-cloudflare deploy   Deploy to Cloudflare Workers with Vite+
 
   The dev and build commands are thin proxies to the project-local Vite CLI.
+  \`vinext dev -p <port>\` is accepted as Vite's \`--port\`.
   Run \`vinext init\` first if the project does not have a Vite config.
 `);
 }

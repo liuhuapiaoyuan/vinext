@@ -131,7 +131,8 @@ Your existing `pages/`, `app/`, `next.config.js`, and `public/` directories work
 
 `vinext dev` and `vinext build` remain as thin aliases for the project-local Vite commands.
 They require a Vite config; if one is missing, run `vinext init`. Vite owns their options,
-output, and exit behavior. For older configured projects, the aliases still preload dotenv
+output, and exit behavior. `vinext dev -p <port>` is kept as a shortcut for Vite's `--port`.
+For older configured projects, the aliases still preload dotenv
 before Vite evaluates the config and add `"type": "module"` (renaming known CommonJS config
 files to `.cjs`) when an unambiguous default Vite config requires the ESM migration. An explicit
 `"type": "commonjs"` is never changed. Direct `vite dev` and `vite build` do not perform these

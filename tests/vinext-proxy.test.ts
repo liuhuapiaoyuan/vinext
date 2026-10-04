@@ -58,8 +58,8 @@ afterEach(async () => {
 
 describe("thin vinext command proxies", () => {
   it.each([
-    ["dev", "-p", "--port"],
     ["dev", "-H", "--host"],
+    ["build", "-p", "--port"],
     ["dev", "--hostname=localhost", "--host"],
     ["dev", "--turbopack", "no-op"],
     ["dev", "--experimental-https", "server.https"],
@@ -81,6 +81,43 @@ describe("thin vinext command proxies", () => {
     expect(result.stderr).toContain(guidance);
     expect(result.stderr).not.toContain("Unknown option");
   });
+
+  it.each(["-p", "-p="])("forwards dev %s to Vite as --port", (flag) => {
+    const root = createRoot();
+    const result = spawnSync(process.execPath, [CLI_PATH, "dev", flag], {
+      cwd: root,
+      encoding: "utf-8",
+    });
+
+    expect(result.status).toBe(1);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("value is missing");
+    expect(result.stderr).not.toContain("no longer supported");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("Unknown option");
+  });
+
+  it("serves on the port given with -p", async () => {
+    const root = createRoot();
+    writeProject(root);
+    child = spawn(process.execPath, [CLI_PATH, "dev", "-p", "0", "--clearScreen", "false"], {
+      cwd: root,
+      stdio: "pipe",
+    });
+
+    const info = await waitFor(() => {
+      const current = readLockfile(getLockfilePath(root));
+      return current && current.port > 0 ? current : undefined;
+    });
+    const response = await fetch(info.appUrl);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("proxy");
+
+    const exited = new Promise<void>((resolve) => {
+      child!.once("exit", () => resolve());
+    });
+    child.kill("SIGTERM");
+    await exited;
+    child = undefined;
+  }, 60_000);
 
   it("does not change native Vite command errors", () => {
     const root = createRoot();
