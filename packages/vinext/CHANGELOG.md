@@ -1,5 +1,11 @@
 # vinext
 
+## 1.0.0-beta.0.35
+
+### Performance
+
+- **Build:** reuse route graphs and metadata facts
+
 ## 1.0.0-beta.0.34
 
 ### Performance
