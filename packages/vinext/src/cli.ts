@@ -16,7 +16,8 @@ import path, { toSlash } from "pathslash";
 import fs from "node:fs";
 import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
+import { hasAppRouterDirectory, runIsolatedProductionBuild } from "./build/isolated-rsc-build.js";
 import {
   detectPackageManager,
   ensureViteConfigCompatibility,
@@ -172,6 +173,41 @@ async function proxyVite(command: ViteCommand): Promise<void> {
     }
   }
   await import(/* @vite-ignore */ pathToFileURL(cliPath).href);
+}
+
+function restartBuildWithExposedGc(): void {
+  if (process.execArgv.includes("--expose-gc") || process.env.VINEXT_BUILD_GC === "0") return;
+  const runtime = path.basename(process.execPath).toLowerCase();
+  if (runtime !== "node" && runtime !== "node.exe") return;
+  const child = spawnSync(process.execPath, ["--expose-gc", ...process.argv.slice(1)], {
+    stdio: "inherit",
+    env: process.env,
+  });
+  if (child.error) throw child.error;
+  process.exit(child.status ?? 1);
+}
+
+async function runBuildCommand(): Promise<void> {
+  const phase = process.env.VINEXT_BUILD_ISOLATION_PHASE;
+  if (!phase && process.env.VINEXT_BUILD_ISOLATION !== "0") {
+    const { root } = configPreflight("build");
+    if (hasAppRouterDirectory(root)) {
+      const cliPath = process.argv[1];
+      if (!cliPath) throw new Error("[vinext] Could not resolve the vinext CLI path.");
+      runIsolatedProductionBuild({
+        execPath: process.execPath,
+        cliPath,
+        args: rawArgs,
+        cwd: process.cwd(),
+        root,
+      });
+      return;
+    }
+  }
+  // One-process builds still need a full GC to drop bundle source between
+  // environments. Isolated phases already exit, so they skip this restart.
+  if (!phase) restartBuildWithExposedGc();
+  await proxyVite("build");
 }
 
 async function start() {
@@ -518,7 +554,7 @@ switch (command) {
     break;
 
   case "build":
-    proxyVite("build").catch((error) => {
+    runBuildCommand().catch((error) => {
       console.error(error instanceof Error ? error.message : error);
       process.exit(1);
     });

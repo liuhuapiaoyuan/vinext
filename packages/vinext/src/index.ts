@@ -100,6 +100,8 @@ import {
 } from "./build/report.js";
 import { planRouteClassificationInjection } from "./build/route-classification-injector.js";
 import { createActionOwnerManifestPlugin } from "./plugins/action-owner-manifest.js";
+import { createIsolatedRscBuildPlugin } from "./build/isolated-rsc-build.js";
+import { createReleaseRscBuildMemoryPlugin } from "./build/release-rsc-build-memory.js";
 import { createRscBuildOptimizationsPlugin } from "./plugins/rsc-build-optimizations.js";
 import { normalizePathnameForRouteMatchStrict } from "./routing/utils.js";
 import { hasBasePath, stripBasePath } from "./utils/base-path.js";
@@ -2034,6 +2036,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             ssr: VIRTUAL_APP_SSR_ENTRY,
             client: VIRTUAL_APP_BROWSER_ENTRY,
           },
+          customBuildApp: Boolean(process.env.VINEXT_BUILD_ISOLATION_PHASE),
         });
         const useCachePlugin = await createUseCacheCallablePlugin({
           projectRoot: earlyBaseDir,
@@ -2363,13 +2366,16 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
     onComplete: () => buildLifecycleInvocation?.onComplete?.(),
     shouldDeferPostBuild: () => buildLifecycleInvocation !== undefined,
     shouldPrepare: (config) =>
-      buildLifecycleEnabled &&
-      config.build?.write !== false &&
-      !config.build?.lib &&
-      (buildLifecycleInvocation !== undefined ||
-        (!config.build?.watch &&
-          !config.build?.ssr &&
-          getBuildBundlerOptions(config.build)?.input === undefined)),
+      process.env.VINEXT_BUILD_ISOLATION_PHASE !== undefined &&
+      process.env.VINEXT_BUILD_ISOLATION_PHASE !== "client-references"
+        ? false
+        : buildLifecycleEnabled &&
+          config.build?.write !== false &&
+          !config.build?.lib &&
+          (buildLifecycleInvocation !== undefined ||
+            (!config.build?.watch &&
+              !config.build?.ssr &&
+              getBuildBundlerOptions(config.build)?.input === undefined)),
     onPrepare: () => {
       if (!hasAppDir || reactUpgradeChecked) return;
       reactUpgradeChecked = true;
@@ -8831,6 +8837,18 @@ export const loadServerActionClient = ${
     if (rscPluginPromise) {
       plugins.push(
         createRscBuildOptimizationsPlugin({
+          async getManager(config) {
+            const rscPluginModule = await rscPluginModulePromise;
+            return rscPluginModule?.getPluginApi(config)?.manager;
+          },
+        }),
+        createReleaseRscBuildMemoryPlugin({
+          async getManager(config) {
+            const rscPluginModule = await rscPluginModulePromise;
+            return rscPluginModule?.getPluginApi(config)?.manager;
+          },
+        }),
+        createIsolatedRscBuildPlugin({
           async getManager(config) {
             const rscPluginModule = await rscPluginModulePromise;
             return rscPluginModule?.getPluginApi(config)?.manager;

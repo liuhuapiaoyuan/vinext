@@ -11,11 +11,28 @@ import {
   resolveClientReferenceImportIds,
   type ActionOwnerRouteReachability,
 } from "../build/action-owner-manifest.js";
+import {
+  isolationBuildPhase,
+  loadActionOwnerReachability,
+  saveActionOwnerReachability,
+} from "../build/isolated-rsc-build.js";
 
 export const ACTION_OWNER_MANIFEST_ID = "virtual:vinext-action-owner-manifest";
 
 const RESOLVED_ACTION_OWNER_MANIFEST_ID = `\0${ACTION_OWNER_MANIFEST_ID}`;
 const ACTION_OWNER_MANIFEST_FILE = "__vinext_action_owner_manifest.js";
+
+async function writeActionOwnerManifest(
+  outDir: string | undefined,
+  manifest: Record<string, string[]>,
+): Promise<void> {
+  if (!outDir) return;
+  await fs.promises.mkdir(outDir, { recursive: true });
+  await fs.promises.writeFile(
+    path.join(outDir, ACTION_OWNER_MANIFEST_FILE),
+    `export default ${safeJsonStringify(manifest)};\n`,
+  );
+}
 
 function getModuleInfo(context: Rollup.PluginContext, id: string) {
   const info = context.getModuleInfo(id);
@@ -73,7 +90,13 @@ export function createActionOwnerManifestPlugin(options: {
           serverReferenceMetaMap: manager.serverReferences.metaMap,
           sharedRoots: options.getSharedRoots(),
         });
+        if (isolationBuildPhase() === "rsc") {
+          saveActionOwnerReachability(config.root, routeReachability);
+        }
       } else if (this.environment.name === "client") {
+        if (isolationBuildPhase() === "client" && routeReachability.size === 0) {
+          routeReachability = loadActionOwnerReachability(config.root);
+        }
         await resolveClientReferenceImportIds({
           canonicalizeModuleId: options.canonicalizeModuleId,
           resolveId: async (id) => (await this.resolve(id))?.id ?? null,
@@ -87,6 +110,9 @@ export function createActionOwnerManifestPlugin(options: {
           serverReferenceMetaMap: manager.serverReferences.metaMap,
         });
         manifest = buildActionOwnerManifest(routeReachability);
+        if (isolationBuildPhase() === "client") {
+          await writeActionOwnerManifest(manager.config.environments.rsc?.build.outDir, manifest);
+        }
       }
     },
     renderChunk(code, chunk) {
@@ -101,17 +127,14 @@ export function createActionOwnerManifestPlugin(options: {
     buildApp: {
       order: "post",
       async handler(builder) {
+        // Isolated phases exit before this hook, except the final Nitro
+        // process, which did not collect this manifest and must not erase it.
+        if (isolationBuildPhase()) return;
         if (rscOutputDirs.size === 0) {
           rscOutputDirs.add(builder.config.environments.rsc.build.outDir);
         }
         await Promise.all(
-          [...rscOutputDirs].map(async (outDir) => {
-            await fs.promises.mkdir(outDir, { recursive: true });
-            await fs.promises.writeFile(
-              path.join(outDir, ACTION_OWNER_MANIFEST_FILE),
-              `export default ${safeJsonStringify(manifest)};\n`,
-            );
-          }),
+          [...rscOutputDirs].map((outDir) => writeActionOwnerManifest(outDir, manifest)),
         );
         routeReachability = new Map();
         manifest = {};
