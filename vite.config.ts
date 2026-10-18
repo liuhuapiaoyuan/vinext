@@ -7,6 +7,7 @@ const SHIMS_SRC = path.resolve(import.meta.dirname, "packages/vinext/src/shims")
 const VINEXT_SRC = path.resolve(import.meta.dirname, "packages/vinext/src");
 const CLOUDFLARE_SRC = path.resolve(import.meta.dirname, "packages/cloudflare/src");
 const MSW_SETUP = path.resolve(import.meta.dirname, "tests/_msw/setup.ts");
+const FLIGHT_CODEC_SETUP = path.resolve(import.meta.dirname, "tests/_setup/flight-codec.ts");
 
 // Resolve own-workspace sources directly in tests so the vinext <->
 // @vinext/cloudflare dependency edge points at source (single module instance,
@@ -38,6 +39,11 @@ export default defineConfig({
       // Kept byte-for-byte comparable with Sentry's upstream Next.js fixture.
       "tests/e2e/sentry-nextjs-16-static/fixture/**",
       "tests/fixtures/ecosystem/**",
+      // Ported from next-intl's playground; kept in upstream style for diffing.
+      "tests/fixtures/cf-next-intl/**",
+      "tests/e2e/cloudflare-next-intl/**",
+      "tests/fixtures/cf-next-intl-example/**",
+      "tests/e2e/cloudflare-next-intl-example/**",
       "examples/**",
       "packages/types/next/upstream/**",
     ],
@@ -181,7 +187,7 @@ export default defineConfig({
         test: {
           name: "unit",
           server: { deps: { inline: ["@vercel/og"] } },
-          setupFiles: [MSW_SETUP],
+          setupFiles: [MSW_SETUP, FLIGHT_CODEC_SETUP],
           // `scripts/**` covers the release-tooling unit tests
           // (scripts/create-changeset.test.ts, scripts/version.test.ts), which
           // are pure-logic and have no fixture/server dependencies.
@@ -220,6 +226,7 @@ export default defineConfig({
             "tests/cjs-globals-runtime.test.ts",
             "tests/cjs.test.ts",
             "tests/client-global-define.test.ts",
+            "tests/connection-probe-worker.test.ts",
             "tests/dep-scan-bundled-deps.test.ts",
             "tests/dev-route-discovery.test.ts",
             "tests/dynamic-requests-build.test.ts",
@@ -229,12 +236,14 @@ export default defineConfig({
             "tests/features.test.ts",
             "tests/favicon-short-circuit.test.ts",
             "tests/hybrid-i18n-api-handoff.test.ts",
+            "tests/skip-trailing-slash-redirect.test.ts",
             "tests/image-optimization-parity.test.ts",
             "tests/instrumentation-dev.test.ts",
             "tests/invalid-static-asset-404.test.ts",
             "tests/middleware-matcher-auth.test.ts",
             "tests/next-intl-cloudflare.test.ts",
             "tests/node-modules-css.test.ts",
+            "tests/node-request-cancellation.test.ts",
             "tests/optimize-deps-jsx-in-js.test.ts",
             "tests/optimize-imports-integration.test.ts",
             "tests/pages-i18n-prod.test.ts",
@@ -242,10 +251,12 @@ export default defineConfig({
             "tests/pages-router-concurrency.test.ts",
             "tests/pages-router-nitro.test.ts",
             "tests/pages-router.test.ts",
+            "tests/pages-server-only-use-server.test.ts",
             "tests/process-browser-define.test.ts",
             "tests/postcss-resolve.test.ts",
             "tests/prerender.test.ts",
             "tests/sass-tsconfig-paths.test.ts",
+            "tests/standalone-workspace-versions.test.ts",
             "tests/static-export.test.ts",
             "tests/tsconfig-path-alias-resolution.test.ts",
             "tests/vite-hmr-websocket.test.ts",
@@ -306,6 +317,7 @@ export default defineConfig({
             "tests/cjs-globals-runtime.test.ts",
             "tests/cjs.test.ts",
             "tests/client-global-define.test.ts",
+            "tests/connection-probe-worker.test.ts",
             "tests/dep-scan-bundled-deps.test.ts",
             "tests/dev-route-discovery.test.ts",
             "tests/dynamic-requests-build.test.ts",
@@ -315,6 +327,7 @@ export default defineConfig({
             "tests/favicon-short-circuit.test.ts",
             "tests/features.test.ts",
             "tests/hybrid-i18n-api-handoff.test.ts",
+            "tests/skip-trailing-slash-redirect.test.ts",
             "tests/image-optimization-parity.test.ts",
             "tests/instrumentation-dev.test.ts",
             "tests/invalid-static-asset-404.test.ts",
@@ -322,6 +335,7 @@ export default defineConfig({
             "tests/middleware-matcher-auth.test.ts",
             "tests/next-intl-cloudflare.test.ts",
             "tests/node-modules-css.test.ts",
+            "tests/node-request-cancellation.test.ts",
             "tests/optimize-deps-jsx-in-js.test.ts",
             "tests/optimize-imports-integration.test.ts",
             "tests/pages-i18n-prod.test.ts",
@@ -329,10 +343,12 @@ export default defineConfig({
             "tests/pages-router-concurrency.test.ts",
             "tests/pages-router-nitro.test.ts",
             "tests/pages-router.test.ts",
+            "tests/pages-server-only-use-server.test.ts",
             "tests/process-browser-define.test.ts",
             "tests/postcss-resolve.test.ts",
             "tests/prerender.test.ts",
             "tests/sass-tsconfig-paths.test.ts",
+            "tests/standalone-workspace-versions.test.ts",
             "tests/static-export.test.ts",
             "tests/tsconfig-path-alias-resolution.test.ts",
             "tests/vite-hmr-websocket.test.ts",

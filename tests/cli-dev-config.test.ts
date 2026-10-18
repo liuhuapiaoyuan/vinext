@@ -7,12 +7,13 @@ import {
 } from "../packages/vinext/src/cli-dev-config.js";
 
 describe("applyDevServerDefaults", () => {
-  it("uses vinext defaults when neither config nor CLI flags specify values", () => {
+  it("leaves the port to Vite when neither config nor CLI flags specify one", () => {
     const server: ServerOptions = {};
 
     applyDevServerDefaults(server, {});
 
-    expect(server).toMatchObject({ host: "localhost", port: 3000, open: true });
+    // vinext still opens the browser by default; the port is left to Vite.
+    expect(server).toEqual({ host: "localhost", open: true });
   });
 
   it("preserves an explicit server.open=false", () => {

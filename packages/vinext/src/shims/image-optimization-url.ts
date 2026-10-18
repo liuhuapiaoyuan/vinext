@@ -20,6 +20,12 @@ function extractLocalDeploymentId(src: string): { src: string; deploymentId?: st
   };
 }
 
+// Next.js defaults `images.path` to `${basePath}/_next/image` and appends a
+// slash when trailingSlash is enabled. The `url` source is never prefixed.
+const IMAGE_ENDPOINT = `${process.env.__NEXT_ROUTER_BASEPATH ?? ""}/_next/image${
+  process.env.__VINEXT_TRAILING_SLASH === "true" ? "/" : ""
+}`;
+
 /**
  * Build a `/_next/image` optimization URL.
  *
@@ -34,5 +40,5 @@ export function imageOptimizationUrl(src: string, width: number, quality: number
   const source = extractLocalDeploymentId(src);
   const deploymentQuery =
     source.src.startsWith("/") && source.deploymentId ? `&dpl=${source.deploymentId}` : "";
-  return `/_next/image?url=${encodeURIComponent(source.src)}&w=${width}&q=${quality}${deploymentQuery}`;
+  return `${IMAGE_ENDPOINT}?url=${encodeURIComponent(source.src)}&w=${width}&q=${quality}${deploymentQuery}`;
 }
