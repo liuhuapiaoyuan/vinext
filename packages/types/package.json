@@ -21,6 +21,9 @@
     "./next/augmentations": {
       "types": "./next/augmentations.d.ts"
     },
+    "./next/optional-stubs": {
+      "types": "./next/next-optional-stubs.d.ts"
+    },
     "./next/vinext/error": {
       "types": "./next/vinext/error.d.ts"
     },
