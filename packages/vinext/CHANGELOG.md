@@ -1,5 +1,17 @@
 # vinext
 
+## 1.0.0-beta.0.44
+
+### Bug Fixes
+
+- **Build:** keep Nitro externals across isolated build processes
+
+  Isolated App Router builds run each RSC phase in its own child process, and every phase except `nitro` exits when done. The `vinext:server-externals-manifest` collector only runs while building the `rsc` and `ssr` environments, so the `nitro` phase — the one that owns the `compiled` hook and copies externals into `.output/server/node_modules` — started with an empty collector Set and silently lost every package the bundler had left external. A package that is external through Next.js's default `serverExternalPackages` list (such as `@aws-sdk/client-s3`) but not user-declared therefore stayed a bare import in the emitted chunks with no matching copy and no matching warning: the build exited 0 and the runtime threw "Cannot find package" on every route that imported it.
+
+  Collected package names are now persisted to the build-scoped isolation state file and read back in the `nitro` phase, so the bundler's own external graph keeps driving the copy across the process split. Only packages that are actually external are copied, so standalone images do not grow the way they would if the whole Next.js defaults list were force-copied.
+
+  The output is also verified now: after copying, the emitted server code is scanned for bare imports and the build fails when a package it imports is absent from `.output/server/node_modules`, naming the files that import it. Previously a standalone deploy that only copies `.output` surfaced this as a runtime 500. Set `VINEXT_SKIP_OUTPUT_DEP_CHECK=1` to skip the check.
+
 ## 1.0.0-beta.0.39
 
 ### Bug Fixes
