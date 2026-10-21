@@ -100,7 +100,11 @@ import {
 } from "./build/report.js";
 import { planRouteClassificationInjection } from "./build/route-classification-injector.js";
 import { createActionOwnerManifestPlugin } from "./plugins/action-owner-manifest.js";
-import { createIsolatedRscBuildPlugin } from "./build/isolated-rsc-build.js";
+import {
+  appendServerExternals,
+  createIsolatedRscBuildPlugin,
+  readServerExternals,
+} from "./build/isolated-rsc-build.js";
 import { createReleaseRscBuildMemoryPlugin } from "./build/release-rsc-build-memory.js";
 import { createRscBuildOptimizationsPlugin } from "./plugins/rsc-build-optimizations.js";
 import { normalizePathnameForRouteMatchStrict } from "./routing/utils.js";
@@ -1773,7 +1777,17 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   // Package names the RSC/SSR bundler left external, collected in-process by
   // vinext:server-externals-manifest during the build. Consumed by the Nitro
   // `compiled` hook to copy whole packages into .output/server/node_modules.
+  // Only populated when the whole build runs in one process; isolated builds
+  // persist these to disk instead (see `isolatedExternalsStateDir`).
   const nitroServerExternalPackages = new Set<string>();
+  // Set for App Router CLI builds that run each RSC phase in its own child
+  // process. Those children exit before the Nitro `compiled` hook runs, so
+  // collected externals must travel through the isolation state file.
+  let isolatedExternalsStateDir: string | null = null;
+  // Opt-out for the post-build check that every package imported by the Nitro
+  // output is actually present in .output/server/node_modules. The check fails
+  // the build instead of shipping an image that 500s on first request.
+  const skipOutputDependencyCheck = process.env.VINEXT_SKIP_OUTPUT_DEP_CHECK === "1";
   let nitroHostRuntime: "node" | "worker" = "node";
   let resolvedServerExternalPackages: string[] = [];
   let registerNodeOpenTelemetryLoader = false;
@@ -3326,6 +3340,14 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           openTelemetryPackages,
         );
         resolvedServerExternalPackages = nextServerExternal;
+        // Mirror the CLI's isolation decision (see runBuildCommand in cli.ts):
+        // App Router production builds run each RSC phase in a separate child
+        // process unless VINEXT_BUILD_ISOLATION=0. Detecting it here lets the
+        // externals collector choose disk persistence over in-memory state.
+        isolatedExternalsStateDir =
+          env.command === "build" && hasAppDir && process.env.VINEXT_BUILD_ISOLATION !== "0"
+            ? root
+            : null;
         // Nitro's dependency tracer (nitro:externals → resolveTraceDeps) only
         // copies `nitro.options.traceDeps` plus its built-in native package
         // lists into `.output/server/node_modules`. Every package vinext
@@ -8074,7 +8096,16 @@ export const loadServerActionClient = ${
     // fragile regex scanning of emitted files. The callback feeds the same
     // list to the Nitro `compiled` hook (see vinext:nitro-route-rules below).
     createServerExternalsManifestPlugin({
-      onExternalPackage: (packageName) => nitroServerExternalPackages.add(packageName),
+      onExternalPackage: (packageName) => {
+        nitroServerExternalPackages.add(packageName);
+        // Isolated builds run `rsc`/`ssr` in child processes that exit before
+        // the Nitro `compiled` hook runs, so the in-memory Set above never
+        // reaches it. Persist each collected name to the build-scoped isolation
+        // state file, which the `nitro` phase reads back.
+        if (isolatedExternalsStateDir) {
+          appendServerExternals(isolatedExternalsStateDir, [packageName]);
+        }
+      },
     }),
     // Authoritative externalization for Nitro/Rolldown: return
     // `{ id, external: true }` from resolveId so Rolldown never tries to
@@ -8302,14 +8333,18 @@ export const loadServerActionClient = ${
               const { copyExternalPackagesWithRuntimeDeps, listInstalledPackageNames } =
                 await import("./build/standalone.js");
 
-              // Three sources, unioned:
-              // 1. Bundler import graph (bare or absolute node_modules paths)
-              // 2. User-declared externals (next.config + vite ssr.external + OG)
-              // 3. Packages nf3 already placed in .output — heal partial trees
+              // Four sources, unioned:
+              // 1. Bundler import graph collected in-process (single-process builds)
+              // 2. Bundler import graph persisted by the rsc/ssr phases (isolated
+              //    builds, where this hook runs in a different process)
+              // 3. User-declared externals (next.config + vite ssr.external + OG)
+              // 4. Packages nf3 already placed in .output — heal partial trees
               //    (the @opentelemetry/* "package.json without main" failure)
+              const persistedExternals = readServerExternals(root);
               const packages = [
                 ...new Set([
                   ...nitroServerExternalPackages,
+                  ...persistedExternals,
                   ...nitroWholePackageCopySeeds,
                   ...listInstalledPackageNames(targetNodeModulesDir),
                 ]),
@@ -8331,6 +8366,31 @@ export const loadServerActionClient = ${
               info(
                 `[vinext] Copied ${copiedPackages.length} external package(s) into .output/server/node_modules.`,
               );
+
+              // Backstop: the copy above is best-effort (it can only copy what
+              // its seeds mention). Verify against what the emitted code
+              // actually imports, so a package that slipped through every seed
+              // fails the build here instead of turning into a runtime
+              // "Cannot find package" 500 in a container that only copied
+              // .output. Skipped when the user opted out of the check.
+              if (!skipOutputDependencyCheck) {
+                const { findMissingExternals } = await import("./build/verify-externals.js");
+                const { missing, importers } = findMissingExternals(serverDir);
+                if (missing.length > 0) {
+                  const details = missing
+                    .map((name) => {
+                      const from = importers[name]?.slice(0, 3).join(", ") ?? "unknown";
+                      return `  - ${name} (imported by ${from})`;
+                    })
+                    .join("\n");
+                  throw new Error(
+                    `[vinext] ${missing.length} package(s) are imported by the Nitro server output but missing from ` +
+                      `.output/server/node_modules:\n${details}\n` +
+                      `A standalone deploy that only copies .output will fail at runtime with "Cannot find package".\n` +
+                      `Add them to next.config serverExternalPackages, or set VINEXT_SKIP_OUTPUT_DEP_CHECK=1 to skip this check.`,
+                  );
+                }
+              }
             });
           }
 
