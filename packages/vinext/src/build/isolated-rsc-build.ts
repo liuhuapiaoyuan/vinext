@@ -62,6 +62,19 @@ type IsolationState = {
   bundleDirs: Record<string, string>;
   assetsManifestCode?: string;
   actionOwnerReachability?: PersistedReachability;
+  /**
+   * Package names the RSC/SSR bundlers left external, collected by
+   * vinext:server-externals-manifest during the `rsc` and `ssr` phases.
+   *
+   * This must cross the process boundary: the phases run in separate
+   * `spawnSync` child processes that `process.exit(0)` on completion, while the
+   * Nitro `compiled` hook — the only consumer that copies externals into
+   * `.output/server/node_modules` — runs later in the `nitro` phase process,
+   * where `rsc`/`ssr` are marked built and never rebuilt. Without persisting
+   * this list, the copy seed set silently loses every bundler-external package
+   * and shipped images fail at runtime with "Cannot find package".
+   */
+  serverExternals?: string[];
 };
 
 const EMPTY_STATE: IsolationState = {
@@ -108,6 +121,47 @@ export function updateIsolationState(root: string, patch: Partial<IsolationState
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(next));
   return next;
+}
+
+/**
+ * Append package names collected by `vinext:server-externals-manifest` to the
+ * build-scoped isolation state file.
+ *
+ * Called from the `rsc` and `ssr` build processes, which each run in their own
+ * child process and `process.exit(0)` once done. The Nitro `compiled` hook
+ * later reads the result back via {@link readServerExternals} in the `nitro`
+ * process, so the bundler's external graph still drives the
+ * `.output/server/node_modules` copy across the process split.
+ *
+ * Safe to call repeatedly: `rsc` and `ssr` each contribute, and names are
+ * de-duplicated on merge.
+ */
+export function appendServerExternals(root: string, packageNames: readonly string[]): void {
+  if (packageNames.length === 0) return;
+  const current = readIsolationState(root).serverExternals ?? [];
+  const merged = [...new Set([...current, ...packageNames])];
+  if (merged.length === current.length) return;
+  updateIsolationState(root, { serverExternals: merged });
+}
+
+/**
+ * Read the package names the RSC/SSR bundlers left external during this build.
+ *
+ * Returns an empty array when the build did not run through the isolated
+ * phases (single-process builds collect these in memory instead) or when the
+ * state file is absent.
+ */
+export function readServerExternals(root: string): string[] {
+  const file = isolationStatePath(root);
+  if (!fs.existsSync(file)) return [];
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as IsolationState;
+    return Array.isArray(parsed.serverExternals) ? parsed.serverExternals : [];
+  } catch {
+    // A corrupt state file must not fail the build; the Nitro copy step still
+    // falls back to its other seed sources.
+    return [];
+  }
 }
 
 export function saveActionOwnerReachability(
