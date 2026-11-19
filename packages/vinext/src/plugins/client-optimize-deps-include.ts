@@ -146,12 +146,6 @@ export const VINEXT_OPTIONAL_CLIENT_OPTIMIZE_DEPS_INCLUDE = Object.freeze([
   "three",
 ]);
 
-/** @deprecated Use {@link VINEXT_SHIM_OPTIMIZE_DEPS_INCLUDE} and {@link VINEXT_OPTIONAL_CLIENT_OPTIMIZE_DEPS_INCLUDE}. */
-export const VINEXT_CLIENT_OPTIMIZE_DEPS_INCLUDE = Object.freeze([
-  ...VINEXT_SHIM_OPTIMIZE_DEPS_INCLUDE,
-  ...VINEXT_OPTIONAL_CLIENT_OPTIMIZE_DEPS_INCLUDE,
-]);
-
 export function mergeOptimizeDepsInclude(
   ...includeGroups: readonly (readonly string[])[]
 ): string[] {

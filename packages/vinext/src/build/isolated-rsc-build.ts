@@ -7,7 +7,7 @@ import type { ActionOwnerRouteReachability } from "./action-owner-manifest.js";
 
 const ASSETS_MANIFEST_FILE = "__vite_rsc_assets_manifest.js";
 
-export const ISOLATED_RSC_BUILD_PHASES = [
+const ISOLATED_RSC_BUILD_PHASES = [
   "client-references",
   "server-references",
   "rsc",
@@ -99,7 +99,7 @@ export function hasAppRouterDirectory(root: string): boolean {
   return fs.existsSync(path.join(root, "app")) || fs.existsSync(path.join(root, "src", "app"));
 }
 
-export function isolationStatePath(root: string): string {
+function isolationStatePath(root: string): string {
   return path.join(root, "node_modules", ".vinext", "isolated-rsc-build.json");
 }
 

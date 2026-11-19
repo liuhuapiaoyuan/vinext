@@ -27,7 +27,7 @@ export type AppRouterImageOptimizationEnv = {
 };
 
 /** Build image security/size config from Vite `define` env vars baked at build time. */
-export function createImageConfigFromEnv(): ImageConfig {
+function createImageConfigFromEnv(): ImageConfig {
   return {
     deviceSizes: JSON.parse(
       process.env.__VINEXT_IMAGE_DEVICE_SIZES ?? JSON.stringify(DEFAULT_DEVICE_SIZES),

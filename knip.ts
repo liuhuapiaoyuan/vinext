@@ -197,6 +197,8 @@ export default {
     "oxlint",
     "gh",
     "jq",
+    // Windows listener probe in src/server/dev-process.ts
+    "netstat",
   ],
   ignoreFiles: [
     "tests/e2e/cloudflare-static-export/fixture/dist/**",
@@ -205,6 +207,11 @@ export default {
     // stub module loaded via `path.resolve()` as a Vite alias target
     "packages/vinext/src/client/empty-module.ts",
   ],
+  // Dedicated dev-server port reclamation helpers. They are wired up by the
+  // fork's dev entry in a follow-up, so keep the exports until a caller lands.
+  ignoreIssues: {
+    "packages/vinext/src/server/dev-process.ts": ["exports"],
+  },
   // Catalog check is noisy here (deps consumed from the workspace's own
   // sub-packages or `examples/**` which we intentionally ignore).
   // `duplicates` flags intentional compat aliases — see

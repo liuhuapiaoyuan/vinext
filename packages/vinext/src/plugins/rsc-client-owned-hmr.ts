@@ -10,7 +10,7 @@ export type GraphModule = {
   url?: string;
 };
 
-export type ClientModuleGraph = {
+type ClientModuleGraph = {
   getModuleById: (id: string) => GraphModule | undefined;
   getModulesByFile?: (file: string) => Iterable<GraphModule> | undefined;
 };

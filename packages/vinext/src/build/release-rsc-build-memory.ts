@@ -8,7 +8,7 @@ import type { BuildEnvironment, Plugin, ResolvedConfig, ViteBuilder } from "vite
  * Metadata needed by later stages (file names, module ids, CSS asset bytes)
  * stays. Source text is dropped as soon as the stage that reads it has finished.
  */
-export type ReleaseableBundleOutput = {
+type ReleaseableBundleOutput = {
   type: string;
   code?: string;
   modules?: Record<string, unknown>;

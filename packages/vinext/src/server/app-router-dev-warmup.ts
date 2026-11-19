@@ -6,9 +6,9 @@ export type AppRouterDevWarmupTargets = {
   client: readonly string[];
 };
 
-export const APP_ROUTER_DEV_WARMUP_ENVIRONMENTS = ["rsc", "ssr", "client"] as const;
+const APP_ROUTER_DEV_WARMUP_ENVIRONMENTS = ["rsc", "ssr", "client"] as const;
 
-export type AppRouterDevWarmupEnvironment = (typeof APP_ROUTER_DEV_WARMUP_ENVIRONMENTS)[number];
+type AppRouterDevWarmupEnvironment = (typeof APP_ROUTER_DEV_WARMUP_ENVIRONMENTS)[number];
 
 /**
  * Per-environment entry modules to warm.
@@ -160,7 +160,7 @@ function resolveDevServerOrigin(server: ViteDevServer): string | null {
   return `http://${formattedHost}:${address.port}`;
 }
 
-export function normalizeWarmupPath(basePath: string | undefined): string {
+function normalizeWarmupPath(basePath: string | undefined): string {
   if (!basePath || basePath === "/") return "/";
   return basePath.endsWith("/") ? basePath.slice(0, -1) || "/" : basePath;
 }
