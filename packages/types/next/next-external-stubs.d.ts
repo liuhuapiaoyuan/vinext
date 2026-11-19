@@ -7,11 +7,6 @@ declare module "@next/env" {
   }>;
 }
 
-declare module "sharp" {
-  const sharp: unknown;
-  export default sharp;
-}
-
 // This must remain an interface so it can merge with TypeScript's built-in
 // declaration when consumers include a newer ES lib.
 // oxlint-disable-next-line typescript/consistent-type-definitions

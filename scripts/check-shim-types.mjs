@@ -156,36 +156,45 @@ function renderContracts(tempDir) {
 
 function main() {
   const tscPath = fileURLToPath(new URL("bin/tsc", import.meta.resolve("typescript/package.json")));
-  for (const target of ["es2022", "esnext"]) {
-    const declarationResult = spawnSync(
-      process.execPath,
-      [
-        tscPath,
-        "--ignoreConfig",
-        "--strict",
-        "--noEmit",
-        "--module",
-        "esnext",
-        "--moduleResolution",
-        "bundler",
-        "--target",
-        target,
-        path.join(typesRoot, "index.d.ts"),
-      ],
-      { cwd: repoRoot, encoding: "utf-8" },
-    );
-    if (declarationResult.status !== 0) {
-      process.stderr.write(declarationResult.stdout);
-      process.stderr.write(declarationResult.stderr);
-      process.exitCode = declarationResult.status ?? 1;
-      return;
-    }
-  }
-
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-shim-types-"));
   const contractPath = path.join(tempDir, "contracts.ts");
   const tsconfigPath = path.join(tempDir, "tsconfig.json");
+  // Vendored Next declarations import "sharp" (an optional Next dependency). The published
+  // types must not declare it — an ambient module declaration shadows a consumer's real sharp
+  // types — so this check supplies its own stub for the optional-dependency case.
+  const sharpStubPath = path.join(tempDir, "sharp-stub.d.ts");
   try {
+    fs.writeFileSync(
+      sharpStubPath,
+      'declare module "sharp" {\n  const sharp: unknown;\n  export default sharp;\n}\n',
+    );
+    for (const target of ["es2022", "esnext"]) {
+      const declarationResult = spawnSync(
+        process.execPath,
+        [
+          tscPath,
+          "--ignoreConfig",
+          "--strict",
+          "--noEmit",
+          "--module",
+          "esnext",
+          "--moduleResolution",
+          "bundler",
+          "--target",
+          target,
+          path.join(typesRoot, "index.d.ts"),
+          sharpStubPath,
+        ],
+        { cwd: repoRoot, encoding: "utf-8" },
+      );
+      if (declarationResult.status !== 0) {
+        process.stderr.write(declarationResult.stdout);
+        process.stderr.write(declarationResult.stderr);
+        process.exitCode = declarationResult.status ?? 1;
+        return;
+      }
+    }
+
     fs.writeFileSync(contractPath, renderContracts(tempDir));
     fs.writeFileSync(
       tsconfigPath,
@@ -199,7 +208,7 @@ function main() {
             "vinext/*": [toImportSpecifier(tempDir, path.join(repoRoot, "packages/vinext/src/*"))],
           },
         },
-        files: [contractPath],
+        files: [contractPath, sharpStubPath],
       }),
     );
     const result = spawnSync(process.execPath, [tscPath, "--project", tsconfigPath], {
