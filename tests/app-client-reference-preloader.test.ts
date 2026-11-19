@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vite-plus/test";
-import { createClientReferencePreloader } from "../packages/vinext/src/server/app-client-reference-preloader.js";
+import {
+  createClientReferencePreloader,
+  resolveRouteClientReferences,
+} from "../packages/vinext/src/server/app-client-reference-preloader.js";
 import { runWithExecutionContext } from "../packages/vinext/src/shims/request-context.js";
 
 function createDeferred(): { promise: Promise<void>; resolve: () => void } {
@@ -129,5 +132,94 @@ describe("app client reference preloader", () => {
     expect(reported).toHaveLength(1);
     expect(reported[0]?.id).toBe("comp-a");
     expect(reported[0]?.error).toBeInstanceOf(Error);
+  });
+
+  it("returns one settled promise for a warm scoped preload", async () => {
+    const preloader = createClientReferencePreloader({
+      getReferences: () => ({ "comp-a": true, "comp-b": true }),
+      getClientRequire: () => async () => {},
+    });
+
+    await preloader.preload(["comp-a", "comp-b"]);
+
+    expect(preloader.preload(["comp-a", "comp-b"])).toBe(preloader.preload(["comp-b"]));
+  });
+
+  it("marks settled module promises the way React tracks thenables", async () => {
+    const error = new Error("load failed");
+    const loads: Record<string, Promise<unknown>> = {
+      "comp-a": Promise.resolve("module-a"),
+      "comp-b": Promise.reject(error),
+    };
+    const preloader = createClientReferencePreloader({
+      getReferences: () => ({ "comp-a": true, "comp-b": true }),
+      getClientRequire: () => (id) => loads[id]!,
+    });
+
+    await preloader.preload();
+
+    expect(loads["comp-a"]).toMatchObject({ status: "fulfilled", value: "module-a" });
+    expect(loads["comp-b"]).toMatchObject({ status: "rejected", reason: error });
+  });
+
+  it("starts streamed references in order without waiting for them", async () => {
+    let finishStreamed!: () => void;
+    const calls: string[] = [];
+    const preloader = createClientReferencePreloader({
+      getReferences: () => ({ "comp-a": true, "comp-b": true, "comp-c": true }),
+      getClientRequire: () => (id) => {
+        calls.push(id);
+        return id === "comp-b"
+          ? new Promise<void>((resolve) => (finishStreamed = resolve))
+          : Promise.resolve();
+      },
+    });
+
+    await preloader.preload(["comp-a", "comp-b", "comp-c"], new Set(["comp-b"]));
+
+    expect(calls).toEqual(["comp-a", "comp-b", "comp-c"]);
+    finishStreamed();
+  });
+});
+
+describe("resolveRouteClientReferences", () => {
+  // File 0 is a boundary of "/" (a not-found.tsx, say), file 1 its page,
+  // which imports "link", "chart" and "nav" statically, in that order, and
+  // "lazy" through a dynamic import.
+  const plan = {
+    references: ["link", "nav", "chart", "search", "lazy"],
+    always: [0],
+    files: [[1], [0, 2, 1, 4], [3]],
+    routes: { "/": [0, 1] },
+    rendered: { "/": [1] },
+    staticFiles: [[], [0, 2, 1], []],
+    routeless: [0, 2],
+    async: [2],
+  };
+
+  it("resolves a route's files and the references every render uses", () => {
+    expect(resolveRouteClientReferences(plan, "/")).toEqual({
+      references: ["link", "nav", "chart", "lazy"],
+      streamed: ["chart"],
+      // In the page's import order, though the boundary preloads "nav"
+      // first. Not "lazy" (dynamically imported) or "search" (only a
+      // boundary imports it); "link" is every render's, and the page's too.
+      linked: ["link", "chart", "nav"],
+    });
+  });
+
+  it("links no reference of a render without a route", () => {
+    expect(resolveRouteClientReferences(plan, null)).toEqual({
+      references: ["link", "nav", "search"],
+      streamed: [],
+      linked: [],
+    });
+  });
+
+  it("preloads everything without a plan, a route, or for an unknown pattern", () => {
+    expect(resolveRouteClientReferences(null, "/")).toBeUndefined();
+    expect(resolveRouteClientReferences(plan, undefined)).toBeUndefined();
+    expect(resolveRouteClientReferences(plan, "/missing")).toBeUndefined();
+    expect(resolveRouteClientReferences(plan, "constructor")).toBeUndefined();
   });
 });

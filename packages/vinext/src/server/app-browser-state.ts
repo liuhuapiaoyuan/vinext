@@ -1,14 +1,15 @@
 import { stripBasePath } from "../utils/base-path.js";
-import type { RouteManifest } from "../routing/app-route-graph.js";
+import type { BrowserRouteManifest } from "../routing/browser-route-manifest.js";
 import {
   AppElementsWire,
+  bindAppElementsSlotRefreshPathname,
   getMountedSlotIds,
   getMountedSlotIdsHeader,
   type AppElements,
   type AppElementsInterception,
   type AppElementsSlotBinding,
-  type LayoutFlags,
 } from "./app-elements.js";
+import { holdsSkippedLayouts } from "./app-mounted-layouts.js";
 import { createRscRequestHeaders } from "./app-rsc-cache-busting.js";
 import {
   NEXT_ACTION_HEADER,
@@ -96,7 +97,6 @@ export type AppRouterState = {
   elements: AppElements;
   interception: AppElementsInterception | null;
   interceptionContext: string | null;
-  layoutFlags: LayoutFlags;
   layoutIds: readonly string[];
   previousNextUrl: string | null;
   renderId: number;
@@ -113,7 +113,6 @@ export type AppRouterAction = {
   elements: AppElements;
   interception: AppElementsInterception | null;
   interceptionContext: string | null;
-  layoutFlags: LayoutFlags;
   layoutIds: readonly string[];
   navigationSnapshot: ClientNavigationRenderSnapshot;
   operation: PendingOperationRecord;
@@ -301,7 +300,7 @@ export function resolvePendingNavigationCommitDispositionDecision(options: {
   activeNavigationId: number;
   currentState: AppRouterState;
   pending: PendingNavigationCommit;
-  routeManifest?: RouteManifest | null;
+  routeManifest?: BrowserRouteManifest | null;
   startedNavigationId: number;
   targetHref?: string;
 }): PendingNavigationCommitDispositionDecision {
@@ -337,9 +336,21 @@ export function resolvePendingNavigationCommitDispositionDecision(options: {
     options.currentState.activeOperation?.navigationId === options.startedNavigationId &&
     options.currentState.activeOperation.navigationCommitKind === "detached" &&
     options.pending.action.operation.navigationCommitKind === "authoritative";
-  const visibleCommitVersion = isAuthoritativeSameNavigationHandoff
-    ? options.pending.action.operation.startedVisibleCommitVersion
-    : options.currentState.visibleCommitVersion;
+  // A commit approved under an older navigation id can still advance the
+  // version: React may render a superseded navigation's tree, or a server
+  // action's revalidation, only after this navigation started. Commits are
+  // approved only while their navigation id is active, so that state was
+  // dispatched before this navigation began. As in Next.js, the latest
+  // navigation commits on top of it. HMR passes its render id as
+  // startedNavigationId, so only a pending navigation compares ids.
+  const isOlderNavigationCommit =
+    options.pending.action.operation.navigationId === options.startedNavigationId &&
+    options.currentState.activeOperation?.navigationId !== undefined &&
+    options.currentState.activeOperation.navigationId < options.startedNavigationId;
+  const visibleCommitVersion =
+    isAuthoritativeSameNavigationHandoff || isOlderNavigationCommit
+      ? options.pending.action.operation.startedVisibleCommitVersion
+      : options.currentState.visibleCommitVersion;
   const verdict = verifyOperationTokenForCommit(token, {
     activeNavigationId: options.activeNavigationId,
     visibleCommitVersion,
@@ -462,7 +473,7 @@ function createPendingRouteSnapshot(pending: PendingNavigationCommit): RouteSnap
 
 function createPendingNavigationOperationToken(options: {
   pending: PendingNavigationCommit;
-  routeManifest: RouteManifest | null;
+  routeManifest: BrowserRouteManifest | null;
   startedNavigationId: number;
   targetSnapshot: RouteSnapshot;
 }): OperationToken {
@@ -487,7 +498,7 @@ function createRootBoundarySnapshotFingerprint(snapshot: RouteSnapshot): string 
 function planPendingRootBoundaryFlightResponse(options: {
   currentState: AppRouterState;
   pending: PendingNavigationCommit;
-  routeManifest: RouteManifest | null;
+  routeManifest: BrowserRouteManifest | null;
   targetHref?: string;
   // The token has already passed commit eligibility (verifyOperationTokenForCommit)
   // in the disposition gate above. Requiring the verified brand here makes that
@@ -562,6 +573,13 @@ function mergeSkippedLayoutPreservation(options: {
 }): PendingNavigationCommitDispositionDecision {
   if (options.decision.disposition !== "dispatch") return options.decision;
   if (options.pending.skippedLayoutIds.length === 0) return options.decision;
+  // A payload left out layouts this navigation's client named. The navigation
+  // refetches a whole payload when its state no longer holds one, so one that
+  // still can't be restored commits as a document navigation, never as a tree
+  // missing a layout.
+  if (!holdsSkippedLayouts(options.currentState, options.pending.action.elements)) {
+    return { disposition: "hard-navigate", preserveElementIds: [], trace: options.decision.trace };
+  }
 
   const currentLayoutIds = new Set(options.currentState.layoutIds);
   const targetLayoutIds = new Set(options.pending.action.layoutIds);
@@ -574,13 +592,10 @@ function mergeSkippedLayoutPreservation(options: {
     if (AppElementsWire.parseElementKey(id)?.kind !== "layout") continue;
     // Set membership here is intentionally broader than the planner's
     // prefix-based persistence (resolveSameLayoutAncestorPersistenceForTopologies
-    // breaks at the first divergence). A layout present in both the current and
-    // target chains but past that divergence point is admitted here even though
-    // the planner would not preserve it. That is correct rather than a
-    // divergence bug: the server only emits a skip for a layout it proved
-    // byte-identical via the static-layout cache proof, so preserving the
-    // retained-and-identical layout — together with its owned slots derived
-    // below — is sound regardless of ancestor-chain position.
+    // breaks at the first divergence). The server only leaves out layouts the
+    // client named with the same segment identity, checked above, so
+    // preserving each one, together with its owned slots derived below, is
+    // sound regardless of ancestor-chain position.
     if (!currentLayoutIds.has(id) || !targetLayoutIds.has(id)) continue;
     if (!Object.hasOwn(options.currentState.elements, id)) continue;
 
@@ -665,7 +680,12 @@ type CreatePendingNavigationCommitOptions = {
 export function createPendingNavigationCommitFromElements(
   options: CreatePendingNavigationCommitOptions & { nextElements: AppElements },
 ): PendingNavigationCommit {
-  const elements = options.nextElements;
+  // The slots this response rendered are refetched at the URL it was
+  // committed for, the snapshot's pathname.
+  const elements = bindAppElementsSlotRefreshPathname(
+    options.nextElements,
+    options.navigationSnapshot.pathname,
+  );
   // Before any merge into the visible tree: a page still streaming when a
   // later navigation keeps its branch first renders under that navigation,
   // but reads the query of the response that delivered it.
@@ -696,7 +716,6 @@ export function createPendingNavigationCommitFromElements(
       interception: metadata.interception,
       interceptionContext: metadata.interceptionContext,
       layoutIds: metadata.layoutIds,
-      layoutFlags: metadata.layoutFlags,
       slotBindings: metadata.slotBindings,
       navigationSnapshot: options.navigationSnapshot,
       operation: createOperationRecord({

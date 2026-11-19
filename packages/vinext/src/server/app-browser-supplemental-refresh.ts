@@ -1,4 +1,5 @@
 import {
+  APP_BFCACHE_SEGMENT_IDENTITIES_KEY,
   APP_INTERCEPTION_CONTEXT_KEY,
   APP_INTERCEPTION_KEY,
   APP_SLOT_BINDINGS_KEY,
@@ -8,8 +9,15 @@ import {
   type AppElementsSlotBinding,
 } from "./app-elements.js";
 import type { AppRouterState } from "./app-browser-state.js";
-import { normalizePathnameForRouteMatch } from "../routing/utils.js";
-import { addBasePathToPathname, removeTrailingSlash, stripBasePath } from "../utils/base-path.js";
+import { resolveActiveRoutePaths } from "./app-history-state.js";
+import { isNestedBfcacheSlotSegmentIdFor } from "./bfcache-identity.js";
+import type {
+  BrowserRouteManifest,
+  BrowserRouteManifestInterception,
+} from "../routing/browser-route-manifest.js";
+import { matchRoutePattern } from "../routing/route-pattern.js";
+import { normalizePathnameForRouteMatch, splitPathnameForRouteMatch } from "../routing/utils.js";
+import { removeTrailingSlash, restoreBasePath, stripBasePath } from "../utils/base-path.js";
 import { normalizePath } from "./normalize-path.js";
 
 const SUPPLEMENTAL_REFRESH_TIMEOUT_MS = 10_000;
@@ -108,6 +116,9 @@ export function mergeRefreshedParallelSlot(
               {
                 ...promotableChildrenBindings[0],
                 activeRouteId: refreshedChildrenBindings[0].activeRouteId,
+                ...(refreshedChildrenBindings[0].refreshPathname !== undefined
+                  ? { refreshPathname: refreshedChildrenBindings[0].refreshPathname }
+                  : {}),
                 state: "active",
               },
             ]
@@ -134,6 +145,12 @@ export function mergeRefreshedParallelSlot(
       for (const binding of retainedBindings) {
         merged[binding.slotId] = currentElements[binding.slotId];
       }
+      copySlotIdentities(
+        merged,
+        refreshedElements,
+        currentElements,
+        retainedBindings.map((binding) => binding.slotId),
+      );
       if (promotedBindings.length === 1) {
         merged[promotedBindings[0].slotId] = refreshedElements[refreshedChildrenBindings[0].slotId];
       }
@@ -155,6 +172,12 @@ export function mergeRefreshedParallelSlot(
     for (const binding of refreshedBindings) {
       merged[binding.slotId] = refreshedElements[binding.slotId];
     }
+    copySlotIdentities(
+      merged,
+      currentElements,
+      refreshedElements,
+      refreshedBindings.map((binding) => binding.slotId),
+    );
     copyRefreshedBranchElements(merged, refreshedElements);
     return merged;
   }
@@ -178,8 +201,44 @@ export function mergeRefreshedParallelSlot(
       layoutIds: currentMetadata.layoutIds,
     }),
   };
+  copySlotIdentities(merged, currentElements, refreshedElements, [interception.slotId]);
   copyRefreshedBranchElements(merged, refreshedElements);
   return merged;
+}
+
+// A slot's content and its BFCache segment entries are one unit. Keeping the
+// base payload's entries (a default slot's, say) beside the slot's content
+// would re-mint its ids and remount the client state a refresh keeps. The
+// listed slots take their entries from slotElements, every other segment keeps
+// baseElements' entries.
+function copySlotIdentities(
+  target: Record<string, AppElements[keyof AppElements]>,
+  baseElements: AppElements,
+  slotElements: AppElements,
+  slotIds: readonly string[],
+): void {
+  const isSlotSegment = (id: string) =>
+    slotIds.some((slotId) => id === slotId || isNestedBfcacheSlotSegmentIdFor(id, slotId));
+  const isNestedSegment = (id: string) => !slotIds.includes(id) && isSlotSegment(id);
+  for (const id of Object.keys(baseElements)) {
+    if (isNestedSegment(id)) delete target[id];
+  }
+  for (const [id, element] of Object.entries(slotElements)) {
+    if (isNestedSegment(id)) target[id] = element;
+  }
+  const identities: Record<string, string> = {};
+  for (const [id, identity] of Object.entries(
+    AppElementsWire.readMetadata(baseElements).bfcacheSegmentIdentities,
+  )) {
+    if (!isSlotSegment(id)) identities[id] = identity;
+  }
+  for (const [id, identity] of Object.entries(
+    AppElementsWire.readMetadata(slotElements).bfcacheSegmentIdentities,
+  )) {
+    if (isSlotSegment(id)) identities[id] = identity;
+  }
+  if (Object.keys(identities).length > 0) target[APP_BFCACHE_SEGMENT_IDENTITIES_KEY] = identities;
+  else delete target[APP_BFCACHE_SEGMENT_IDENTITIES_KEY];
 }
 
 function copyRefreshedBranchElements(
@@ -215,15 +274,19 @@ export function resolvePersistedSourcePageRefreshes(options: {
     sourceUrlsByPathname.set(sourceUrl.pathname, sourceUrl);
   }
 
+  // The browser pathname of the refresh, compared as it is with the refresh
+  // pathnames bindings record, which are browser pathnames too.
+  const refreshRequestPathname = removeTrailingSlash(
+    stripBasePath(options.refreshUrl.pathname, options.basePath),
+  );
+
+  // Each path is a binding's refresh pathname, the URL of the navigation that
+  // rendered the slot, or its route path when it has none. The slots the
+  // current page rendered carry the refresh URL itself, so the last filter
+  // below leaves them to the refresh request, as Next.js refetches only a
+  // reused segment's URL that differs from the current one.
   const activeRoutePaths =
-    options.activeRoutePaths ??
-    options.state.slotBindings.flatMap((binding) => {
-      if (binding.state !== "active" || binding.activeRouteId == null) return [];
-      const activeRoute = AppElementsWire.parseElementKey(binding.activeRouteId);
-      return activeRoute?.kind === "route" && activeRoute.interceptionContext === null
-        ? [activeRoute.path]
-        : [];
-    });
+    options.activeRoutePaths ?? resolveActiveRoutePaths(options.state.slotBindings);
   for (const activeRoutePath of activeRoutePaths) {
     // A deeper children route can remain in the merged client tree after the
     // user navigates back to its ancestor for cache reuse. It is not a visible
@@ -231,14 +294,16 @@ export function resolvePersistedSourcePageRefreshes(options: {
     // refresh open and repeatedly replace the ancestor DOM. Persisted visible
     // branches are ancestors or siblings of the current route instead.
     if (
-      activeRoutePath !== refreshRoutePathname &&
-      (refreshRoutePathname === "/" || activeRoutePath.startsWith(refreshRoutePathname + "/"))
+      isDescendantPathname(activeRoutePath, refreshRequestPathname) ||
+      isDescendantPathname(activeRoutePath, refreshRoutePathname)
     ) {
       continue;
     }
-    const pathname = addBasePathToPathname(activeRoutePath, options.basePath);
+    const pathname = restoreBasePath(activeRoutePath, options.basePath);
     if (sourceUrlsByPathname.has(pathname)) continue;
     const sourceUrl = new URL(pathname, options.refreshUrl);
+    // History state is page-writable: never refetch another origin.
+    if (sourceUrl.origin !== options.refreshUrl.origin) continue;
     sourceUrl.search = options.refreshUrl.search;
     sourceUrlsByPathname.set(pathname, sourceUrl);
   }
@@ -249,6 +314,78 @@ export function resolvePersistedSourcePageRefreshes(options: {
     const pathAndSearch = `${sourceUrl.pathname}${sourceUrl.search}`;
     if (pathAndSearch !== refreshPathAndSearch) resolved.push(pathAndSearch);
   }
+  return resolved;
+}
+
+function isDescendantPathname(pathname: string, ancestor: string): boolean {
+  return pathname !== ancestor && (ancestor === "/" || pathname.startsWith(ancestor + "/"));
+}
+
+export type PersistedRefreshInterception = {
+  interception: BrowserRouteManifestInterception;
+  interceptionContext: string;
+  targetPathname: string;
+};
+
+function getMatchedUrlPathname(matchedUrl: string): string {
+  return new URL(matchedUrl, "https://vinext.local").pathname;
+}
+
+export function resolvePersistedRefreshInterceptions(options: {
+  basePath: string;
+  refreshUrl: URL;
+  requestInterceptionContext: string | null;
+  routeManifest: BrowserRouteManifest | null;
+  state: Pick<AppRouterState, "interception" | "slotBindings">;
+}): PersistedRefreshInterception[] {
+  const { basePath, refreshUrl, requestInterceptionContext, routeManifest, state } = options;
+  if (routeManifest === null) return [];
+
+  const refreshPathname = stripBasePath(refreshUrl.pathname, basePath);
+  const refreshPathParts = splitPathnameForRouteMatch(refreshPathname);
+  const resolved: PersistedRefreshInterception[] = [];
+
+  for (const binding of state.slotBindings) {
+    if (binding.state !== "active" || !binding.activeRouteId) continue;
+    if (!binding.interceptionId || !binding.interceptionSourceMatchedUrl) continue;
+    const activeRoute = AppElementsWire.parseElementKey(binding.activeRouteId);
+    if (activeRoute?.kind !== "route") continue;
+    const match = routeManifest.segmentGraph.interceptions.get(binding.interceptionId);
+    if (!match) continue;
+
+    const retainedInterception =
+      state.interception?.slotId === binding.slotId &&
+      matchRoutePattern(
+        splitPathnameForRouteMatch(getMatchedUrlPathname(state.interception.targetMatchedUrl)),
+        match.targetPatternParts,
+      ) !== null
+        ? state.interception
+        : null;
+    // The URL the slot was intercepted at, which the refresh asks for again
+    // with the same interception context, as resolvePersistedSourcePageRefreshes
+    // names the same slot. A matched or route path would be rewritten again,
+    // or decoded once more.
+    const targetPathname =
+      binding.refreshPathname ?? retainedInterception?.targetMatchedUrl ?? activeRoute.path;
+    const targetParts = splitPathnameForRouteMatch(getMatchedUrlPathname(targetPathname));
+    const isPrimaryRefreshInterception =
+      requestInterceptionContext !== null &&
+      state.interception?.slotId === binding.slotId &&
+      matchRoutePattern(refreshPathParts, match.targetPatternParts) !== null &&
+      matchRoutePattern(targetParts, match.targetPatternParts) !== null;
+    if (isPrimaryRefreshInterception) continue;
+
+    const targetUrl = new URL(targetPathname, refreshUrl);
+    targetUrl.pathname = restoreBasePath(targetUrl.pathname, basePath);
+    targetUrl.search = refreshUrl.search;
+    resolved.push({
+      interception: match,
+      interceptionContext:
+        retainedInterception?.sourceMatchedUrl ?? binding.interceptionSourceMatchedUrl,
+      targetPathname: `${targetUrl.pathname}${targetUrl.search}`,
+    });
+  }
+
   return resolved;
 }
 

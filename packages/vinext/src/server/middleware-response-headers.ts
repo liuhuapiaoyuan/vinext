@@ -1,4 +1,4 @@
-import { VINEXT_SPECIAL_ERROR_STATUS_HEADER } from "./headers.js";
+import { VINEXT_ROUTE_MISS_HEADER, VINEXT_SPECIAL_ERROR_STATUS_HEADER } from "./headers.js";
 
 const ADDITIVE_RESPONSE_HEADER_NAMES = new Set(["set-cookie", "vary"]);
 
@@ -47,8 +47,13 @@ export function mergeMiddlewareResponseHeaders(
 
   for (const [key, value] of middlewareHeaders) {
     const lowerName = key.toLowerCase();
-    // vinext's own marker, which middleware can't forge.
-    if (lowerName === VINEXT_SPECIAL_ERROR_STATUS_HEADER) continue;
+    // vinext's own markers, which middleware can't forge.
+    if (
+      lowerName === VINEXT_SPECIAL_ERROR_STATUS_HEADER ||
+      lowerName === VINEXT_ROUTE_MISS_HEADER
+    ) {
+      continue;
+    }
     // Next.js only stages truthy middleware response-header values. Keep an
     // empty Link from erasing config or renderer-owned Link values.
     if (lowerName === "link" && !value) {
@@ -125,4 +130,40 @@ export function mergeMiddlewareResponseHeadersOntoResponse(
       target.append(name, value);
     }
   }
+}
+
+/**
+ * Build the response for an external rewrite from the headers routing staged
+ * before proxying.
+ *
+ * Next.js writes the staged config and middleware headers to its outgoing
+ * response and then proxies, and the proxy sets each upstream header over
+ * them. Its Set-Cookie patch keeps middleware's cookies ahead of the
+ * upstream's, so an upstream cookie replaces a staged config cookie while
+ * middleware's are kept. Without an upstream Set-Cookie the staged cookies
+ * stay as they are.
+ */
+export function withExternalRewriteResponseHeaders(
+  upstream: Response,
+  staged: Headers,
+  middlewareCookies: readonly string[],
+): Response {
+  // The proxied body owns its framing.
+  staged.delete("content-length");
+  for (const name of new Set(upstream.headers.keys())) {
+    if (name !== "set-cookie") staged.set(name, upstream.headers.get(name) ?? "");
+  }
+  const upstreamCookies = upstream.headers.getSetCookie();
+  if (upstreamCookies.length > 0) {
+    staged.delete("set-cookie");
+    // Like Next.js, keep one copy of a cookie both sides set verbatim.
+    for (const cookie of new Set([...middlewareCookies, ...upstreamCookies])) {
+      staged.append("set-cookie", cookie);
+    }
+  }
+  return new Response(upstream.body, {
+    status: upstream.status,
+    statusText: upstream.statusText,
+    headers: staged,
+  });
 }

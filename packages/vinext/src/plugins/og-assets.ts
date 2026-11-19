@@ -123,6 +123,11 @@ export function createOgInlineFetchAssetsPlugin(): Plugin {
         if (this.environment?.name && this.environment.config.build.write === false) return null;
         if (!ownership.shouldTrackImport(source)) return null;
 
+        // One nested resolve per specifier, like upstream's single-resolve
+        // optimization: every importer re-enters the full plugin pipeline
+        // otherwise. The cached result only feeds ownership, so the hook still
+        // returns null and Vite resolves each importer with its own conditions
+        // (a nested node_modules copy can resolve the same bare id differently).
         let pending = trackedSpecifiers.get(source);
         if (pending === undefined) {
           pending = (async () => {

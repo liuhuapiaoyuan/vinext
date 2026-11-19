@@ -1264,7 +1264,7 @@ export default handler;
           persist: false;
           logLevel: "none";
           watch: false;
-          server: { port: 0 };
+          server: { hostname: string; port: 0 };
         };
       }): Promise<{ url: Promise<URL>; dispose(): Promise<void> }>;
     };
@@ -1275,7 +1275,7 @@ export default handler;
         persist: false,
         logLevel: "none",
         watch: false,
-        server: { port: 0 },
+        server: { hostname: "127.0.0.1", port: 0 },
       },
     });
     baseUrl = (await worker.url).origin;
@@ -1404,6 +1404,18 @@ describe("bundled module identity on a Pages-only Cloudflare Workers runtime", (
         vinext({ appDir: root }),
         identityResourcePlugin(),
         await loadCloudflarePlugin(root, false),
+        {
+          name: "test:top-level-worker-chunks",
+          outputOptions(output) {
+            if (this.environment.config.consumer !== "server") return;
+            // Before the Vite+ upgrade, this fixture resolved runtime.js as
+            // /bundle/runtime.js. Rolldown now splits shared modules into
+            // _next/static chunks, producing /bundle/_next/static/runtime.js.
+            // Keep server chunks at the root so the unchanged assertions still
+            // cover top-level module identities for runtime and prerendered routes.
+            return { ...output, chunkFileNames: "[name]-[hash].js" };
+          },
+        },
       ],
       logLevel: "silent",
     });
@@ -1424,7 +1436,7 @@ describe("bundled module identity on a Pages-only Cloudflare Workers runtime", (
           persist: false;
           logLevel: "none";
           watch: false;
-          server: { port: 0 };
+          server: { hostname: string; port: 0 };
         };
       }): Promise<{ url: Promise<URL>; dispose(): Promise<void> }>;
     };
@@ -1435,7 +1447,7 @@ describe("bundled module identity on a Pages-only Cloudflare Workers runtime", (
         persist: false,
         logLevel: "none",
         watch: false,
-        server: { port: 0 },
+        server: { hostname: "127.0.0.1", port: 0 },
       },
     });
     baseUrl = (await worker.url).origin;

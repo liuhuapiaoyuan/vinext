@@ -48,7 +48,18 @@ export function createImageConfigFromEnv(): ImageConfig {
  */
 export async function handleAppRouterImageOptimizationRequest(
   request: Request,
-  options: { basePath: string; env: AppRouterImageOptimizationEnv },
+  options: {
+    basePath: string;
+    env: AppRouterImageOptimizationEnv;
+    /**
+     * The next.config `images` config the build baked into the RSC entry. The
+     * `define`d env vars above only carry sizes and the SVG/IP flags, so
+     * `localPatterns` (and CSP/Content-Disposition/cache-lifetime settings)
+     * have to come from here or this early dispatch would answer requests the
+     * shared handler rejects.
+     */
+    imageConfig?: ImageConfig;
+  },
 ): Promise<Response | null> {
   const url = new URL(request.url);
   const strippedPathname = stripBasePath(url.pathname, options.basePath);
@@ -61,7 +72,9 @@ export async function handleAppRouterImageOptimizationRequest(
       ? request
       : cloneRequestWithUrl(request, new URL(`${strippedPathname}${url.search}`, url).href);
 
-  const imageConfig = createImageConfigFromEnv();
+  // Config wins over the baked env defaults, but only for the keys it sets:
+  // a partial config must not blank out the sizes/env-derived flags.
+  const imageConfig: ImageConfig = { ...createImageConfigFromEnv(), ...options.imageConfig };
   const allowedWidths = [
     ...(imageConfig.deviceSizes ?? DEFAULT_DEVICE_SIZES),
     ...(imageConfig.imageSizes ?? DEFAULT_IMAGE_SIZES),
