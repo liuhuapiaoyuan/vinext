@@ -718,15 +718,15 @@ export function resolveDeploymentTool(root: string): DeploymentTool {
   return fs.existsSync(path.join(root, "cloudflare.config.ts")) ? "cf" : "wrangler";
 }
 
+// Resolve a dependency the *project* installed, not one that merely happens to be
+// reachable from this process: `createRequire(projectRoot).resolve()` also honors
+// NODE_PATH, and pnpm exports its virtual store there, so a package the project
+// never declared would look installed. Walking the project's own node_modules
+// chain keeps the check tied to the tree the user actually has.
 export function isCfCliInstalled(
   root: string,
-  resolvePackageJson: (root: string) => string | null = (projectRoot) => {
-    try {
-      return createRequire(path.join(projectRoot, "package.json")).resolve("cf/package.json");
-    } catch {
-      return findInNodeModules(projectRoot, "cf/package.json");
-    }
-  },
+  resolvePackageJson: (root: string) => string | null = (projectRoot) =>
+    findInNodeModules(projectRoot, "cf/package.json"),
 ): boolean {
   return resolvePackageJson(root) !== null;
 }
@@ -750,13 +750,12 @@ export function buildCfDeployArgs(
  *
  * Invoking the JavaScript file through `process.execPath` avoids the `.cmd`
  * shim and command shell that package managers create on Windows.
+ *
+ * Only the project's own node_modules chain counts — see {@link isCfCliInstalled}
+ * for why NODE_PATH-based resolution is not trustworthy here.
  */
 function resolveWranglerPackageJson(root: string): string | null {
-  try {
-    return createRequire(path.join(root, "package.json")).resolve("wrangler/package.json");
-  } catch {
-    return findInNodeModules(root, "wrangler/package.json");
-  }
+  return findInNodeModules(root, "wrangler/package.json");
 }
 
 export function resolveWranglerBin(

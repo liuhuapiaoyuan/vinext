@@ -40,8 +40,15 @@ describe("shouldIgnoreDevWatchFile", () => {
     expect(isIgnored(root, srcDir, path.join(root, ".env.local"))).toBe(false);
   });
 
-  it("ignores tsconfig.json, including Windows-separator paths", () => {
+  it("ignores tsconfig.json", () => {
     expect(isIgnored(root, srcDir, path.join(root, "tsconfig.json"))).toBe(true);
+  });
+
+  // A Windows watcher hands back backslash paths; on POSIX a backslash is a
+  // legal filename character, so `toSlash` deliberately leaves it alone and
+  // this path never occurs. See AGENTS.md: gate Windows-only scenarios instead
+  // of normalizing in source.
+  it.runIf(process.platform === "win32")("ignores tsconfig.json with Windows separators", () => {
     expect(
       shouldIgnoreDevWatchFile(`${root.replaceAll("/", "\\")}\\tsconfig.json`, {
         root,
