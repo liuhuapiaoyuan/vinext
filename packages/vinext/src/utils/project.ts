@@ -7,7 +7,7 @@
  */
 
 import fs from "node:fs";
-import path from "pathslash";
+import path, { toSlash } from "pathslash";
 import { createRequire } from "node:module";
 
 // ─── CJS Config Handling ─────────────────────────────────────────────────────
@@ -549,6 +549,47 @@ export function isPackageResolvable(root: string, packageName: string): boolean 
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Whether `resolvedPath` lives in an ancestor `node_modules` of `root`.
+ *
+ * pnpm exports `<repo>/node_modules/.pnpm/node_modules` on `NODE_PATH` for the
+ * scripts it runs, so `require.resolve` from an unrelated project root succeeds
+ * for any package in that store — every package of the workspace, including
+ * dev-only ones. Comparing against the path chain keeps the documented
+ * monorepo case (next-intl installed at an ancestor root) while dropping
+ * `NODE_PATH` leakage: a project dependency always resolves inside
+ * `<ancestor>/node_modules/…`, follow that symlink into pnpm's virtual store and
+ * it is still under that same `<ancestor>/node_modules/`.
+ */
+function isProjectNodeModulePath(root: string, resolvedPath: string): boolean {
+  const target = toSlash(resolvedPath);
+  let dir = toSlash(path.resolve(root));
+  for (;;) {
+    const prefix = dir.endsWith("/") ? `${dir}node_modules/` : `${dir}/node_modules/`;
+    if (target.startsWith(prefix)) return true;
+    const parent = path.dirname(dir);
+    if (parent === dir) return false;
+    dir = parent;
+  }
+}
+
+/**
+ * Resolve a request from the project's own dependency tree, ignoring
+ * resolutions that only succeed through pnpm's `NODE_PATH` virtual-store
+ * fallback.
+ *
+ * Use this for "does this project depend on X?" probes. Without it, a pnpm
+ * workspace's store makes every sibling package look installed.
+ */
+export function resolveProjectModule(root: string, request: string): string | undefined {
+  try {
+    const resolved = createRequire(path.join(root, "package.json")).resolve(request);
+    return isProjectNodeModulePath(root, resolved) ? resolved : undefined;
+  } catch {
+    return undefined;
   }
 }
 

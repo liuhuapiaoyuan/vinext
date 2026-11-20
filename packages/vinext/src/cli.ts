@@ -15,12 +15,12 @@
 import path, { toSlash } from "pathslash";
 import fs from "node:fs";
 import { pathToFileURL } from "node:url";
-import { createRequire } from "node:module";
 import { execFileSync, spawnSync } from "node:child_process";
 import { hasAppRouterDirectory, runIsolatedProductionBuild } from "./build/isolated-rsc-build.js";
 import {
   detectPackageManager,
   ensureViteConfigCompatibility,
+  findInNodeModules,
   findViteConfigPath,
 } from "./utils/project.js";
 import { runCheck, formatReport } from "./check.js";
@@ -113,22 +113,25 @@ function resolveProjectViteCli(root: string): string {
   const cwd = process.cwd();
   const candidates = new Set([root, cwd]);
   for (const candidate of candidates) {
-    const require = createRequire(path.join(candidate, "package.json"));
-    let packagePath: string;
-    try {
-      packagePath = require.resolve("vite/package.json");
-    } catch {
-      continue;
-    }
+    // Walk the project's own `node_modules` chain instead of calling
+    // `require.resolve`: pnpm exports its virtual store on NODE_PATH, so a
+    // resolve from a root without Vite of its own still succeeds and the proxied
+    // build would run the store's copy. `findInNodeModules` also keeps the
+    // monorepo case working by walking up to a hoisting root.
+    const packagePath = findInNodeModules(candidate, "vite/package.json");
+    if (!packagePath) continue;
 
     const packageRoot = path.dirname(packagePath);
     const packageJson = JSON.parse(fs.readFileSync(packagePath, "utf-8")) as {
       bin?: string | Record<string, string>;
+      main?: string;
     };
     const bin = typeof packageJson.bin === "string" ? packageJson.bin : packageJson.bin?.vite;
+    // `vite` resolves to `@voidzero-dev/vite-plus-core` in this repo's toolchain,
+    // which ships no `bin` map — its CLI sits next to the resolved `main` entry.
     const cliPath = bin
       ? path.resolve(packageRoot, bin)
-      : path.join(path.dirname(require.resolve("vite")), "cli.js");
+      : path.resolve(packageRoot, path.dirname(packageJson.main ?? "index.js"), "cli.js");
     if (fs.existsSync(cliPath)) return cliPath;
   }
 
@@ -190,8 +193,14 @@ function restartBuildWithExposedGc(): void {
 async function runBuildCommand(): Promise<void> {
   const phase = process.env.VINEXT_BUILD_ISOLATION_PHASE;
   if (!phase && process.env.VINEXT_BUILD_ISOLATION !== "0") {
-    const { root } = configPreflight("build");
-    if (hasAppRouterDirectory(root)) {
+    let isolatedRoot: string | undefined;
+    try {
+      isolatedRoot = configPreflight("build").root;
+    } catch {
+      // A missing config must not preempt the migrate tip `proxyVite` prints
+      // before it reports the same problem, so fall through and let it speak.
+    }
+    if (isolatedRoot !== undefined && hasAppRouterDirectory(isolatedRoot)) {
       const cliPath = process.argv[1];
       if (!cliPath) throw new Error("[vinext] Could not resolve the vinext CLI path.");
       runIsolatedProductionBuild({
@@ -199,7 +208,7 @@ async function runBuildCommand(): Promise<void> {
         cliPath,
         args: rawArgs,
         cwd: process.cwd(),
-        root,
+        root: isolatedRoot,
       });
       return;
     }

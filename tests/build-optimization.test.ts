@@ -33,6 +33,7 @@ import {
   computeDynamicImportPreloads,
   computeLazyChunks,
 } from "../packages/vinext/src/utils/lazy-chunks.js";
+import { VINEXT_DEV_WATCH_IGNORE_GLOBS } from "../packages/vinext/src/server/dev-watch-ignore.js";
 import {
   createDynamicPreloadMetadataPlugin,
   transformNextDynamicPreloadMetadata as _transformNextDynamicPreloadMetadata,
@@ -359,9 +360,12 @@ describe.each([false, true])("generated .vinext files (bundled dev: %s)", (bundl
         },
         "serve",
       );
+      // Dev serve adds the extra generated/non-source globs plus the
+      // path-aware predicate (fork feature: server/dev-watch-ignore.ts).
       expect(config.server.watch?.ignored).toEqual([
         ...(ignored === undefined ? [] : Array.isArray(ignored) ? ignored : [ignored]),
-        /(?:^|[/\\])\.vinext(?:[/\\]|$)/,
+        ...VINEXT_DEV_WATCH_IGNORE_GLOBS,
+        expect.any(Function),
       ]);
       expect(config.server.watch?.exclude).toEqual([
         ...(ignored === undefined ? [] : Array.isArray(ignored) ? ignored : [ignored]),

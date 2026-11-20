@@ -159,6 +159,30 @@ function configureDevServerLifecycle(server: ViteDevServer): void {
     }
   };
   const listenServer = server.listen.bind(server);
+  /** Publish the address Vite actually bound, once the HTTP server is up. */
+  const syncLockfileAddress = (): void => {
+    if (!activeLock) return;
+    const lock = activeLock;
+    setImmediate(() => {
+      if (activeLock !== lock) return;
+      const address = server.httpServer?.address();
+      const actualPort =
+        typeof address === "object" && address ? address.port : server.config.server.port;
+      const hostname = normalizeDevServerHostname(server.config.server.host);
+      const displayHostname = hostname === "0.0.0.0" ? "localhost" : hostname;
+      const appUrl =
+        server.resolvedUrls?.local[0]?.replace(/\/$/, "") ??
+        `http://${displayHostname}:${actualPort}`;
+      lock.lockfile.update({
+        pid: process.pid,
+        port: actualPort,
+        hostname,
+        appUrl,
+        startedAt: lock.startedAt,
+        cwd: root,
+      });
+    });
+  };
   server.listen = async (port?: number, isRestart?: boolean) => {
     if (server.config.server.middlewareMode || process.env.VINEXT_NO_DEV_LOCK === "1") {
       return listenServer(port, isRestart);
@@ -196,36 +220,18 @@ function configureDevServerLifecycle(server: ViteDevServer): void {
     }
     activeLock.servers++;
     try {
-      return await listenServer(port, isRestart);
+      const listening = await listenServer(port, isRestart);
+      // A fast `listen()` can emit `listening` before this frame resumes; sync
+      // here too so the lockfile never keeps the requested (possibly `0`) port.
+      if (server.httpServer?.listening) syncLockfileAddress();
+      return listening;
     } catch (error) {
       // The same Vite server can retry listen(); only close ends its CLI claim.
       releaseLock();
       throw error;
     }
   };
-  server.httpServer?.on("listening", () => {
-    if (!activeLock) return;
-    const port = server.config.server.port;
-    const hostname = normalizeDevServerHostname(server.config.server.host);
-    const displayHostname = hostname === "0.0.0.0" ? "localhost" : hostname;
-    const lock = activeLock;
-    setImmediate(() => {
-      if (activeLock !== lock) return;
-      const address = server.httpServer?.address();
-      const actualPort = typeof address === "object" && address ? address.port : port;
-      const appUrl =
-        server.resolvedUrls?.local[0]?.replace(/\/$/, "") ??
-        `http://${displayHostname}:${actualPort}`;
-      lock.lockfile.update({
-        pid: process.pid,
-        port: actualPort,
-        hostname,
-        appUrl,
-        startedAt: lock.startedAt,
-        cwd: root,
-      });
-    });
-  });
+  server.httpServer?.on("listening", syncLockfileAddress);
   // Vite runs closeServer hooks after closing HTTP. Keep CLI ownership until
   // server.close() finishes those hooks, even if the lock is already released.
   server.httpServer?.on("close", releaseLock);

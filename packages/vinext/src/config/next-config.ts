@@ -18,6 +18,7 @@ import { getHtmlLimitedBotRegex } from "../utils/html-limited-bots.js";
 import { flattenPluginOptions } from "../utils/plugin-options.js";
 import { type CacheLifeConfig, resolveCacheLifeProfiles } from "../utils/cache-life-profiles.js";
 import { isUnknownRecord } from "../utils/record.js";
+import { resolveProjectModule } from "../utils/project.js";
 import { escapeRegExp } from "../utils/regex.js";
 import { applyLocaleToRoutes, configSourceError, isExternalUrl } from "./config-matchers.js";
 import { loadTsconfigResolutionForRoot } from "./tsconfig-paths.js";
@@ -3118,11 +3119,12 @@ const I18N_REQUEST_CANDIDATES = [
  * `require('next/package.json')` to check the Next.js version. Instead,
  * vinext detects next-intl and registers the alias automatically.
  *
- * Note: `require.resolve('next-intl')` walks up to parent `node_modules`
- * directories via standard Node module resolution. In a monorepo, next-intl
- * installed at the workspace root will trigger detection even if not listed
- * in the project's own package.json. This is acceptable since a workspace-root
- * install implies the user wants it available.
+ * Note: resolution walks up to parent `node_modules` directories, so in a
+ * monorepo next-intl installed at the workspace root is detected even when it is
+ * not in the project's own package.json. That is acceptable — a workspace-root
+ * install implies the user wants it available. Resolutions that only exist
+ * because pnpm put its virtual store on `NODE_PATH` are ignored; see
+ * {@link resolveProjectModule}.
  *
  * Mutates `resolved.aliases` and `resolved.env` in place.
  */
@@ -3131,13 +3133,11 @@ export function detectNextIntlConfig(root: string, resolved: ResolvedNextConfig)
   if (resolved.aliases["next-intl/config"]) return;
 
   // Check if next-intl is installed (use main entry — some packages
-  // don't expose ./package.json in their exports map)
-  const require = createRequire(path.join(root, "package.json"));
-  try {
-    require.resolve("next-intl");
-  } catch {
-    return; // next-intl not installed
-  }
+  // don't expose ./package.json in their exports map). Resolve through the
+  // project, not `NODE_PATH`: pnpm exports its virtual-store fallback there, so
+  // a bare `require.resolve` reports next-intl as installed for every project
+  // in the workspace.
+  if (resolveProjectModule(root, "next-intl") === undefined) return;
 
   // Probe for the i18n request config file
   const configPath = probeFiles(root, I18N_REQUEST_CANDIDATES);

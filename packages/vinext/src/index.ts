@@ -252,6 +252,7 @@ import {
   detectPackageManager,
   formatMissingCloudflarePluginError,
   hasWranglerConfig,
+  resolveProjectModule,
 } from "./utils/project.js";
 import {
   hasReactCompilerPlugin,
@@ -4553,7 +4554,6 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             // dependencies during the first render. Only root-resolvable deps
             // trigger this; isolated pnpm dependencies need no extra includes.
             // https://github.com/vitejs/vite-plugin-react/issues/1473
-            const projectRequire = createRequire(path.join(root, "package.json"));
             const excluded = [
               ...incomingExclude,
               ...(config.environments?.rsc?.optimizeDeps?.exclude ?? []),
@@ -4565,10 +4565,9 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               "intl-messageformat",
             ]) {
               if (excluded.includes(id)) continue;
-              try {
-                projectRequire.resolve(id);
+              if (resolveProjectModule(root, id) !== undefined) {
                 additionalRscOptimizeIncludes.push(id);
-              } catch {}
+              }
             }
           }
           const additionalClientOptimizeIncludes: string[] = [];
@@ -4601,29 +4600,31 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             // RSC exposes next-intl's private provider and Link modules as raw
             // client references. Prebundle use-intl's available entry points so these
             // references share the same context as optimized application imports.
-            try {
-              const projectRequire = createRequire(path.join(root, "package.json"));
-              const packageRequire = createRequire(projectRequire.resolve("next-intl"));
-              for (const id of [
-                "use-intl",
-                "use-intl/react",
-                // next-intl 3.x uses private provider and locale-hook exports.
-                "use-intl/_IntlProvider",
-                "use-intl/_useLocale",
-              ]) {
-                const include = `next-intl > ${id}`;
-                if (
-                  excluded.includes("use-intl") ||
-                  excluded.includes(id) ||
-                  excluded.includes(include)
-                )
-                  continue;
-                try {
-                  packageRequire.resolve(id);
-                  additionalClientOptimizeIncludes.push(include);
-                } catch {}
-              }
-            } catch {}
+            const nextIntlEntry = resolveProjectModule(root, "next-intl");
+            if (nextIntlEntry !== undefined) {
+              try {
+                const packageRequire = createRequire(nextIntlEntry);
+                for (const id of [
+                  "use-intl",
+                  "use-intl/react",
+                  // next-intl 3.x uses private provider and locale-hook exports.
+                  "use-intl/_IntlProvider",
+                  "use-intl/_useLocale",
+                ]) {
+                  const include = `next-intl > ${id}`;
+                  if (
+                    excluded.includes("use-intl") ||
+                    excluded.includes(id) ||
+                    excluded.includes(include)
+                  )
+                    continue;
+                  try {
+                    packageRequire.resolve(id);
+                    additionalClientOptimizeIncludes.push(include);
+                  } catch {}
+                }
+              } catch {}
+            }
           }
           const appClientInput: Record<string, string> = { index: VIRTUAL_APP_BROWSER_ENTRY };
           if (hasPagesDir) {
@@ -4660,12 +4661,21 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           // Keep `next` in Vite's pipeline, as the Node environments below do.
           const nitroDevEnvironmentResolve =
             hasNitroPlugin && env?.command === "serve" ? { resolve: { noExternal: ["next"] } } : {};
+          // Nitro *builds* still take the Node RSC/SSR resolve config: Nitro
+          // runs on Node and its dependency tracer only copies `traceDeps` plus
+          // native builtins into `.output/server/node_modules`, so leaving
+          // server deps (react-dom, instrumentation → OpenTelemetry) external
+          // produces a `.output` that is not self-contained. See ffa49b945.
+          // Upstream skips both bundled runtimes here; only Cloudflare Workers
+          // hand the whole server graph to their own bundler.
+          const skipNodeServerEnvironmentResolve =
+            hasCloudflarePlugin || (hasNitroPlugin && env?.command === "serve");
 
           viteConfig.environments = {
             rsc: {
               ...appRouterDevConfigFor("rsc"),
               ...nitroDevEnvironmentResolve,
-              ...(hasCloudflarePlugin || hasNitroPlugin
+              ...(skipNodeServerEnvironmentResolve
                 ? {}
                 : {
                     resolve: {
@@ -4729,7 +4739,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             ssr: {
               ...appRouterDevConfigFor("ssr"),
               ...nitroDevEnvironmentResolve,
-              ...(hasCloudflarePlugin || hasNitroPlugin
+              ...(skipNodeServerEnvironmentResolve
                 ? {}
                 : {
                     resolve: {
@@ -6951,6 +6961,11 @@ export const loadServerActionClient = ${
         });
         server.httpServer?.on("upgrade", (req, socket, head) => {
           if (isViteHmrWebSocketUpgrade(req)) return;
+          // The Cloudflare Vite plugin runs the Worker in its own dev runtime and
+          // owns upgrades for it; claiming the socket here fights its handler and
+          // every Worker upgrade fails the handshake.
+          if (hasCloudflarePlugin) return;
+
           void (async () => {
             try {
               await handleNodeWebSocketUpgrade({
@@ -7009,6 +7024,16 @@ export const loadServerActionClient = ${
         };
         let pendingPublicRouteInvalidation = false;
 
+        // An `_app` change, a stylesheet edit, or a script whose import graph
+        // can pull a new stylesheet all change the Pages client assets.
+        function shouldInvalidatePagesClientAssets(filePath: string): boolean {
+          return (
+            isPagesAppFile(filePath) ||
+            STYLESHEET_FILE_RE.test(filePath) ||
+            isPotentialPagesAssetGraphScript(filePath)
+          );
+        }
+
         function invalidatePagesMiddlewareMatcher(filePath: string, sendReload = true): boolean {
           if (!hasPagesDir || !middlewarePath || toSlash(filePath) !== middlewarePath) {
             return false;
@@ -7032,23 +7057,12 @@ export const loadServerActionClient = ${
             let rscReloadNeeded = false;
             let serverReloadNeeded = false;
 
-            for (const { kind, filePath } of events) {
-              // Vite invalidates modules on change itself, but a topology event
-              // (editor save via unlink+add) needs the Pages dependency stores
-              // updated explicitly, as upstream's per-event handlers do.
-              invalidatePagesModuleDependencies(filePath, kind === "add" ? "create" : "delete");
+            for (const { filePath } of events) {
               if (hasPagesDir && middlewarePath !== null && toSlash(filePath) === middlewarePath) {
                 middlewareChanged = true;
               }
 
-              const pagesAppChanged = isPagesAppFile(filePath);
-              const pagesAssetGraphScriptChanged = isPotentialPagesAssetGraphScript(filePath);
-              if (
-                hasPagesDir &&
-                (pagesAppChanged ||
-                  STYLESHEET_FILE_RE.test(filePath) ||
-                  pagesAssetGraphScriptChanged)
-              ) {
+              if (hasPagesDir && shouldInvalidatePagesClientAssets(filePath)) {
                 pagesClientAssetsChanged = true;
               }
 
@@ -7116,6 +7130,16 @@ export const loadServerActionClient = ${
           invalidatePagesMiddlewareMatcher(filePath, false);
           if (updatePublicFileRoute(filePath, kind === "add")) {
             pendingPublicRouteInvalidation = true;
+          }
+          // Module-graph invalidation is not deferrable: the next request (or
+          // `ssrLoadModule`) must see the new topology. A retargeted stylesheet
+          // resolves through a fresh module graph entry, so invalidating the
+          // dependency stores and the client-asset module synchronously keeps
+          // dev behavior identical to per-event handling. The coalescer still
+          // owns the reload/route-cache decisions.
+          invalidatePagesModuleDependencies(filePath, kind === "add" ? "create" : "delete");
+          if (hasPagesDir && shouldInvalidatePagesClientAssets(filePath)) {
+            invalidatePagesClientAssetsModule();
           }
           coalescedDevWatchEvents.enqueue(kind, filePath);
         };
