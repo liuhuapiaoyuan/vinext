@@ -66,6 +66,13 @@ export async function handleAppRouterImageOptimizationRequest(
   if (!isImageOptimizationPath(strippedPathname) || !options.env.ASSETS) {
     return null;
   }
+  // Only a Next-format optimizer request belongs here. The same pathname can
+  // also be claimed by an app route (which signals the Worker to serve the
+  // source itself), and answering that one with the optimizer's parameter
+  // validation would replace the route's response with a 400.
+  if (!url.searchParams.has("url")) {
+    return null;
+  }
 
   const imageRequest =
     strippedPathname === url.pathname
