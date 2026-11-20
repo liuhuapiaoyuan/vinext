@@ -230,7 +230,15 @@ jobs:
         shell: bash
         run: |
           node "$GITHUB_WORKSPACE/scripts/configure-local-vinext-types.mjs" "${{ runner.temp }}"
-          vp add "${{ runner.temp }}"/vinext-[0-9]*.tgz
+          # The fork publishes as @qzsy/vinext but apps import `vinext/*`, so the
+          # tarball is installed under the upstream name as an alias.
+          VINEXT_TARBALL="$(ls "${{ runner.temp }}"/qzsy-vinext-*.tgz)"
+          # The Windows runners hand bash POSIX-shaped paths; `file:` specs want a
+          # native one, so convert when cygpath is available.
+          if command -v cygpath >/dev/null 2>&1; then
+            VINEXT_TARBALL="$(cygpath -w "$VINEXT_TARBALL")"
+          fi
+          vp add "vinext@file:$VINEXT_TARBALL"
           # Install the @vitejs/plugin-rsc and React versions the repo is tested
           # with. An unversioned install can resolve an older release under
           # pnpm's minimumReleaseAge default, which vinext rejects.
@@ -338,7 +346,15 @@ jobs:
         working-directory: ${{ runner.temp }}/cna-cloudflare
         run: |
           node "$GITHUB_WORKSPACE/scripts/configure-local-vinext-types.mjs" "${{ runner.temp }}"
-          vp add "${{ runner.temp }}"/vinext-[0-9]*.tgz "${{ runner.temp }}"/cloudflare-workers-response-store-*.tgz "${{ runner.temp }}"/vinext-cloudflare-*.tgz
+          # The fork publishes as @qzsy/vinext but apps import `vinext/*`, so the
+          # tarball is installed under the upstream name as an alias.
+          VINEXT_TARBALL="$(ls "${{ runner.temp }}"/qzsy-vinext-*.tgz)"
+          # The Windows runners hand bash POSIX-shaped paths; `file:` specs want a
+          # native one, so convert when cygpath is available.
+          if command -v cygpath >/dev/null 2>&1; then
+            VINEXT_TARBALL="$(cygpath -w "$VINEXT_TARBALL")"
+          fi
+          vp add "vinext@file:$VINEXT_TARBALL" "${{ runner.temp }}"/cloudflare-workers-response-store-*.tgz "${{ runner.temp }}"/vinext-cloudflare-*.tgz
           # Install the @vitejs/plugin-rsc and React versions the repo is tested
           # with. An unversioned install can resolve an older release under
           # pnpm's minimumReleaseAge default, which vinext rejects.
@@ -441,7 +457,15 @@ jobs:
         working-directory: ${{ runner.temp }}/cva-cloudflare
         run: |
           node "$GITHUB_WORKSPACE/scripts/configure-local-vinext-types.mjs" "${{ runner.temp }}"
-          vp add "${{ runner.temp }}"/vinext-[0-9]*.tgz "${{ runner.temp }}"/cloudflare-workers-response-store-*.tgz "${{ runner.temp }}"/vinext-cloudflare-*.tgz
+          # The fork publishes as @qzsy/vinext but apps import `vinext/*`, so the
+          # tarball is installed under the upstream name as an alias.
+          VINEXT_TARBALL="$(ls "${{ runner.temp }}"/qzsy-vinext-*.tgz)"
+          # The Windows runners hand bash POSIX-shaped paths; `file:` specs want a
+          # native one, so convert when cygpath is available.
+          if command -v cygpath >/dev/null 2>&1; then
+            VINEXT_TARBALL="$(cygpath -w "$VINEXT_TARBALL")"
+          fi
+          vp add "vinext@file:$VINEXT_TARBALL" "${{ runner.temp }}"/cloudflare-workers-response-store-*.tgz "${{ runner.temp }}"/vinext-cloudflare-*.tgz
           # Install the @vitejs/plugin-rsc and React versions the repo is tested
           # with. An unversioned install can resolve an older release under
           # pnpm's minimumReleaseAge default, which vinext rejects.
