@@ -426,9 +426,10 @@ describe("generateRouteTypes", () => {
 
       const tarballs = await readdir(packDir);
       const typesTarball = tarballs.find((name) => name.startsWith("vinext-types-"));
-      const vinextTarball = tarballs.find(
-        (name) => name.startsWith("vinext-") && !name.startsWith("vinext-types-"),
-      );
+      // This fork publishes the package as `@qzsy/vinext`, so the packed tarball
+      // is `qzsy-vinext-<version>.tgz` rather than `vinext-<version>.tgz`. Match on
+      // "the one tarball that is not the types package" instead of the prefix.
+      const vinextTarball = tarballs.find((name) => name.endsWith(".tgz") && name !== typesTarball);
       expect(typesTarball).toBeDefined();
       expect(vinextTarball).toBeDefined();
 
@@ -446,7 +447,7 @@ describe("generateRouteTypes", () => {
         consumer,
         ".pnpmfile.cjs",
         `module.exports = { hooks: { readPackage(pkg) {\n` +
-          `  if (pkg.name === "vinext") {\n` +
+          `  if (pkg.name === "vinext" || pkg.name === "@qzsy/vinext") {\n` +
           `    const declared = pkg.dependencies?.["@vinext/types"];\n` +
           `    if (declared !== ${JSON.stringify(`^${typesVersion}`)}) throw new Error("packed vinext does not declare the matching @vinext/types version");\n` +
           `    pkg.dependencies = { "@vinext/types": ${JSON.stringify(`file:${path.join(packDir, typesTarball!)}`)} };\n` +
@@ -483,6 +484,15 @@ describe("generateRouteTypes", () => {
       expect(await readFile(path.join(consumer, "next-env.d.ts"), "utf-8")).toContain(
         'import "vinext/types";',
       );
+      // `@vinext/types` mirrors Next.js's declarations, which mention the optional
+      // `sharp` dependency. It is genuinely absent in this consumer, so declare it
+      // like `@vinext/types/next/optional-stubs` does for projects that type check
+      // their dependencies (no `skipLibCheck` covers the missing module here).
+      await writeProjectFile(
+        consumer,
+        "sharp-stub.d.ts",
+        'declare module "sharp" {\n  const sharp: unknown;\n  export default sharp;\n}\n',
+      );
       runCommand(
         process.execPath,
         [
@@ -497,6 +507,7 @@ describe("generateRouteTypes", () => {
           "--target",
           "esnext",
           path.join(consumer, "next-env.d.ts"),
+          path.join(consumer, "sharp-stub.d.ts"),
           path.join(consumer, "app/page.ts"),
         ],
         consumer,
