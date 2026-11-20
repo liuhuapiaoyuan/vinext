@@ -7140,6 +7140,11 @@ export const loadServerActionClient = ${
           invalidatePagesMiddlewareMatcher(filePath, false);
           if (updatePublicFileRoute(filePath, kind === "add")) {
             pendingPublicRouteInvalidation = true;
+            // The dev servers check a matched public file before rejecting an
+            // unsupported method, so the next request must already see the new
+            // topology — a deferred invalidation answers 404 instead of 405.
+            if (hasAppDir) invalidateRscEntryModule(false);
+            else if (hasCloudflarePlugin && hasPagesDir) invalidatePagesServerEntry();
           }
           // Module-graph invalidation is not deferrable: the next request (or
           // `ssrLoadModule`) must see the new topology. A retargeted stylesheet
