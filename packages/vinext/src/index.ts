@@ -4671,6 +4671,16 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           const skipNodeServerEnvironmentResolve =
             hasCloudflarePlugin || (hasNitroPlugin && env?.command === "serve");
 
+          // Isolated build phases drive `buildApp` themselves, so plugin-rsc
+          // leaves Vite's builder config unset. Without it Vite falls back to
+          // its legacy single-environment builder, which only ever creates
+          // `client` — and every isolated phase then threw `Isolated build
+          // requires a "rsc" environment`. Declaring the builder keeps the
+          // multi-environment setup the phases run against.
+          if (process.env.VINEXT_BUILD_ISOLATION_PHASE !== undefined) {
+            viteConfig.builder = { sharedPlugins: true, sharedConfigBuild: true };
+          }
+
           viteConfig.environments = {
             rsc: {
               ...appRouterDevConfigFor("rsc"),
