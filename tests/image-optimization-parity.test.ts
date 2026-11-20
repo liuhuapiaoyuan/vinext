@@ -382,7 +382,7 @@ describe("Pages Router production /_next/image cache-state headers", () => {
     expect(notModified.headers["x-vinext-cache"]).toBeUndefined();
 
     for (const [query, status] of [
-      ["url=%2Fhello%20world.png&w=65&q=75", 400],
+      ["url=%2Fhello%20world.png&w=0&q=75", 400],
       ["url=%2Ficon.svg&w=64&q=75", 400],
       ["url=%2Fmissing.png&w=64&q=75", 400],
     ] as const) {

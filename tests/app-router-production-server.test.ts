@@ -2802,7 +2802,7 @@ describe("App Router Production server (startProdServer)", () => {
     expect(notModified.headers["x-vinext-cache"]).toBeUndefined();
 
     for (const [query, status] of [
-      ["url=%2Fheart.png&w=65&q=75", 400],
+      ["url=%2Fheart.png&w=0&q=75", 400],
       ["url=%2Flogo%2Flogo.svg&w=64&q=75", 400],
       ["url=%2Fmissing.png&w=64&q=75", 400],
     ] as const) {
