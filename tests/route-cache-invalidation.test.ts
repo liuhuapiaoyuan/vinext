@@ -1,4 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { appRouter, invalidateAppRouteCache } from "../packages/vinext/src/routing/app-router.js";
 import { invalidateRouteCache, pagesRouter } from "../packages/vinext/src/routing/pages-router.js";
 
@@ -6,6 +9,16 @@ const mocks = vi.hoisted(() => ({
   buildAppRouteGraph: vi.fn(),
   glob: vi.fn(),
 }));
+
+// The fork's scanner skips the scan entirely when the pages directory does not
+// exist (see `isDirectory` in routing/file-matcher.ts), and the mocked `glob`
+// only takes over once a scan starts. Point the cache at a real, empty
+// directory so the in-flight invalidation retry is what the test exercises.
+const pagesDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-route-cache-"));
+
+afterAll(() => {
+  fs.rmSync(pagesDir, { recursive: true, force: true });
+});
 
 vi.mock("node:fs/promises", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:fs/promises")>()),
@@ -23,7 +36,7 @@ beforeEach(() => {
   mocks.buildAppRouteGraph.mockReset();
   mocks.glob.mockReset();
   invalidateAppRouteCache();
-  invalidateRouteCache("/virtual/pages");
+  invalidateRouteCache(pagesDir);
 });
 
 describe("route cache invalidation", () => {
@@ -67,10 +80,10 @@ describe("route cache invalidation", () => {
         yield "new.tsx";
       });
 
-    const routesPromise = pagesRouter("/virtual/pages");
+    const routesPromise = pagesRouter(pagesDir);
     await started;
-    const concurrentRoutesPromise = pagesRouter("/virtual/pages");
-    invalidateRouteCache("/virtual/pages");
+    const concurrentRoutesPromise = pagesRouter(pagesDir);
+    invalidateRouteCache(pagesDir);
     releaseScan();
 
     const expectedRoutes = [
